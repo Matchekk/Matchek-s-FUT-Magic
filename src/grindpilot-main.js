@@ -285,7 +285,12 @@ class GrindPilotRuntime {
   async refreshStatus() {
     try { const health=await this.adapter.health(); this.state.bridgeHealth=health.eaReady ? "healthy" : "initializing"; this.state.error=null; }
     catch(error){ this.state.bridgeHealth="unavailable"; this.state.error=error.message; }
-    await this.refreshInventory().catch(()=>null); this.emit(); return this.getState();
+    try {
+      await this.refreshInventory();
+    } catch (error) {
+      this.state.error = this.state.error || `Inventory refresh failed: ${error?.message || error}`;
+    }
+    this.emit(); return this.getState();
   }
 
   async refreshInventory() {
@@ -311,7 +316,12 @@ class GrindPilotRuntime {
   async takeDiagnosticSnapshot() { const health=await this.adapter.health().catch(error=>({error:error.message})); const latest=this.dev.captureSnapshot({ bridgeHealth:health,route:location.pathname,selectors:{controllerBridge:Boolean(window.eaData?.grindPilot)} }); this.state.diagnostics={...this.dev.getStatus(),latest,diff:this.dev.compareLatestSnapshots()}; this.emit(); return latest; }
   async exportDiagnostics() { return this.dev.exportDiagnostics({ healthChecks:[await this.adapter.health().catch(error=>({error:error.message}))], logs:this.logger.entries() }); }
   reportUiError(error) { this.state.error=error?.message||String(error); this.logger.error("Error",this.state.error,{code:error?.code||null}); this.emit(); }
-  persistActivity() { clearTimeout(this.activityTimer); this.activityTimer=setTimeout(()=>this.storage.set({[ACTIVITY_KEY]:this.logger.entries()}).catch(()=>{}),250); }
+  persistActivity() {
+    clearTimeout(this.activityTimer);
+    this.activityTimer=setTimeout(()=>this.storage.set({[ACTIVITY_KEY]:this.logger.entries()}).catch((error)=>{
+      console.warn("[GrindPilot] Activity persistence failed", { code:error?.code||null, message:error?.message||String(error) });
+    }),250);
+  }
 }
 
 if (globalThis.window && !globalThis.window.__grindPilotRuntime) {
