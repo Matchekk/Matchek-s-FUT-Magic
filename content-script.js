@@ -61,6 +61,9 @@ const injectPageScript = async (path, { type = "module" } = {}) =>
   });
 
 const BRIDGE_INJECT_REQUEST = "EA_PAGE_BRIDGE_INJECT";
+const GRINDPILOT_RPC_INSTALL_REQUEST = "EA_GRINDPILOT_RPC_INSTALL";
+const GRINDPILOT_EA_REQUEST = "GRINDPILOT_EA_REQUEST_V1";
+const GRINDPILOT_EA_RESPONSE = "GRINDPILOT_EA_RESPONSE_V1";
 
 const requestBackgroundBridgeInject = (path) =>
   new Promise((resolve, reject) => {
@@ -129,8 +132,10 @@ void (async () => {
   if (window !== window.top) return;
   await exposeExtensionMetadataToPage();
   const bridgePath = "page/ea-data-bridge.js";
+  let bridgeInjected = false;
   try {
     await injectPageScript(bridgePath, { type: "module" });
+    bridgeInjected = true;
   } catch (error) {
     console.warn("[EA Data] Module script injection failed; retrying classic", {
       path: error?.path ?? bridgePath,
@@ -140,12 +145,14 @@ void (async () => {
     });
     try {
       await injectPageScript(bridgePath, { type: null });
+      bridgeInjected = true;
       console.warn("[EA Data] Classic script injection fallback succeeded", {
         path: bridgePath,
       });
     } catch (fallbackError) {
       try {
         await requestBackgroundBridgeInject(bridgePath);
+        bridgeInjected = true;
         console.warn(
           "[EA Data] Background executeScript injection fallback succeeded",
           {
@@ -177,6 +184,17 @@ void (async () => {
         });
       }
     }
+  }
+  if (!bridgeInjected) return;
+  try {
+    await requestGrindPilotRpcInstall();
+    installIsolatedGrindPilotEaProxy();
+    await import(chrome.runtime.getURL("src/grindpilot-main.js"));
+  } catch (error) {
+    console.error("[GrindPilot] Runtime injection failed", {
+      path: error?.path ?? "src/grindpilot-main.js",
+      message: error?.message ?? String(error),
+    });
   }
 })();
 
@@ -368,6 +386,51 @@ const initSolverWorker = () => {
     throw error;
   });
   return solverWorkerInitPromise;
+};
+
+const requestGrindPilotRpcInstall = () =>
+  new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: GRINDPILOT_RPC_INSTALL_REQUEST }, (response) => {
+      const runtimeError = chrome.runtime?.lastError;
+      if (runtimeError || !response?.ok) {
+        reject(new Error(runtimeError?.message || response?.error?.message || "EA RPC installation failed"));
+      } else resolve(response.data);
+    });
+  });
+
+const installIsolatedGrindPilotEaProxy = () => {
+  const pending = new Map();
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (event.source !== window || data?.type !== GRINDPILOT_EA_RESPONSE) return;
+    const request = pending.get(String(data.requestId ?? ""));
+    if (!request) return;
+    pending.delete(String(data.requestId));
+    clearTimeout(request.timeoutId);
+    if (data.ok) request.resolve(data.value);
+    else request.reject(Object.assign(new Error(data?.error?.message || "EA RPC failed"), { code: data?.error?.code || "EA_RPC_FAILED" }));
+  }, true);
+  const invoke = (method, payload) => new Promise((resolve, reject) => {
+    const requestId = createRequestId();
+    const timeoutId = setTimeout(() => {
+      pending.delete(requestId);
+      reject(Object.assign(new Error(`EA RPC timed out: ${method}`), { code: "EA_RPC_TIMEOUT" }));
+    }, 130_000);
+    pending.set(requestId, { resolve, reject, timeoutId });
+    window.postMessage({ type: GRINDPILOT_EA_REQUEST, requestId, method, payload }, "*");
+  });
+  const method = (name) => (payload) => invoke(name, payload);
+  window.eaData = {
+    grindPilot: {
+      getHealth: method("getHealth"), getContext: method("getContext"),
+      readInventory: method("readInventory"), solveCurrentSbc: method("solveCurrentSbc"),
+      submitCurrentSbc: method("submitCurrentSbc"), listOwnedRewardPacks: method("listOwnedRewardPacks"),
+      claimCurrentReward: method("claimCurrentReward"), openOwnedRewardPack: method("openOwnedRewardPack"),
+      resolveUnassigned: method("resolveUnassigned"), readPlayerPick: method("readPlayerPick"),
+      selectPlayerPick: method("selectPlayerPick"),
+    },
+    openSequencePlanner: method("openSequencePlanner"),
+  };
 };
 
 const isRetryableSolverError = (error) => {
@@ -630,46 +693,6 @@ const handleSolverBridgeRequest = async (data) => {
     postSolverResponse(requestId, false, null, responseError);
   }
 };
-
-const storageLocalGet = (key) =>
-  new Promise((resolve, reject) => {
-    try {
-      if (!chrome?.storage?.local?.get) {
-        reject(new Error("chrome.storage.local unavailable"));
-        return;
-      }
-      chrome.storage.local.get([key], (items) => {
-        const err = chrome?.runtime?.lastError;
-        if (err) {
-          reject(new Error(err.message || "storage get failed"));
-          return;
-        }
-        resolve(items ? items[key] : null);
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-
-const storageLocalSet = (key, value) =>
-  new Promise((resolve, reject) => {
-    try {
-      if (!chrome?.storage?.local?.set) {
-        reject(new Error("chrome.storage.local unavailable"));
-        return;
-      }
-      chrome.storage.local.set({ [key]: value }, () => {
-        const err = chrome?.runtime?.lastError;
-        if (err) {
-          reject(new Error(err.message || "storage set failed"));
-          return;
-        }
-        resolve(true);
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
 
 const postPrefResponse = (requestId, ok, data, error) => {
   const detail = {

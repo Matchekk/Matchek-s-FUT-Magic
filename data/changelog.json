@@ -2,6 +2,45 @@
   "version": 1,
   "releases": [
     {
+      "version": "2.1.2",
+      "date": "2026-08-24",
+      "headline": "Fail-closed workflow and reward hardening.",
+      "summary": "Hardened GrindPilot state ownership, destructive recovery, protected-card handling, reward correlation and player identity.",
+      "details": [
+        "Moved runtime state behind typed service-worker commands with serialized revisions and per-tab run ownership.",
+        "Verified the full content-script bootstrap and added immediate safe run recovery after the previous owner tab closes.",
+        "Blocked ambiguous destructive resumes and unverified unassigned or reward-pack states.",
+        "Preserved complete profile limits and hidden protection settings from load through Start.",
+        "Prevented locked cards and base/promo versions of the same footballer from being consumed incorrectly.",
+        "Required-special stop conditions now use fresh normalized inventory and optional card-type filters.",
+        "Added focused regression and browser-harness coverage for the hardened paths."
+      ]
+    },
+    {
+      "version": "2.1.1",
+      "date": "2026-08-24",
+      "headline": "A clean blue identity for GrindPilot.",
+      "summary": "Added an original navigation-loop icon that stays recognizable from the toolbar to the extensions page.",
+      "details": [
+        "Added purpose-rendered 16, 32, 48 and 128 pixel PNG icons.",
+        "Added a scalable source master and automated manifest icon validation.",
+        "The artwork is original and uses no EA, FIFA, FC, FUT, club or player branding."
+      ]
+    },
+    {
+      "version": "2.1.0",
+      "date": "2026-08-24",
+      "headline": "GrindPilot FC26 unified grind-manager MVP.",
+      "summary": "Added one persistent workflow UI for solving, submitting, claiming, opening owned rewards, resolving items and safely repeating.",
+      "details": [
+        "Added explicit REVIEW, ASSISTED and hash-approved AUTO workflow modes with pause, resume, stop and recovery.",
+        "Added item-aware inventory, duplicate and SBC Storage policies with no implicit quicksell.",
+        "Added protected-card, high-rating, reserve and arbitrary Target Project policies.",
+        "Added safe reward-pack correlation, player-pick pause behavior, profiles, activity logs and opt-in diagnostics.",
+        "Source code: https://github.com/Matchekk/Matchek-s-FUT-Magic"
+      ]
+    },
+    {
       "version": "2.0.0",
       "date": "2026-08-24",
       "headline": "AutoSBC Best-of: hardened local-first release.",

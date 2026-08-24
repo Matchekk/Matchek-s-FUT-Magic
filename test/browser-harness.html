@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>GrindPilot browser harness</title></head>
+  <body style="margin:0;background:#20251e;color:#eef5e8;font-family:system-ui">
+    <main style="padding:32px"><h1>EA Web App test surface</h1><p>Safe local browser harness; no EA account or network session is used.</p></main>
+    <script>
+      const state = { activeRun:null, activity:[], profiles:{}, projects:[], settings:{} };
+      window.chrome = { runtime: {
+        lastError:null,
+        sendMessage(message, callback) {
+          if (message?.type !== "GRINDPILOT_STATE_COMMAND_V2") {
+            callback({ ok:false, error:{ code:"TEST_COMMAND_UNKNOWN", message:"Unknown test command" } });
+            return;
+          }
+          const input = message.payload || {};
+          let data = null;
+          if (message.action === "BOOTSTRAP_LOAD") data = { activity:state.activity, projects:state.projects, settings:state.settings };
+          else if (message.action === "SETTINGS_SAVE") data = state.settings = structuredClone(input.value);
+          else if (message.action === "ACTIVITY_SAVE") data = state.activity = structuredClone(input.value);
+          else if (message.action === "PROJECTS_SAVE") data = state.projects = structuredClone(input.value);
+          else if (message.action === "PROFILE_LIST") data = Object.values(state.profiles);
+          else if (message.action === "PROFILE_GET") data = state.profiles[input.id] || null;
+          else if (message.action === "PROFILE_PUT") data = state.profiles[input.profile.id] = structuredClone(input.profile);
+          else if (message.action === "PROFILE_DELETE") data = delete state.profiles[input.id];
+          else if (["RUN_LOAD_ACTIVE", "RUN_LOAD"].includes(message.action)) data = state.activeRun;
+          else if (message.action === "RUN_CREATE") data = state.activeRun = structuredClone(input.run);
+          else if (message.action === "RUN_SAVE") data = state.activeRun = structuredClone(input.run);
+          else if (message.action === "RUN_ASSERT_OWNER") data = true;
+          else if (message.action === "RUN_CLEAR") data = state.activeRun = null;
+          else {
+            callback({ ok:false, error:{ code:"TEST_ACTION_UNKNOWN", message:`Unknown test action ${message.action}` } });
+            return;
+          }
+          queueMicrotask(() => callback({ ok:true, data }));
+        },
+      }};
+      const verified = (value) => ({ status:"verified", value, at:Date.now() });
+      window.eaData = { grindPilot: {
+        getHealth: () => verified({ eaReady:true, bridgeReady:true, storeAvailable:true, itemMoveAvailable:true }),
+        getContext: () => ({ setName:"Test SBC", challengeName:"85+ Upgrade" }),
+        readInventory: () => verified({ club:[], storage:[], unassigned:[] }),
+        solveCurrentSbc: () => verified({ challengeId:"test-85-plus", submitReady:true, solutionIds:[] }),
+        listOwnedRewardPacks: () => verified([]),
+        readPlayerPick: () => verified({ pending:false, pickItemIds:[] }),
+      }};
+    </script>
+    <script type="module" src="../src/grindpilot-main.js"></script>
+  </body>
+</html>

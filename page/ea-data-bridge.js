@@ -2136,7 +2136,21 @@
   };
 
   const extractUnassignedItemsFromResult = (result) => {
-    const data = result?.data ?? result ?? null;
+    const status = parseStatusNumber(result?.status);
+    if (
+      result == null ||
+      result?.success === false ||
+      result?.error != null ||
+      (status != null && status >= 400)
+    ) {
+      const error = new Error("EA unassigned request failed");
+      error.code = "EA_UNASSIGNED_REQUEST_FAILED";
+      error.response = result ?? null;
+      throw error;
+    }
+    const data = Object.prototype.hasOwnProperty.call(result, "data")
+      ? result.data
+      : result;
     if (Array.isArray(data)) return markItemsAsUnassigned(data);
     if (Array.isArray(data?.items)) return markItemsAsUnassigned(data.items);
     if (Array.isArray(data?.data?.items))
@@ -2146,23 +2160,36 @@
     if (Array.isArray(data?.list)) return markItemsAsUnassigned(data.list);
     if (Array.isArray(data?._collection))
       return markItemsAsUnassigned(data._collection);
-    return markItemsAsUnassigned([]);
+    const error = new Error("EA unassigned response shape was not recognized");
+    error.code = "EA_UNASSIGNED_RESPONSE_UNKNOWN";
+    error.response = result;
+    throw error;
   };
 
-  const getUnassignedItems = async ({ refresh = false } = {}) => {
+  const getUnassignedItems = async ({ refresh = false, failClosed = false } = {}) => {
     const lookup = services?.Item?.getUnassignedItems ?? null;
     let initial = [];
+    let verifiedRead = false;
+    const failures = [];
     if (typeof lookup === "function") {
       try {
         initial = extractUnassignedItemsFromResult(
           await observableToPromise(lookup(false)),
         );
-      } catch {
+        verifiedRead = true;
+      } catch (error) {
+        failures.push(error);
         initial = [];
       }
     }
 
     if (!refresh || typeof services?.Item?.requestUnassignedItems !== "function") {
+      if (failClosed && !verifiedRead) {
+        const error = new Error("Unassigned state could not be verified");
+        error.code = "EA_UNASSIGNED_UNVERIFIED";
+        error.causes = failures;
+        throw error;
+      }
       return initial;
     }
 
@@ -2174,18 +2201,28 @@
           { minGapMs: 400, maxAttempts: 1 },
         ),
       );
-      if (Array.isArray(requested) && requested.length) return requested;
-    } catch {}
+      if (Array.isArray(requested)) return requested;
+    } catch (error) {
+      failures.push(error);
+    }
 
     if (typeof lookup === "function") {
       try {
         const refreshed = extractUnassignedItemsFromResult(
           await observableToPromise(lookup(false)),
         );
-        if (Array.isArray(refreshed) && refreshed.length) return refreshed;
-      } catch {}
+        if (Array.isArray(refreshed)) return refreshed;
+      } catch (error) {
+        failures.push(error);
+      }
     }
 
+    if (failClosed) {
+      const error = new Error("Fresh unassigned state could not be verified");
+      error.code = "EA_UNASSIGNED_UNVERIFIED";
+      error.causes = failures;
+      throw error;
+    }
     return initial;
   };
 
@@ -30229,12 +30266,23 @@
     const isUntradeable =
       typeof item.isTradeable === "function"
         ? !item.isTradeable()
-        : !item.isTradeable;
+        : item.isTradeable === false;
     const isEvolution =
       typeof item.isEvolution === "function"
         ? Boolean(item.isEvolution())
         : Boolean(item.isEvolution ?? item.upgrades);
     const isAcademy = Boolean(item.isEnrolledInAcademy?.());
+    const readItemBoolean = (...keys) => {
+      for (const key of keys) {
+        if (typeof item?.[key] === "function") {
+          try {
+            return Boolean(item[key]());
+          } catch {}
+        }
+        if (typeof item?.[key] === "boolean") return item[key];
+      }
+      return false;
+    };
     const isDuplicate =
       Boolean(duplicateDefIds?.has(item.definitionId)) &&
       !isStorage &&
@@ -30242,13 +30290,24 @@
       !isEvolution;
     return {
       id: item.id,
+      itemId: item.id == null ? null : String(item.id),
       definitionId: item.definitionId,
+      resourceId: item.resourceId ?? item.definitionId ?? null,
+      assetId: item.assetId ?? item._staticData?.id ?? null,
+      basePlayerId:
+        item.basePlayerId ?? item.assetId ?? item._staticData?.baseId ?? null,
       name: resolvePlayerName(item),
       pile: item.pile,
-      isTradeable: item.isTradeable?.(),
+      isTradeable:
+        typeof item.isTradeable === "function"
+          ? Boolean(item.isTradeable())
+          : Boolean(item.isTradeable),
       isUntradeable,
       isStorage,
       isUnassigned,
+      isLocked: readItemBoolean("isLocked", "locked"),
+      isFavorite: readItemBoolean("isFavorite", "isFavourite", "favorite"),
+      isInStartingSquad: readItemBoolean("isInStartingSquad", "isInActive11"),
       hasStorageDuplicate: false,
       hasClubDuplicate: false,
       isDuplicate,
@@ -30264,6 +30323,7 @@
       isEnrolledInAcademy: item.isEnrolledInAcademy?.(),
       rarityId,
       rarityName,
+      cardType: rarityName,
       isSpecial,
       isTotw,
       isEvolution,
@@ -30494,7 +30554,499 @@
     return data;
   };
 
+  const GRINDPILOT_CLUB_PILE = 7;
+  const GRINDPILOT_STORAGE_PILE = 10;
+
+  const grindPilotResult = (status, value = null, reason = null, evidence = null) => ({
+    status,
+    value,
+    reason,
+    evidence,
+    at: Date.now(),
+  });
+
+  const grindPilotContext = () => ({
+    setId: currentSbcSet?.id ?? currentChallenge?.setId ?? null,
+    setName: currentSbcSet?.name ?? currentSbcSet?.title ?? null,
+    challengeId: currentChallenge?.id ?? null,
+    challengeName: currentChallenge?.name ?? currentChallenge?.title ?? null,
+    challengeCompleted: Boolean(currentChallenge?.isCompleted?.()),
+    bridgeReady: Boolean(solverBridgeReady),
+  });
+
+  const grindPilotMoveItems = async (items, pile) => {
+    if (!Array.isArray(items) || !items.length) return { success: true };
+    if (typeof services?.Item?.move !== "function") {
+      throw new Error("services.Item.move unavailable");
+    }
+    const operation = services.Item.move(items, pile);
+    if (operation && typeof operation.observe === "function") {
+      return observableToPromise(operation);
+    }
+    if (operation && typeof operation.then === "function") return operation;
+    return { success: true, data: operation ?? null };
+  };
+
+  const grindPilotSerializeNormalizedRequirements = (rules = []) =>
+    (Array.isArray(rules) ? rules : []).map((rule) => {
+      if (!rule || typeof rule !== "object") return rule;
+      return {
+        type: rule.type ?? null,
+        key: rule.key ?? null,
+        keyName: rule.keyName ?? null,
+        keyNameNormalized: rule.keyNameNormalized ?? null,
+        typeSource: rule.typeSource ?? null,
+        op: rule.op ?? null,
+        count: rule.count ?? null,
+        derivedCount: rule.derivedCount ?? null,
+        value: rule.value ?? null,
+        scope: rule.scope ?? null,
+        scopeName: rule.scopeName ?? null,
+        label: rule.label ?? null,
+      };
+    });
+
+  const grindPilotReadSquadIds = (challenge = currentChallenge) => {
+    const slots = challenge?.squad?.getPlayers?.() ?? [];
+    return (Array.isArray(slots) ? slots : [])
+      .map((slot) => resolveSlotItem(slot) ?? slot ?? null)
+      .filter(Boolean)
+      .map((item) => (item?.id == null ? null : String(item.id)))
+      .filter(Boolean);
+  };
+
+  const grindPilotSolveCurrent = async (options = {}) => {
+    const challenge = currentChallenge;
+    if (!challenge?.id) {
+      return grindPilotResult("unavailable", null, "No SBC challenge is open");
+    }
+    const challengeId = String(challenge.id);
+    const ready = await initSolverBridge();
+    if (!ready) {
+      return grindPilotResult("unavailable", null, "Solver bridge unavailable");
+    }
+
+    const storedSettings = await getSolverSettingsForChallenge(challenge.id);
+    const solverSettings = normalizeSolverSettingsInput({
+      ...storedSettings,
+      ...(options?.solverSettings && typeof options.solverSettings === "object"
+        ? options.solverSettings
+        : {}),
+    });
+    const payload = await window.eaData.getSolverPayload({
+      ignoreLoaned: true,
+      forcePlayersFetch: options?.forcePlayersFetch !== false,
+      includeUnassigned: Boolean(solverSettings?.useUnassigned),
+    });
+    if (String(currentChallenge?.id ?? "") !== challengeId) {
+      return grindPilotResult("ambiguous", null, "Open challenge changed during solve");
+    }
+
+    const requiredIds = new Set(
+      (payload?.squadSlots ?? [])
+        .map((slot) => slot?.item)
+        .filter((item) => item?.id != null && !item?.concept)
+        .map((item) => String(item.id)),
+    );
+    const protectedIds = new Set(
+      (options?.protectedItemIds ?? []).map((id) => String(id)),
+    );
+    const { filteredPlayers, poolFilters } = filterPlayersBySolverPoolSettings(
+      payload?.players ?? [],
+      solverSettings,
+      { requiredIds },
+    );
+    const safePlayers = filteredPlayers.filter((player) => {
+      const id = player?.id == null ? "" : String(player.id);
+      return requiredIds.has(id) || !protectedIds.has(id);
+    });
+    const requirements = (payload?.openChallenge?.requirements ?? []).map(
+      serializeRequirementForSolver,
+    );
+    const requirementsNormalized = grindPilotSerializeNormalizedRequirements(
+      payload?.openChallenge?.requirementsNormalized,
+    );
+    const result = await callSolveBridge(
+      {
+        players: safePlayers,
+        _cacheRevision: payload?._cacheRevision ?? null,
+        requirements,
+        requirementsNormalized,
+        requiredPlayers: payload?.requiredPlayers ?? null,
+        squadSlots: payload?.squadSlots ?? [],
+        prioritize: {
+          ...(payload?.prioritize ?? {}),
+          ...(options?.prioritize && typeof options.prioritize === "object"
+            ? options.prioritize
+            : {}),
+        },
+        filters: {
+          ...(payload?.filters ?? {}),
+          ...poolFilters,
+          excludedPlayerIds: Array.from(
+            new Set([
+              ...(payload?.filters?.excludedPlayerIds ?? []).map(String),
+              ...protectedIds,
+            ]),
+          ),
+          preserveOccupiedSlots: true,
+        },
+        debug: Boolean(debugEnabled),
+      },
+      requirementsNormalized,
+      options?.timeoutMs ?? null,
+    );
+    const solutionIds = Array.isArray(result?.solutions?.[0])
+      ? result.solutions[0].map(String)
+      : [];
+    if (!solutionIds.length) {
+      return grindPilotResult("not_applied", {
+        solved: false,
+        failingRequirements: result?.failingRequirements ?? [],
+      }, "No verified squad solution");
+    }
+    const protectedViolation = solutionIds.find(
+      (id) => protectedIds.has(id) && !requiredIds.has(id),
+    );
+    if (protectedViolation) {
+      return grindPilotResult("not_applied", null, "Solver selected a protected item", {
+        itemId: protectedViolation,
+      });
+    }
+    if (result?.requiresConcepts || result?.stats?.requiresConcepts) {
+      return grindPilotResult("not_applied", {
+        solved: true,
+        submitReady: false,
+        solutionIds,
+      }, "Solution requires concept players");
+    }
+    const solveValue = {
+      solved: true,
+      submitReady: true,
+      challengeId,
+      solutionIds,
+      solutionSlots: result?.solutionSlots?.[0] ?? null,
+      stats: result?.stats ?? null,
+    };
+    if (options?.previewOnly === true) {
+      return grindPilotResult("verified", solveValue, null, { applied: false });
+    }
+
+    const playerById = new Map(
+      (payload?.players ?? [])
+        .filter((player) => player?.id != null)
+        .map((player) => [String(player.id), player]),
+    );
+    await applySolutionWithSelectedMode(challenge, solutionIds, {
+      lookupKey: "id",
+      slotSolution: solveValue.solutionSlots,
+      playerById,
+    });
+    const appliedIds = new Set(grindPilotReadSquadIds(challenge));
+    const expected = new Set(solutionIds);
+    const applied =
+      appliedIds.size === expected.size &&
+      Array.from(expected).every((id) => appliedIds.has(id));
+    if (!applied) {
+      return grindPilotResult("ambiguous", solveValue, "Applied squad could not be verified", {
+        expected: Array.from(expected),
+        observed: Array.from(appliedIds),
+      });
+    }
+    clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
+    return grindPilotResult("verified", solveValue, null, {
+      applied: true,
+      observedItemIds: Array.from(appliedIds),
+    });
+  };
+
+  const grindPilotSubmitCurrent = async ({
+    expectedChallengeId,
+    expectedItemIds,
+    protectedItemIds = [],
+  } = {}) => {
+    const challenge = currentChallenge;
+    if (!challenge?.id) {
+      return grindPilotResult("unavailable", null, "No SBC challenge is open");
+    }
+    if (
+      expectedChallengeId != null &&
+      String(challenge.id) !== String(expectedChallengeId)
+    ) {
+      return grindPilotResult("not_applied", null, "SBC challenge does not match intent");
+    }
+    const observedIds = grindPilotReadSquadIds(challenge);
+    const protectedIds = new Set(
+      (Array.isArray(protectedItemIds) ? protectedItemIds : []).map(String),
+    );
+    const protectedViolation = observedIds.find((id) => protectedIds.has(id));
+    if (protectedViolation) {
+      return grindPilotResult(
+        "not_applied",
+        null,
+        "Loaded squad contains a protected item",
+        { itemId: protectedViolation },
+      );
+    }
+    if (Array.isArray(expectedItemIds)) {
+      const expected = new Set(expectedItemIds.map(String));
+      const observed = new Set(observedIds);
+      if (
+        expected.size !== observed.size ||
+        !Array.from(expected).every((id) => observed.has(id))
+      ) {
+        return grindPilotResult("not_applied", null, "Loaded squad differs from approved solution", {
+          expected: Array.from(expected),
+          observed: Array.from(observed),
+        });
+      }
+    }
+    const response = await submitSbcChallenge(challenge);
+    if (response?.success !== true) {
+      return grindPilotResult("not_applied", response, "EA rejected SBC submission");
+    }
+    const deadline = Date.now() + 8000;
+    let completionEvidence = null;
+    while (Date.now() < deadline) {
+      const snapshot = await refreshSbcSetChallengesSnapshot(
+        challenge.setId,
+        await ensureSbcSetById(challenge.setId),
+      );
+      const refreshedChallenges = Array.isArray(
+        snapshot?.setEntity?.getChallenges?.(),
+      )
+        ? snapshot.setEntity.getChallenges()
+        : [];
+      const match = refreshedChallenges.find(
+        (entry) => String(entry?.id ?? "") === String(challenge.id),
+      );
+      if (match?.isCompleted?.() || match?.status === "COMPLETED") {
+        completionEvidence = { challengeId: String(challenge.id), completed: true };
+        break;
+      }
+      await delayMs(250);
+    }
+    if (!completionEvidence) {
+      return grindPilotResult("ambiguous", response, "Submission response succeeded but completion was not observed");
+    }
+    return grindPilotResult("verified", response, null, completionEvidence);
+  };
+
+  const grindPilotListOwnedPacks = async () => {
+    if (typeof services?.Store?.getPacks !== "function") {
+      return grindPilotResult("unavailable", null, "Pack service unavailable");
+    }
+    repositories?.Store?.setDirty?.("ALL");
+    const response = await observableToPromise(
+      services.Store.getPacks("ALL", true, true),
+    );
+    if (response?.success === false) {
+      return grindPilotResult("unavailable", null, "Pack listing failed", response);
+    }
+    const raw = response?.data?.packs ?? response?.data?.items ?? response?.data ?? [];
+    const packs = (Array.isArray(raw) ? raw : [])
+      .filter((pack) => pack?.isMyPack === true)
+      .map((pack) => ({
+        id: String(pack?.id ?? pack?.articleId ?? pack?.assetId ?? ""),
+        assetId: pack?.assetId ?? null,
+        name: pack?.packName ?? pack?.name ?? null,
+        count: Math.max(1, Number(pack?.count ?? 1)),
+        isReward: true,
+        costsCoins: false,
+        costsPoints: false,
+      }))
+      .filter((pack) => pack.id);
+    return grindPilotResult("verified", packs, null, { count: packs.length });
+  };
+
+  const grindPilotClaimReward = async ({ beforePacks = null } = {}) => {
+    const beforeResult = Array.isArray(beforePacks)
+      ? grindPilotResult("verified", beforePacks)
+      : await grindPilotListOwnedPacks();
+    if (beforeResult.status !== "verified" || !Array.isArray(beforeResult.value)) {
+      return grindPilotResult(
+        "not_applied",
+        null,
+        "Reward was not claimed because the owned-pack baseline could not be verified",
+        { beforeStatus: beforeResult?.status ?? null },
+      );
+    }
+    const handled = await detectAndConfirmRewardPopup({
+      maxAttempts: 2,
+      intervalMs: 350,
+    });
+    if (!handled?.handled) {
+      return grindPilotResult("unavailable", null, handled?.reason || "Reward claim control unavailable");
+    }
+    repositories?.Store?.setDirty?.("ALL");
+    await delayMs(250);
+    const afterResult = await grindPilotListOwnedPacks();
+    if (afterResult.status !== "verified") {
+      return grindPilotResult("ambiguous", null, "Reward clicked but pack inventory could not be verified");
+    }
+    const countPacksById = (packs) => {
+      const counts = new Map();
+      for (const pack of packs) {
+        const id = String(pack?.id ?? "");
+        const count = Number(pack?.count ?? 1);
+        if (!id || !Number.isFinite(count) || count < 0) continue;
+        counts.set(id, (counts.get(id) ?? 0) + count);
+      }
+      return counts;
+    };
+    const beforeCounts = countPacksById(beforeResult.value);
+    const afterCounts = countPacksById(afterResult.value);
+    const positiveDeltaIds = [...afterCounts].filter(
+      ([id, count]) => count - (beforeCounts.get(id) ?? 0) > 0,
+    );
+    const deltas = positiveDeltaIds.map(([id, count]) => ({
+      ...(afterResult.value ?? []).find((pack) => String(pack?.id ?? "") === id),
+      id,
+      count,
+    }));
+    if (deltas.length !== 1) {
+      return grindPilotResult("ambiguous", { candidates: deltas }, "Claimed reward could not be correlated to exactly one pack");
+    }
+    return grindPilotResult("verified", { pack: deltas[0] }, null, {
+      correlatedPackId: deltas[0].id,
+    });
+  };
+
+  const grindPilotOpenRewardPack = async ({ packId } = {}) => {
+    const unassigned = await getUnassignedItems({ refresh: true, failClosed: true });
+    if (unassigned.length) {
+      return grindPilotResult("not_applied", { unresolvedUnassigned: unassigned.length }, "Unassigned items must be resolved before opening another pack");
+    }
+    if (!packId || typeof services?.Store?.getPacks !== "function") {
+      return grindPilotResult("not_applied", null, "A correlated owned reward pack ID is required");
+    }
+    repositories?.Store?.setDirty?.("ALL");
+    const listing = await observableToPromise(
+      services.Store.getPacks("ALL", true, true),
+    );
+    const raw = listing?.data?.packs ?? listing?.data?.items ?? listing?.data ?? [];
+    const pack = (Array.isArray(raw) ? raw : []).find(
+      (entry) =>
+        entry?.isMyPack === true &&
+        String(entry?.id ?? entry?.articleId ?? entry?.assetId ?? "") === String(packId),
+    );
+    if (!pack || typeof pack.open !== "function") {
+      return grindPilotResult("unavailable", null, "Owned reward pack is no longer available");
+    }
+    const opened = await observableToPromise(pack.open());
+    if (opened?.success !== true) {
+      return grindPilotResult("not_applied", opened, "EA rejected reward pack opening");
+    }
+    const items = opened?.data?.items ?? opened?.data ?? [];
+    if (!Array.isArray(items)) {
+      return grindPilotResult("ambiguous", null, "Pack opened but contents were not observable");
+    }
+    clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
+    return grindPilotResult("verified", {
+      packId: String(packId),
+      itemCount: items.length,
+      itemIds: items.map((item) => String(item?.id ?? "")).filter(Boolean),
+    });
+  };
+
+  const grindPilotResolveUnassigned = async ({ storageCapacity = 100 } = {}) => {
+    const items = await getUnassignedItems({ refresh: true, failClosed: true });
+    const storage = await getStorageItems();
+    const freeStorage = Math.max(0, Number(storageCapacity) - storage.length);
+    const readFlag = (item, key) =>
+      typeof item?.[key] === "function"
+        ? Boolean(item[key]())
+        : Boolean(item?.[key]);
+    const isDuplicate = (item) =>
+      readFlag(item, "isDuplicate") || Number(item?.duplicateId ?? 0) > 0;
+    const toClub = items.filter((item) => readFlag(item, "isMovable"));
+    const toStorage = items
+      .filter(
+        (item) =>
+          !readFlag(item, "isMovable") &&
+          readFlag(item, "isStorable") &&
+          isDuplicate(item) &&
+          !readFlag(item, "isTradeable"),
+      )
+      .slice(0, freeStorage);
+    await grindPilotMoveItems(toClub, GRINDPILOT_CLUB_PILE);
+    await grindPilotMoveItems(toStorage, GRINDPILOT_STORAGE_PILE);
+    clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
+    const [remaining, clubAfter, storageAfter] = await Promise.all([
+      getUnassignedItems({ refresh: true, failClosed: true }),
+      toClub.length
+        ? getClubPlayers({ ignoreLoaned: false, excludeActiveSquad: false })
+        : Promise.resolve([]),
+      toStorage.length ? getStorageItems() : Promise.resolve(storage),
+    ]);
+    const clubIds = new Set(clubAfter.map((item) => String(item?.id ?? "")));
+    const storageIds = new Set(storageAfter.map((item) => String(item?.id ?? "")));
+    const missingClubIds = toClub
+      .map((item) => String(item.id))
+      .filter((id) => !clubIds.has(id));
+    const missingStorageIds = toStorage
+      .map((item) => String(item.id))
+      .filter((id) => !storageIds.has(id));
+    if (missingClubIds.length || missingStorageIds.length) {
+      return grindPilotResult(
+        "ambiguous",
+        null,
+        "Item moves completed but destination state could not be verified",
+        { missingClubIds, missingStorageIds },
+      );
+    }
+    return grindPilotResult("verified", {
+      movedToClub: toClub.map((item) => String(item.id)),
+      movedToStorage: toStorage.map((item) => String(item.id)),
+      unresolvedItemIds: remaining.map((item) => String(item.id)),
+      unresolvedUnassigned: remaining.length,
+      storageUsed: storageAfter.length,
+      storageCapacity: Number(storageCapacity),
+    }, remaining.length ? "Unresolved items require a policy decision" : null);
+  };
+
+  const grindPilotReadInventory = async () => {
+    const snapshot = await ensurePlayersSnapshot(
+      { includeUnassigned: true },
+      { force: true },
+    );
+    return grindPilotResult("verified", {
+      club: snapshot?.clubPlayers ?? [],
+      storage: snapshot?.storagePlayers ?? [],
+      unassigned: snapshot?.unassignedPlayers ?? [],
+      generation: Number(playersFetchCacheRevision ?? 0),
+    });
+  };
+
   window.eaData = {
+    grindPilot: Object.freeze({
+      getHealth: () =>
+        grindPilotResult("verified", {
+          ...grindPilotContext(),
+          eaReady: isReady(),
+          storeAvailable: typeof services?.Store?.getPacks === "function",
+          itemMoveAvailable: typeof services?.Item?.move === "function",
+        }),
+      getContext: () => grindPilotContext(),
+      readInventory: () => grindPilotReadInventory(),
+      solveCurrentSbc: (options) => grindPilotSolveCurrent(options),
+      submitCurrentSbc: (intent) => grindPilotSubmitCurrent(intent),
+      listOwnedRewardPacks: () => grindPilotListOwnedPacks(),
+      claimCurrentReward: (intent) => grindPilotClaimReward(intent),
+      openOwnedRewardPack: (intent) => grindPilotOpenRewardPack(intent),
+      resolveUnassigned: (policy) => grindPilotResolveUnassigned(policy),
+      readPlayerPick: async () => {
+        const items = await getUnassignedItems({ refresh: true, failClosed: true });
+        const picks = items.filter((item) => item?.isPlayerPickItem?.());
+        return grindPilotResult("verified", {
+          pending: picks.length > 0,
+          pickItemIds: picks.map((item) => String(item.id)),
+          requiresUser: picks.length > 0,
+        });
+      },
+      selectPlayerPick: () =>
+        grindPilotResult("unavailable", null, "Automatic player-pick controller is not verified; pause for user"),
+    }),
     openSequenceSolver: () => openSequenceSolveOverlay(),
     openSequencePlanner: () => openSequenceSolveOverlay(),
     openWhatsNew: () => openWhatsNewOverlay({ source: "manual" }),

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">GrindPilot icon</title>
+  <desc id="desc">A blue navigation loop shaped like a geometric G on a dark navy rounded square.</desc>
+  <defs>
+    <linearGradient id="tile" x1="72" y1="52" x2="440" y2="460" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0D2C50"/>
+      <stop offset="1" stop-color="#061426"/>
+    </linearGradient>
+    <linearGradient id="route" x1="118" y1="108" x2="402" y2="399" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5CC8FF"/>
+      <stop offset="0.52" stop-color="#1677FF"/>
+      <stop offset="1" stop-color="#0A4ED1"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#tile)"/>
+  <rect x="37" y="37" width="438" height="438" rx="99" fill="none" stroke="#50B9FF" stroke-opacity="0.22" stroke-width="4"/>
+
+  <!-- The broken loop reads as both a workflow route and a compact letter G. -->
+  <circle cx="250" cy="256" r="129" fill="none" stroke="#04101F" stroke-opacity="0.48" stroke-width="72" stroke-linecap="round" stroke-dasharray="665 146" transform="rotate(-38 250 256) translate(0 5)"/>
+  <circle cx="250" cy="256" r="129" fill="none" stroke="url(#route)" stroke-width="64" stroke-linecap="round" stroke-dasharray="665 146" transform="rotate(-38 250 256)"/>
+
+  <!-- The forward course marker completes the G without relying on text. -->
+  <path d="M258 269H379" fill="none" stroke="#EAF7FF" stroke-width="48" stroke-linecap="round"/>
+  <path d="M349 223L395 269L349 315" fill="none" stroke="#EAF7FF" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="150" cy="151" r="18" fill="#FFFFFF"/>
+</svg>

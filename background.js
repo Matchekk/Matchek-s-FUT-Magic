@@ -6,8 +6,10 @@ const SOLVER_WORKER_RESPONSE = "SOLVER_WORKER_RESPONSE";
 // content scripts are still alive in already-open EA tabs.
 const LEGACY_SOLVER_WORKER_REQUEST = SOLVER_WORKER_RESPONSE;
 const BRIDGE_INJECT_REQUEST = "EA_PAGE_BRIDGE_INJECT";
+const GRINDPILOT_RPC_INSTALL_REQUEST = "EA_GRINDPILOT_RPC_INSTALL";
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
 const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
+const GP_STATE_COMMAND = "GRINDPILOT_STATE_COMMAND_V2";
 const ALLOWED_BRIDGE_INJECT_PATHS = new Set(["page/ea-data-bridge.js"]);
 const EA_WEBAPP_URL_RE =
   /^https:\/\/www\.ea\.com(?:\/[^/?#]+)?\/ea-sports-fc\/ultimate-team\/web-app(?:\/|$)/i;
@@ -46,6 +48,8 @@ import {
   buildSolverContext,
   solveSquad,
 } from "./solver/solver.js?v=2026-02-22d";
+import { normalizeProfile } from "./src/profiles/profile-service.js";
+import { normalizeWorkflowDefinition } from "./src/workflow/definitions.js";
 
 const isRecord = (value) =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -314,6 +318,54 @@ const markFutPriceBatchError = (ids, reason = null) => {
       cachedAt: now,
       retryAfter: now + FUT_PRICE_ERROR_BACKOFF_MS,
     });
+  }
+};
+
+const installGrindPilotMainWorldRpc = () => {
+  if (window.__grindPilotEaRpcInstalled) return;
+  window.__grindPilotEaRpcInstalled = true;
+  const requestType = "GRINDPILOT_EA_REQUEST_V1";
+  const responseType = "GRINDPILOT_EA_RESPONSE_V1";
+  const methods = new Set([
+    "getHealth", "getContext", "readInventory", "solveCurrentSbc",
+    "submitCurrentSbc", "listOwnedRewardPacks", "claimCurrentReward",
+    "openOwnedRewardPack", "resolveUnassigned", "readPlayerPick",
+    "selectPlayerPick", "openSequencePlanner",
+  ]);
+  window.addEventListener("message", async (event) => {
+    const data = event.data;
+    if (event.source !== window || data?.type !== requestType) return;
+    const requestId = String(data.requestId ?? "");
+    const method = String(data.method ?? "");
+    if (!requestId || !methods.has(method)) return;
+    try {
+      const target = method === "openSequencePlanner"
+        ? window.eaData
+        : window.eaData?.grindPilot;
+      const operation = target?.[method];
+      if (typeof operation !== "function") throw new Error(`EA operation unavailable: ${method}`);
+      const value = await operation(data.payload ?? undefined);
+      window.postMessage({ type: responseType, requestId, ok: true, value }, "*");
+    } catch (error) {
+      window.postMessage({ type: responseType, requestId, ok: false, error: {
+        code: error?.code || "EA_RPC_FAILED",
+        message: error?.message || "EA operation failed",
+      } }, "*");
+    }
+  }, true);
+};
+
+const handleGrindPilotRpcInstallRequest = async (sender, sendResponse) => {
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [0] },
+      world: "MAIN",
+      injectImmediately: true,
+      func: installGrindPilotMainWorldRpc,
+    });
+    sendResponse({ ok: true, data: { installed: true, results: result?.length ?? 0 } });
+  } catch (error) {
+    sendResponse({ ok: false, error: { code: "EA_RPC_INSTALL_FAILED", message: error?.message || "EA RPC installation failed" } });
   }
 };
 
@@ -720,12 +772,379 @@ const handleFutPlayersRequest = (message, sendResponse) => {
     });
 };
 
+const GP_KEYS = Object.freeze({
+  activeRun: "grindpilot.activeRun.v1",
+  activity: "grindpilot.activity.v1",
+  profiles: "grindpilot.profiles.v1",
+  projects: "grindpilot.projects.v1",
+  settings: "grindpilot.settings.v1",
+});
+const GP_MAX_STATE_BYTES = 2 * 1024 * 1024;
+const GP_LEASE_MS = 15 * 60_000;
+const GP_TERMINAL_STATUSES = new Set(["completed", "stopped", "failed"]);
+const GP_RUN_STATUSES = new Set([
+  "running", "waiting", "paused", "stopping", "stopped", "completed",
+  "failed", "recovery_required",
+]);
+const GP_SETTINGS_FIELDS = new Set([
+  "mode", "maxIterations", "storageCapacity", "protectRatingAtOrAbove",
+  "protectedCardTypes", "protectedItemIds", "protectedPlayerIds",
+  "protectedResourceIds", "protectStartingSquad", "protectFavorites",
+  "protectTradables", "preferUntradeables", "preferDuplicates",
+  "preferSbcStorage", "minimumReserveByRating", "preferredFodderRange",
+  "protectedRatings", "allowedSpecialTypes", "specialReserveByCardType",
+  "packMode", "maxPacks",
+  "pickMode", "stopConditions", "solverSettings", "duplicatePolicy",
+  "packPolicy", "pickPolicy", "workflow", "runLimits", "loadedProfileId",
+  "profileCeilings",
+]);
+const GP_BLOCKED_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+let grindPilotStateQueue = Promise.resolve();
+
+const gpStateError = (code, message, details = null) =>
+  Object.assign(new Error(message), { code, details });
+
+const gpStorageGet = (keys) =>
+  new Promise((resolve, reject) => {
+    chrome.storage.local.get(keys, (items) => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(gpStateError("GP_STATE_STORAGE_FAILED", error.message));
+      else resolve(items ?? {});
+    });
+  });
+
+const gpStorageSet = (entries) =>
+  new Promise((resolve, reject) => {
+    chrome.storage.local.set(entries, () => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(gpStateError("GP_STATE_STORAGE_FAILED", error.message));
+      else resolve(true);
+    });
+  });
+
+const gpStorageRemove = (keys) =>
+  new Promise((resolve, reject) => {
+    chrome.storage.local.remove(keys, () => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(gpStateError("GP_STATE_STORAGE_FAILED", error.message));
+      else resolve(true);
+    });
+  });
+
+const gpCloneJson = (value, label = "State value") => {
+  let encoded;
+  try {
+    encoded = JSON.stringify(value);
+  } catch {
+    throw gpStateError("GP_STATE_INVALID", `${label} must be JSON serializable`);
+  }
+  if (encoded === undefined) {
+    throw gpStateError("GP_STATE_INVALID", `${label} must be JSON serializable`);
+  }
+  const bytes = new TextEncoder().encode(encoded).byteLength;
+  if (bytes > GP_MAX_STATE_BYTES) {
+    throw gpStateError("GP_STATE_TOO_LARGE", `${label} exceeds the 2 MiB limit`);
+  }
+  const clone = JSON.parse(encoded);
+  const visit = (entry, depth = 0) => {
+    if (depth > 64) throw gpStateError("GP_STATE_INVALID", `${label} is too deeply nested`);
+    if (!entry || typeof entry !== "object") return;
+    for (const [key, child] of Object.entries(entry)) {
+      if (GP_BLOCKED_KEYS.has(key)) {
+        throw gpStateError("GP_STATE_INVALID", `${label} contains a blocked key`);
+      }
+      visit(child, depth + 1);
+    }
+  };
+  visit(clone);
+  return clone;
+};
+
+const gpSafeId = (value, label) => {
+  const id = String(value ?? "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(id)) {
+    throw gpStateError("GP_STATE_INVALID", `${label} is invalid`);
+  }
+  return id;
+};
+
+const gpValidateSettings = (value) => {
+  const settings = gpCloneJson(value, "Settings");
+  if (!isRecord(settings)) throw gpStateError("GP_STATE_INVALID", "Settings must be an object");
+  for (const key of Object.keys(settings)) {
+    if (!GP_SETTINGS_FIELDS.has(key)) {
+      throw gpStateError("GP_STATE_INVALID", `Unsupported settings field: ${key}`);
+    }
+  }
+  if (settings.workflow != null) settings.workflow = normalizeWorkflowDefinition(settings.workflow);
+  if (settings.runLimits != null) {
+    const limits = settings.runLimits;
+    if (!isRecord(limits) || !Number.isSafeInteger(limits.maxIterations) || limits.maxIterations < 1 || limits.maxIterations > 10_000) {
+      throw gpStateError("GP_STATE_INVALID", "runLimits.maxIterations is invalid");
+    }
+    for (const field of ["maxSbcSubmissions", "maxPacksOpened", "maxDurationMinutes"]) {
+      if (limits[field] != null && (!Number.isSafeInteger(limits[field]) || limits[field] < 1)) {
+        throw gpStateError("GP_STATE_INVALID", `runLimits.${field} is invalid`);
+      }
+    }
+  }
+  if (settings.duplicatePolicy?.quicksell === true) {
+    throw gpStateError("GP_STATE_INVALID", "Implicit quicksell cannot be persisted");
+  }
+  return settings;
+};
+
+const gpValidateActivity = (value) => {
+  const activity = gpCloneJson(value, "Activity");
+  if (!Array.isArray(activity) || activity.length > 500 || activity.some((entry) => !isRecord(entry))) {
+    throw gpStateError("GP_STATE_INVALID", "Activity must contain at most 500 records");
+  }
+  return activity;
+};
+
+const gpValidateProjects = (value) => {
+  const projects = gpCloneJson(value, "Target projects");
+  if (!Array.isArray(projects) || projects.length > 100) {
+    throw gpStateError("GP_STATE_INVALID", "Target projects must contain at most 100 records");
+  }
+  for (const project of projects) {
+    if (!isRecord(project)) throw gpStateError("GP_STATE_INVALID", "Target project must be an object");
+    gpSafeId(project.id, "Target project id");
+    if (typeof project.name !== "string" || !project.name.trim() || project.name.length > 120) {
+      throw gpStateError("GP_STATE_INVALID", "Target project name is invalid");
+    }
+  }
+  return projects;
+};
+
+const gpValidateRun = (value) => {
+  const run = gpCloneJson(value, "Workflow run");
+  if (!isRecord(run)) throw gpStateError("GP_RUN_INVALID", "Workflow run must be an object");
+  gpSafeId(run.runId, "Workflow run id");
+  if (!Number.isSafeInteger(run.revision) || run.revision < 0) {
+    throw gpStateError("GP_RUN_INVALID", "Workflow revision is invalid");
+  }
+  if (!GP_RUN_STATUSES.has(String(run.status))) {
+    throw gpStateError("GP_RUN_INVALID", "Workflow status is invalid");
+  }
+  run.definition = normalizeWorkflowDefinition(run.definition);
+  if (!Array.isArray(run.nodes) || run.nodes.length > 10_000) {
+    throw gpStateError("GP_RUN_INVALID", "Workflow execution nodes are invalid");
+  }
+  return run;
+};
+
+const gpNormalizeRunRecord = (stored) => {
+  if (!stored) return null;
+  if (isRecord(stored) && isRecord(stored.run)) {
+    return { run: gpValidateRun(stored.run), lease: isRecord(stored.lease) ? stored.lease : null };
+  }
+  return { run: gpValidateRun(stored), lease: null };
+};
+
+const gpCaller = (sender, ownerValue) => ({
+  tabId: sender.tab.id,
+  ownerId: gpSafeId(ownerValue, "Workflow owner id"),
+});
+
+const gpIsMissingTabError = (error) =>
+  /^No tab with id\b/i.test(String(error?.message ?? error ?? "").trim());
+
+const gpIsTabGone = (tabId) => {
+  if (!Number.isInteger(tabId) || typeof chrome.tabs?.get !== "function") {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId = null;
+    const finish = (gone) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(gone === true);
+    };
+    timeoutId = setTimeout(() => finish(false), 1000);
+    try {
+      const pending = chrome.tabs.get(tabId, () => {
+        const error = chrome.runtime?.lastError;
+        finish(error ? gpIsMissingTabError(error) : false);
+      });
+      if (pending && typeof pending.then === "function") {
+        pending.then(
+          () => finish(false),
+          (error) => finish(gpIsMissingTabError(error)),
+        );
+      }
+    } catch (error) {
+      finish(gpIsMissingTabError(error));
+    }
+  });
+};
+
+const gpAssertOrClaimOwner = (
+  record,
+  caller,
+  { allowClaim = false, ownerTabGone = false } = {},
+) => {
+  const now = Date.now();
+  const lease = record.lease;
+  const ownedByCaller =
+    lease?.tabId === caller.tabId && lease?.ownerId === caller.ownerId;
+  const sameTab = lease?.tabId === caller.tabId;
+  const expired =
+    !Number.isFinite(Number(lease?.expiresAt)) || Number(lease.expiresAt) <= now;
+  if (
+    !ownedByCaller &&
+    !(allowClaim && (sameTab || expired || ownerTabGone || !lease))
+  ) {
+    throw gpStateError(
+      "WORKFLOW_OWNED_BY_OTHER_TAB",
+      "This active workflow is owned by another EA Web App tab",
+      { ownerTabId: lease?.tabId ?? null, leaseExpiresAt: lease?.expiresAt ?? null },
+    );
+  }
+  record.lease = { ...caller, expiresAt: now + GP_LEASE_MS };
+  return record;
+};
+
+const gpReadRunRecord = async () => {
+  const stored = await gpStorageGet([GP_KEYS.activeRun]);
+  return gpNormalizeRunRecord(stored[GP_KEYS.activeRun] ?? null);
+};
+
+const gpWriteRunRecord = (record) =>
+  gpStorageSet({ [GP_KEYS.activeRun]: gpCloneJson(record, "Workflow record") });
+
+const gpHandleStateAction = async (action, payload, sender) => {
+  const input = isRecord(payload) ? payload : {};
+  if (action === "BOOTSTRAP_LOAD") {
+    const stored = await gpStorageGet([GP_KEYS.activity, GP_KEYS.projects, GP_KEYS.settings]);
+    const safeStored = (validator, value, fallback) => {
+      try { return validator(value); } catch { return fallback; }
+    };
+    return {
+      activity: safeStored(gpValidateActivity, stored[GP_KEYS.activity] ?? [], []),
+      projects: safeStored(gpValidateProjects, stored[GP_KEYS.projects] ?? [], []),
+      settings: safeStored(gpValidateSettings, stored[GP_KEYS.settings] ?? {}, {}),
+    };
+  }
+  if (action === "SETTINGS_SAVE") {
+    await gpStorageSet({ [GP_KEYS.settings]: gpValidateSettings(input.value) });
+    return true;
+  }
+  if (action === "ACTIVITY_SAVE") {
+    await gpStorageSet({ [GP_KEYS.activity]: gpValidateActivity(input.value) });
+    return true;
+  }
+  if (action === "PROJECTS_SAVE") {
+    await gpStorageSet({ [GP_KEYS.projects]: gpValidateProjects(input.value) });
+    return true;
+  }
+  if (["PROFILE_LIST", "PROFILE_GET", "PROFILE_PUT", "PROFILE_DELETE"].includes(action)) {
+    const stored = await gpStorageGet([GP_KEYS.profiles]);
+    const profiles = isRecord(stored[GP_KEYS.profiles]) ? stored[GP_KEYS.profiles] : {};
+    if (action === "PROFILE_LIST") return Object.values(profiles).map((profile) => normalizeProfile(profile));
+    const id = gpSafeId(input.id ?? input.profile?.id, "Profile id");
+    if (action === "PROFILE_GET") return profiles[id] ? normalizeProfile(profiles[id]) : null;
+    if (action === "PROFILE_PUT") {
+      const profile = normalizeProfile(input.profile);
+      profiles[id] = profile;
+      await gpStorageSet({ [GP_KEYS.profiles]: gpCloneJson(profiles, "Profiles") });
+      return profile;
+    }
+    if (!Object.hasOwn(profiles, id)) return false;
+    delete profiles[id];
+    if (Object.keys(profiles).length) await gpStorageSet({ [GP_KEYS.profiles]: profiles });
+    else await gpStorageRemove([GP_KEYS.profiles]);
+    return true;
+  }
+
+  const caller = gpCaller(sender, input.ownerId);
+  if (action === "RUN_CREATE") {
+    const run = gpValidateRun(input.run);
+    const existing = await gpReadRunRecord();
+    if (existing && !GP_TERMINAL_STATUSES.has(existing.run.status)) {
+      throw gpStateError("WORKFLOW_ALREADY_ACTIVE", "A workflow run is already active");
+    }
+    const record = gpAssertOrClaimOwner({ run, lease: null }, caller, { allowClaim: true });
+    await gpWriteRunRecord(record);
+    return record.run;
+  }
+  const record = await gpReadRunRecord();
+  if (!record) return null;
+  if (action === "RUN_LOAD_ACTIVE" || action === "RUN_LOAD") {
+    if (action === "RUN_LOAD" && String(record.run.runId) !== String(input.runId)) return null;
+    if (!GP_TERMINAL_STATUSES.has(record.run.status)) {
+      const ownerTabGone =
+        record.lease?.tabId !== caller.tabId &&
+        (await gpIsTabGone(record.lease?.tabId));
+      gpAssertOrClaimOwner(record, caller, { allowClaim: true, ownerTabGone });
+      await gpWriteRunRecord(record);
+    }
+    return record.run;
+  }
+  if (String(record.run.runId) !== String(input.runId ?? input.run?.runId ?? "")) {
+    throw gpStateError("WORKFLOW_NOT_FOUND", "Workflow run was not found");
+  }
+  gpAssertOrClaimOwner(record, caller);
+  if (action === "RUN_ASSERT_OWNER") {
+    await gpWriteRunRecord(record);
+    return true;
+  }
+  if (action === "RUN_SAVE") {
+    const run = gpValidateRun(input.run);
+    if (input.expectedRevision != null && Number(record.run.revision) !== Number(input.expectedRevision)) {
+      throw gpStateError("WORKFLOW_REVISION_CONFLICT", "Workflow run revision changed", {
+        expectedRevision: input.expectedRevision,
+        actualRevision: record.run.revision,
+      });
+    }
+    record.run = run;
+    if (GP_TERMINAL_STATUSES.has(run.status)) record.lease = null;
+    await gpWriteRunRecord(record);
+    return run;
+  }
+  if (action === "RUN_CLEAR") {
+    await gpStorageRemove([GP_KEYS.activeRun]);
+    return true;
+  }
+  throw gpStateError("GP_STATE_ACTION_FORBIDDEN", "State command is not allowed");
+};
+
+const handleGrindPilotStateCommand = (message, sender, sendResponse) => {
+  const action = String(message?.action ?? "").toUpperCase();
+  const requestId = normalizeRequestId(message?.requestId);
+  const allowed = new Set([
+    "BOOTSTRAP_LOAD", "SETTINGS_SAVE", "ACTIVITY_SAVE", "PROJECTS_SAVE",
+    "PROFILE_LIST", "PROFILE_GET", "PROFILE_PUT", "PROFILE_DELETE",
+    "RUN_LOAD_ACTIVE", "RUN_LOAD", "RUN_CREATE", "RUN_SAVE",
+    "RUN_ASSERT_OWNER", "RUN_CLEAR",
+  ]);
+  if (!requestId || !allowed.has(action)) {
+    sendResponse({ requestId, action, ok: false, data: null, error: { code: "GP_STATE_ACTION_FORBIDDEN", message: "State command is not allowed" } });
+    return;
+  }
+  const execute = () => gpHandleStateAction(action, message?.payload, sender);
+  const pending = grindPilotStateQueue.then(execute, execute);
+  grindPilotStateQueue = pending.catch(() => {});
+  pending.then(
+    (data) => sendResponse({ requestId, action, ok: true, data: data ?? null, error: null }),
+    (error) => sendResponse({ requestId, action, ok: false, data: null, error: {
+      code: error?.code || "GP_STATE_FAILED",
+      message: error?.message || "State command failed",
+      details: error?.details ?? null,
+    } }),
+  );
+};
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isRecord(message)) return false;
   const knownType =
     message.type === BRIDGE_INJECT_REQUEST ||
+    message.type === GRINDPILOT_RPC_INSTALL_REQUEST ||
     message.type === PRICE_BRIDGE_REQUEST ||
     message.type === FUTGG_PLAYERS_BRIDGE_REQUEST ||
+    message.type === GP_STATE_COMMAND ||
     message.type === SOLVER_BRIDGE_REQUEST;
   if (!knownType) return false;
 
@@ -747,6 +1166,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleFutPlayersRequest(message, sendResponse);
     return true;
   }
+  if (message?.type === GRINDPILOT_RPC_INSTALL_REQUEST) {
+    handleGrindPilotRpcInstallRequest(sender, sendResponse);
+    return true;
+  }
+  if (message?.type === GP_STATE_COMMAND) {
+    handleGrindPilotStateCommand(message, sender, sendResponse);
+    return true;
+  }
   console.log("[EA Data] Background request", {
     type: message?.payload?.type ?? null,
     debug: message?.payload?.payload?.debug ?? null,
@@ -754,6 +1181,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleSolverRequest(message, sendResponse);
   return true;
 });
+
+if (chrome.tabs?.onRemoved?.addListener) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    if (!Number.isInteger(tabId)) return;
+    const releaseLease = async () => {
+      const record = await gpReadRunRecord();
+      if (!record || record.lease?.tabId !== tabId) return;
+      record.lease = null;
+      await gpWriteRunRecord(record);
+    };
+    const pending = grindPilotStateQueue.then(releaseLease, releaseLease);
+    grindPilotStateQueue = pending.catch((error) => {
+      console.warn("[GrindPilot] Failed to release removed-tab workflow lease", {
+        tabId,
+        code: error?.code ?? null,
+        message: error?.message ?? String(error),
+      });
+    });
+  });
+}
 
 chrome.runtime.onConnect.addListener((port) => {
   if (!port || port.name !== SOLVER_PORT_NAME) return;
@@ -772,7 +1219,6 @@ chrome.runtime.onConnect.addListener((port) => {
     } catch {}
     return;
   }
-
   port.onMessage.addListener((msg) => {
     if (!isRecord(msg)) return;
     if (

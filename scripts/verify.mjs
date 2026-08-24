@@ -33,6 +33,8 @@ for (const file of walk(root).filter(
 
 const referenced = new Set([
   manifest.background?.service_worker,
+  ...Object.values(manifest.icons || {}),
+  ...Object.values(manifest.action?.default_icon || {}),
   ...(manifest.content_scripts || []).flatMap((entry) => [
     ...(entry.js || []),
     ...(entry.css || []),
@@ -41,8 +43,34 @@ const referenced = new Set([
     (entry) => entry.resources || [],
   ),
 ]);
+const releaseFiles = walk(root).map((path) => relative(root, path).replaceAll("\\", "/"));
+const wildcardRegex = (pattern) => new RegExp(
+  `^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`,
+);
 for (const path of referenced) {
-  if (path && !existsSync(join(root, path))) errors.push(`Missing manifest asset: ${path}`);
+  if (!path) continue;
+  const exists = path.includes("*")
+    ? releaseFiles.some((file) => wildcardRegex(path).test(file))
+    : existsSync(join(root, path));
+  if (!exists) errors.push(`Missing manifest asset: ${path}`);
+}
+
+const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+for (const [declaredSize, path] of Object.entries(manifest.icons || {})) {
+  if (!path || !existsSync(join(root, path))) continue;
+  const png = readFileSync(join(root, path));
+  if (png.length < 24 || !png.subarray(0, 8).equals(pngSignature)) {
+    errors.push(`Manifest icon is not a valid PNG: ${path}`);
+    continue;
+  }
+  const width = png.readUInt32BE(16);
+  const height = png.readUInt32BE(20);
+  const expected = Number(declaredSize);
+  if (width !== expected || height !== expected) {
+    errors.push(
+      `Manifest icon ${path} must be ${expected}x${expected}, got ${width}x${height}`,
+    );
+  }
 }
 
 for (const entry of manifest.content_scripts || []) {

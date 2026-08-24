@@ -2,6 +2,8 @@ sources/
 dist/
 *.zip
 node_modules/
+.playwright-cli/
+.bug-hunter/
 solver/glpk.js
 solver/glpk.wasm
 .DS_Store
