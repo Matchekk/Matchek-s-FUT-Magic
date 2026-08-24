@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Hardened local-first FC26 SBC browser extension derived from AutoPilot-SBC with selected Auto-SBC policies.",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test \"test/**/*.test.js\"",
     "check": "node scripts/verify.mjs"
   },
   "license": "GPL-3.0-only",

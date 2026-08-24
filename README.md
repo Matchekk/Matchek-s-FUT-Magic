@@ -82,8 +82,8 @@ solver/                      Compiler, Heuristik, Chemistry, Policies
 ```
 
 Die detaillierte technische Entscheidung steht in
-[`docs/UPSTREAM_ANALYSIS.md`](docs/UPSTREAM_ANALYSIS.md). Die verbleibende
-Modularisierung ist in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+[`docs/upstream-analysis.md`](docs/upstream-analysis.md). Die verbleibende
+Modularisierung ist in [`docs/architecture.md`](docs/architecture.md)
 dokumentiert.
 
 ## Datenschutz
