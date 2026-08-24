@@ -30874,18 +30874,18 @@
     const items = await getUnassignedItems({ refresh: true });
     const storage = await getStorageItems();
     const freeStorage = Math.max(0, Number(storageCapacity) - storage.length);
-    const toClub = items.filter((item) => item?.isMovable?.());
+    const readFlag = (item, key) =>
+      typeof item?.[key] === "function"
+        ? Boolean(item[key]())
+        : Boolean(item?.[key]);
+    const toClub = items.filter((item) => readFlag(item, "isMovable"));
     const toStorage = items
       .filter(
         (item) =>
-          !item?.isMovable?.() &&
-          item?.isStorable?.() &&
-          (typeof item?.isDuplicate === "function"
-            ? item.isDuplicate()
-            : Boolean(item?.isDuplicate)) &&
-          (typeof item?.isTradeable === "function"
-            ? !item.isTradeable()
-            : item?.isTradeable === false),
+          !readFlag(item, "isMovable") &&
+          readFlag(item, "isStorable") &&
+          readFlag(item, "isDuplicate") &&
+          !readFlag(item, "isTradeable"),
       )
       .slice(0, freeStorage);
     await grindPilotMoveItems(toClub, GRINDPILOT_CLUB_PILE);

@@ -25,7 +25,9 @@ export class GrindPanel {
   constructor(runtime) {
     this.runtime = runtime;
     this.host = document.createElement("grindpilot-panel");
-    this.shadow = this.host.attachShadow({ mode: "closed" });
+    // Open shadow DOM keeps the panel style-isolated while remaining inspectable
+    // for accessibility tools and the opt-in Developer Mode.
+    this.shadow = this.host.attachShadow({ mode: "open" });
     this.state = runtime.getState();
     this.activeSection = "Dashboard";
     this.renderShell();
@@ -85,7 +87,7 @@ export class GrindPanel {
 
   renderInventory() { const i=this.state.inventory||{}; return `<div class="grid"><div class="card"><div class="label">Club</div><div class="metric">${i.clubCount||0}</div></div><div class="card"><div class="label">SBC Storage</div><div class="metric">${i.storageCount||0}</div></div><div class="card"><div class="label">Free slots</div><div class="metric">${i.storageFreeSlots ?? "?"}</div></div><div class="card"><div class="label">Unassigned</div><div class="metric">${i.unassignedCount||0}</div></div></div><div class="controls"><button class="action" data-action="inventory">Synchronize</button></div>`; }
   renderProtectedCards() { return `<div class="card"><b>Fail-closed conservation</b><p class="hint">Protected owned item IDs, resource IDs, ratings, card types, starting squad, favourites, tradables and per-rating reserves are removed from the candidate pool before solve and rechecked before submit.</p></div>`; }
-  renderTargetProjects() { const projects=this.state.projects||[]; return projects.length ? projects.map((p)=>`<div class="card"><b>${escapeHtml(p.name)}</b><div class="hint">Priority ${escapeHtml(p.priority)} · ${escapeHtml(p.requiredSquadsRemaining)} squads remaining</div></div>`).join("") : '<div class="empty">No active target projects. Profiles can carry arbitrary project protection policies.</div>'; }
+  renderTargetProjects() { const projects=this.state.projects||[]; return `<div class="form"><div class="field"><label>Project name</label><input data-project="name" placeholder="Target SBC"></div><div class="field"><label>Squads remaining</label><input data-project="remaining" type="number" min="0" value="1"></div><div class="field"><label>Protect rating at or above</label><input data-project="rating" type="number" min="1" max="99" value="90"></div><div class="field"><label>Priority</label><input data-project="priority" type="number" min="0" max="100" value="50"></div></div><div class="controls"><button class="action primary" data-action="add-project">Add target project</button></div>${projects.length ? projects.map((p)=>`<div class="card"><b>${escapeHtml(p.name)}</b><div class="hint">Priority ${escapeHtml(p.priority)} · ${escapeHtml(p.requiredSquadsRemaining)} squads remaining · protects ${escapeHtml(p.protectedRatings?.atOrAbove ?? "configured reserves")}</div><button class="action danger" data-remove-project="${escapeHtml(p.id)}">Remove</button></div>`).join("") : '<div class="empty">No active target projects.</div>'}`; }
   renderActivity() { const logs=(this.state.logs||[]).slice(-200).reverse(); return logs.length ? logs.map((e)=>`<div class="log"><span class="muted">${escapeHtml((e.timestamp||"").slice(11,19))}</span><b>${escapeHtml(e.action)}</b><span>${escapeHtml(e.message)}</span></div>`).join("") : '<div class="empty">No activity yet.</div>'; }
   renderSettings() { return `<div class="card"><b>Safety defaults</b><p class="hint">No pack purchases, no market automation, no credential persistence, no automatic quicksell. Ambiguous EA state always pauses.</p></div>`; }
   renderDeveloper() { const d=this.state.diagnostics||{}; return `<div class="form"><div class="field"><label><input data-field="developerMode" type="checkbox" ${d.enabled ? "checked" : ""}> Developer Mode</label></div></div><div class="controls"><button class="action" data-action="diagnostic-snapshot">Take snapshot</button><button class="action" data-action="diagnostic-export">Export diagnostics</button></div><textarea readonly>${escapeHtml(JSON.stringify(d.latest || d, null, 2))}</textarea><p class="hint">Instrumentation remains dormant while Developer Mode is disabled. Export is redacted and excludes request bodies, headers and credentials.</p>`; }
@@ -106,12 +108,13 @@ export class GrindPanel {
         else if(action==="save-profile") await this.runtime.saveDraftProfile(); else if(action==="export-profile") downloadJson("grindpilot-profile.json", await this.runtime.exportCurrentProfile());
         else if(action==="import-profile") { const file=node.files?.[0]; if(file) await this.runtime.importProfile(await file.text()); }
         else if(action==="diagnostic-snapshot") await this.runtime.takeDiagnosticSnapshot(); else if(action==="diagnostic-export") downloadJson("grindpilot-diagnostics.json", await this.runtime.exportDiagnostics());
+        else if(action==="add-project") await this.runtime.addTargetProject({ name:root.querySelector('[data-project="name"]')?.value, requiredSquadsRemaining:Number(root.querySelector('[data-project="remaining"]')?.value||0), protectRatingAtOrAbove:Number(root.querySelector('[data-project="rating"]')?.value||0), priority:Number(root.querySelector('[data-project="priority"]')?.value||0) });
       } catch(error) { this.runtime.reportUiError(error); }
     }));
     root.querySelectorAll("[data-load-profile]").forEach((node)=>node.addEventListener("click",()=>this.runtime.loadProfile(node.dataset.loadProfile)));
+    root.querySelectorAll("[data-remove-project]").forEach((node)=>node.addEventListener("click",()=>this.runtime.removeTargetProject(node.dataset.removeProject)));
     const dev=root.querySelector('[data-field="developerMode"]'); if(dev) dev.addEventListener("change",()=>this.runtime.setDeveloperMode(dev.checked));
   }
 
   dispose() { this.unsubscribe?.(); this.host.remove(); }
 }
-

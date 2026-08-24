@@ -301,6 +301,12 @@ class GrindPilotRuntime {
   async loadProfile(id) { const p=await this.profileService.get(id); if(!p)return; this.config={...this.defaultConfig(),maxIterations:p.runLimits.maxIterations,protectRatingAtOrAbove:p.fodderPolicy.protectRatingAtOrAbove,protectedCardTypes:p.fodderPolicy.protectedCardTypes||[],packMode:p.packPolicy.mode,pickMode:p.pickPolicy.type}; this.state.draft=this.config; this.emit(); }
   async exportCurrentProfile() { const p=this.state.profiles.at(-1) || await this.saveDraftProfile(); return this.profileService.export(p.id); }
   async importProfile(text) { await this.profileService.import(text,{overwrite:false}); this.state.profiles=await this.profileService.list(); this.emit(); }
+  async addTargetProject(input) {
+    const name=String(input?.name||"").trim(); if(!name)throw new Error("Target project name is required");
+    const project=this.targets.upsert({ id:`project-${Date.now()}`, name, active:true, priority:Math.max(0,Math.trunc(input.priority||0)), requiredSquadsRemaining:Math.max(0,Math.trunc(input.requiredSquadsRemaining||0)), protectedRatings:{ atOrAbove:input.protectRatingAtOrAbove||null }, ratingRequirements:[], specialCardRequirements:[], completionProgress:0 });
+    this.state.projects=this.targets.list(); await this.storage.set({[PROJECTS_KEY]:this.state.projects}); this.emit(); return project;
+  }
+  async removeTargetProject(id) { this.targets.remove(id); this.state.projects=this.targets.list(); await this.storage.set({[PROJECTS_KEY]:this.state.projects}); this.emit(); }
   async setDeveloperMode(enabled) { enabled?this.dev.enable():this.dev.disable(); this.state.diagnostics={...this.dev.getStatus(),latest:this.state.diagnostics.latest||null}; this.emit(); }
   async takeDiagnosticSnapshot() { const health=await this.adapter.health().catch(error=>({error:error.message})); const latest=this.dev.captureSnapshot({ bridgeHealth:health,route:location.pathname,selectors:{controllerBridge:Boolean(window.eaData?.grindPilot)} }); this.state.diagnostics={...this.dev.getStatus(),latest,diff:this.dev.compareLatestSnapshots()}; this.emit(); return latest; }
   async exportDiagnostics() { return this.dev.exportDiagnostics({ healthChecks:[await this.adapter.health().catch(error=>({error:error.message}))], logs:this.logger.entries() }); }
