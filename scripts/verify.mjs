@@ -41,8 +41,16 @@ const referenced = new Set([
     (entry) => entry.resources || [],
   ),
 ]);
+const releaseFiles = walk(root).map((path) => relative(root, path).replaceAll("\\", "/"));
+const wildcardRegex = (pattern) => new RegExp(
+  `^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`,
+);
 for (const path of referenced) {
-  if (path && !existsSync(join(root, path))) errors.push(`Missing manifest asset: ${path}`);
+  if (!path) continue;
+  const exists = path.includes("*")
+    ? releaseFiles.some((file) => wildcardRegex(path).test(file))
+    : existsSync(join(root, path));
+  if (!exists) errors.push(`Missing manifest asset: ${path}`);
 }
 
 for (const entry of manifest.content_scripts || []) {

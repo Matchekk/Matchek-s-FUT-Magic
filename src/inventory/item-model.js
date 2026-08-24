@@ -118,7 +118,7 @@ export const normalizeInventoryItem = (raw, options = {}) => {
   const assetId = normalizeIdentifier(readFirst(raw, ["assetId", "assetID"]), {
     name: "assetId",
   });
-  const baseId = normalizeIdentifier(readFirst(raw, ["baseId", "baseID"]), {
+  const baseId = normalizeIdentifier(readFirst(raw, ["baseId", "baseID", "basePlayerId"]), {
     name: "baseId",
   });
   const location = normalizeInventoryLocation(options.location ?? raw.location);
@@ -148,4 +148,3 @@ export const normalizeInventoryItem = (raw, options = {}) => {
     isProtected: Boolean(raw.isProtected),
   });
 };
-

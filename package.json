@@ -1,9 +1,9 @@
 {
-  "name": "autosbc-best-of",
-  "version": "2.0.0",
+  "name": "grindpilot-fc26",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
-  "description": "Hardened local-first FC26 SBC browser extension derived from AutoPilot-SBC with selected Auto-SBC policies.",
+  "description": "Unified local-first FC26 SBC grind manager derived from AutoPilot-SBC.",
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
     "check": "node scripts/verify.mjs"

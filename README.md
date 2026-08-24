@@ -1,10 +1,28 @@
-# Matchek's FUT Magic – AutoSBC Best-of
+# GrindPilot FC26
 
-Eine lokal laufende Chrome-/Edge-Extension für SBCs in der EA SPORTS FC 26 Web App.
-Sie basiert auf den stärksten Teilen von
-[AutoPilot-SBC](https://github.com/icysymmetra/AutoPilot-SBC) und übernimmt
-aus [Auto-SBC](https://github.com/titiroMonkey/Auto-SBC) nur die nach der
-Codeanalyse tragfähigen Solver- und Kostenideen.
+Eine einheitliche, lokal laufende Chrome-/Edge-Extension für SBC-Grinds in der
+EA SPORTS FC 26 Web App. AutoPilot-SBC bleibt die kanonische Basis und der
+vorhandene Browser-Solver bleibt Standard. GrindPilot ergänzt eine persistente
+Workflow-State-Machine, Reward-/Inventar-Domänen, Schutzrichtlinien, Profile,
+Aktivitätslogs und eine einzige gemeinsame Oberfläche.
+
+## MVP-Workflow
+
+Über den einklappbaren `GP`-Button läuft ein begrenzter, überprüfter Ablauf:
+
+1. aktuelles SBC lösen;
+2. Squad vor dem Submit erneut gegen Challenge, Lösung und Schutzkarten prüfen;
+3. Reward claimen und genau einem neuen, bereits besessenen Pack zuordnen;
+4. nur dieses erlaubte Reward-Pack öffnen;
+5. Player Picks erkennen und bei fehlender sicherer Entscheidung pausieren;
+6. normale Karten zum Club und geeignete untradeable Duplikate in den SBC
+   Storage verschieben;
+7. bei Rest-Duplikaten pausieren;
+8. höchstens die bestätigte Anzahl Wiederholungen ausführen.
+
+REVIEW erstellt nur die Vorschau. ASSISTED fragt vor destruktiven Schritten.
+AUTO zeigt vor dem Start eine Zusammenfassung und bindet die einmalige
+Bestätigung an exakt diese Workflow-Version und ihren Hash.
 
 ## Was bewusst kombiniert wurde
 
@@ -22,8 +40,9 @@ umgesetzt:
 - harte Requirements werden vor dem Anwenden erneut validiert.
 
 Nicht übernommen wurden das offene FastAPI-Backend, Remote-CDN-Skripte,
-CSV-Exports des Clubinventars, Quick-Buy/Pack-Automation und die fehlerhafte
-CP-SAT-Chemistry-Implementierung.
+CSV-Exports des Clubinventars, Markt-/Trading-Automation und die fehlerhafte
+CP-SAT-Chemistry-Implementierung. GrindPilot kauft keine Packs und speichert
+keine EA-Anmeldedaten.
 
 ## Sicherheits- und Korrektheitsverbesserungen
 
@@ -61,16 +80,20 @@ npm test
 npm run check
 ```
 
-`npm test` enthält Regressionstests für Fail-closed-Requirements,
-unvollständige Spielerpools, Null-Constraints, Chemistry/Positionen und die
-übernommene Spielerwert-Policy. `npm run check` validiert JavaScript-Syntax,
-Manifest-Assets und Least-Privilege-Invarianten.
+`npm test` enthält Regressionstests für Solver, FC26-Rating, Identitäten,
+Inventory, Storage, Duplikate, Schutzrichtlinien, Target Projects, Packs,
+Player Picks, Profile, Workflow-Zustände/Recovery und Developer Mode.
+`npm run check` validiert JavaScript-Syntax, Manifest-Assets und
+Least-Privilege-Invarianten.
 
 ## Architektur
 
 ```text
 EA Web App (MAIN world)
-  page/ea-data-bridge.js     EA-Adapter, UI und Automation
+  page/ea-data-bridge.js     erhaltener AutoPilot-Controller-Adapter
+  src/grindpilot-main.js     Domain-Orchestrierung und einheitliche UI
+  src/workflow/              persistente explizite State Machine
+  src/inventory|packs|...    kleine testbare Domänen
           ⇅ korrelierte, begrenzte Messages
 Content Script (ISOLATED)
   content-script.js          Protokollprüfung und Extension-Grenze
@@ -81,9 +104,10 @@ Background Service Worker
 solver/                      Compiler, Heuristik, Chemistry, Policies
 ```
 
-Die detaillierte technische Entscheidung steht in
+Die detaillierten Entscheidungen stehen in
 [`docs/upstream-analysis.md`](docs/upstream-analysis.md). Die verbleibende
-Modularisierung ist in [`docs/architecture.md`](docs/architecture.md)
+Architektur ist in [`docs/architecture.md`](docs/architecture.md), die
+State-Machine in [`docs/workflow-engine.md`](docs/workflow-engine.md)
 dokumentiert.
 
 ## Datenschutz
@@ -100,6 +124,9 @@ Details: [`PRIVACY.md`](PRIVACY.md).
 - Der aktuelle Squad-Selektor ist eine validierte Heuristik, kein mathematischer
   Optimalitätsbeweis. Ein sauber neu modellierter CP-SAT-Kern bleibt eine
   geplante zweite Engine.
+- Die verifizierte EA-Controller-Oberfläche liefert derzeit keine vollständigen
+  Player-Pick-Angebote. GrindPilot erkennt den Zustand und pausiert deshalb,
+  statt eine Auswahl zu erraten.
 - Sonderkarten mit eigenen Chemistry-Boost-Regeln benötigen reale FC-26-
   Golden-Fixtures, bevor sie sicher modelliert werden können.
 - Das Tool ist inoffiziell, nicht mit EA verbunden und wird auf eigenes Risiko

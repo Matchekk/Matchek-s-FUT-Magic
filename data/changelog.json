@@ -2,6 +2,19 @@
   "version": 1,
   "releases": [
     {
+      "version": "2.1.0",
+      "date": "2026-08-24",
+      "headline": "GrindPilot FC26 unified grind-manager MVP.",
+      "summary": "Added one persistent workflow UI for solving, submitting, claiming, opening owned rewards, resolving items and safely repeating.",
+      "details": [
+        "Added explicit REVIEW, ASSISTED and hash-approved AUTO workflow modes with pause, resume, stop and recovery.",
+        "Added item-aware inventory, duplicate and SBC Storage policies with no implicit quicksell.",
+        "Added protected-card, high-rating, reserve and arbitrary Target Project policies.",
+        "Added safe reward-pack correlation, player-pick pause behavior, profiles, activity logs and opt-in diagnostics.",
+        "Source code: https://github.com/Matchekk/Matchek-s-FUT-Magic"
+      ]
+    },
+    {
       "version": "2.0.0",
       "date": "2026-08-24",
       "headline": "AutoSBC Best-of: hardened local-first release.",

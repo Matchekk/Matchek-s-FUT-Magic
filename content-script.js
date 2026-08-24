@@ -129,8 +129,10 @@ void (async () => {
   if (window !== window.top) return;
   await exposeExtensionMetadataToPage();
   const bridgePath = "page/ea-data-bridge.js";
+  let bridgeInjected = false;
   try {
     await injectPageScript(bridgePath, { type: "module" });
+    bridgeInjected = true;
   } catch (error) {
     console.warn("[EA Data] Module script injection failed; retrying classic", {
       path: error?.path ?? bridgePath,
@@ -140,12 +142,14 @@ void (async () => {
     });
     try {
       await injectPageScript(bridgePath, { type: null });
+      bridgeInjected = true;
       console.warn("[EA Data] Classic script injection fallback succeeded", {
         path: bridgePath,
       });
     } catch (fallbackError) {
       try {
         await requestBackgroundBridgeInject(bridgePath);
+        bridgeInjected = true;
         console.warn(
           "[EA Data] Background executeScript injection fallback succeeded",
           {
@@ -177,6 +181,15 @@ void (async () => {
         });
       }
     }
+  }
+  if (!bridgeInjected) return;
+  try {
+    await injectPageScript("src/grindpilot-main.js", { type: "module" });
+  } catch (error) {
+    console.error("[GrindPilot] Runtime injection failed", {
+      path: error?.path ?? "src/grindpilot-main.js",
+      message: error?.message ?? String(error),
+    });
   }
 })();
 
