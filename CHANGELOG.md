@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.1 - 2026-08-24
+
+- Replaced the inherited shield artwork with an original, clean blue
+  GrindPilot navigation-loop icon at 16, 32, 48 and 128 pixels.
+- Added a scalable SVG master and release checks for manifest icon files and
+  their declared PNG dimensions.
+
 ## 2.1.0 - 2026-08-24
 
 - Renamed the unified extension to GrindPilot FC26.

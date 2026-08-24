@@ -2,6 +2,17 @@
   "version": 1,
   "releases": [
     {
+      "version": "2.1.1",
+      "date": "2026-08-24",
+      "headline": "A clean blue identity for GrindPilot.",
+      "summary": "Added an original navigation-loop icon that stays recognizable from the toolbar to the extensions page.",
+      "details": [
+        "Added purpose-rendered 16, 32, 48 and 128 pixel PNG icons.",
+        "Added a scalable source master and automated manifest icon validation.",
+        "The artwork is original and uses no EA, FIFA, FC, FUT, club or player branding."
+      ]
+    },
+    {
       "version": "2.1.0",
       "date": "2026-08-24",
       "headline": "GrindPilot FC26 unified grind-manager MVP.",
