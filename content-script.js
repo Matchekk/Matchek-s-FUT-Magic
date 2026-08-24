@@ -209,6 +209,19 @@ const PREF_BRIDGE_GET = "EA_DATA_PREF_GET";
 const PREF_BRIDGE_SET = "EA_DATA_PREF_SET";
 const PREF_BRIDGE_RES = "EA_DATA_PREF_RES";
 const PREF_ALLOWED_KEYS = new Set(["eaData.preferences.v1"]);
+const GP_STORAGE_REQUEST = "GRINDPILOT_STORAGE_REQUEST_V1";
+const GP_STORAGE_RESPONSE = "GRINDPILOT_STORAGE_RESPONSE_V1";
+const GP_STORAGE_SOURCE = "grindpilot-fc26";
+const GP_STORAGE_MAX_BYTES = 2 * 1024 * 1024;
+const GP_STORAGE_ALLOWED_KEYS = new Set([
+  "grindpilot.workflows.v1",
+  "grindpilot.activeRun.v1",
+  "grindpilot.activity.v1",
+  "grindpilot.profiles.v1",
+  "grindpilot.projects.v1",
+  "grindpilot.settings.v1",
+  "grindpilot.devSnapshots.v1",
+]);
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
 const PRICE_BRIDGE_RESPONSE = "EA_DATA_PRICE_RESPONSE";
 const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
@@ -671,6 +684,92 @@ const storageLocalSet = (key, value) =>
     }
   });
 
+const storageLocalRemove = (key) =>
+  new Promise((resolve, reject) => {
+    try {
+      chrome.storage.local.remove([key], () => {
+        const err = chrome?.runtime?.lastError;
+        if (err) reject(new Error(err.message || "storage remove failed"));
+        else resolve(true);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+
+const estimateJsonBytes = (value) => {
+  const encoded = JSON.stringify(value);
+  return new TextEncoder().encode(encoded ?? "null").byteLength;
+};
+
+const postGrindPilotStorageResponse = (requestId, ok, data, error) => {
+  window.postMessage(
+    {
+      type: GP_STORAGE_RESPONSE,
+      source: GP_STORAGE_SOURCE,
+      requestId,
+      ok: Boolean(ok),
+      data,
+      error,
+    },
+    "*",
+  );
+};
+
+const handleGrindPilotStorageRequest = async (data) => {
+  if (window !== window.top) return;
+  if (data?.type !== GP_STORAGE_REQUEST || data?.source !== GP_STORAGE_SOURCE)
+    return;
+  const requestId = String(data?.requestId ?? "");
+  const operation = String(data?.operation ?? "").toUpperCase();
+  const key = String(data?.key ?? "");
+  if (!requestId || requestId.length > 200) return;
+  if (!GP_STORAGE_ALLOWED_KEYS.has(key)) {
+    postGrindPilotStorageResponse(requestId, false, null, {
+      code: "GP_STORAGE_KEY_FORBIDDEN",
+      message: "Storage key is not allowlisted",
+    });
+    return;
+  }
+  if (!new Set(["GET", "SET", "REMOVE"]).has(operation)) {
+    postGrindPilotStorageResponse(requestId, false, null, {
+      code: "GP_STORAGE_OPERATION_FORBIDDEN",
+      message: "Storage operation is not allowed",
+    });
+    return;
+  }
+
+  try {
+    if (operation === "GET") {
+      postGrindPilotStorageResponse(
+        requestId,
+        true,
+        await storageLocalGet(key),
+        null,
+      );
+      return;
+    }
+    if (operation === "REMOVE") {
+      await storageLocalRemove(key);
+      postGrindPilotStorageResponse(requestId, true, true, null);
+      return;
+    }
+    const bytes = estimateJsonBytes(data?.value);
+    if (bytes > GP_STORAGE_MAX_BYTES) {
+      throw Object.assign(new Error("Storage value exceeds the 2 MiB limit"), {
+        code: "GP_STORAGE_VALUE_TOO_LARGE",
+      });
+    }
+    await storageLocalSet(key, data?.value ?? null);
+    postGrindPilotStorageResponse(requestId, true, { stored: true, bytes }, null);
+  } catch (error) {
+    postGrindPilotStorageResponse(requestId, false, null, {
+      code: error?.code || "GP_STORAGE_FAILED",
+      message: error?.message || "Storage request failed",
+    });
+  }
+};
+
 const postPrefResponse = (requestId, ok, data, error) => {
   const detail = {
     type: PREF_BRIDGE_RES,
@@ -858,6 +957,16 @@ window.addEventListener(
     if (window !== window.top) return;
     if (!isTrustedPageMessageEvent(event)) return;
     handleSolverBridgeRequest(event.data);
+  },
+  true,
+);
+
+window.addEventListener(
+  "message",
+  (event) => {
+    if (window !== window.top) return;
+    if (!isTrustedPageMessageEvent(event)) return;
+    handleGrindPilotStorageRequest(event.data);
   },
   true,
 );
