@@ -471,6 +471,28 @@ const deriveValuesFromLabel = (rule, fallback = []) => {
   return fallback;
 };
 
+const normalizeIdentityValue = (value) => {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized && normalized !== "0" ? normalized : null;
+};
+
+const getNormalizedBasePlayerId = (player) => {
+  const candidates = [
+    player?.basePlayerId,
+    player?.baseId,
+    player?.baseID,
+    player?._staticData?.baseId,
+    player?.assetId,
+    player?.assetID,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeIdentityValue(candidate);
+    if (normalized != null) return normalized;
+  }
+  return null;
+};
+
 const normalizePlayers = (players) => {
   const list = Array.isArray(players) ? players : [];
   const seen = new Set();
@@ -500,6 +522,7 @@ const normalizePlayers = (players) => {
     const isConcept = isConceptPlayer(item);
     normalized.push({
       ...item,
+      basePlayerId: getNormalizedBasePlayerId(item),
       rating,
       quality: getPlayerQuality(rating),
       rarityName,
@@ -5530,8 +5553,18 @@ const optimizeSquadForPreservation = (
   };
 };
 
-const getDefinitionKey = (player) =>
-  player?.definitionId ?? player?.defId ?? player?.id ?? null;
+const getDefinitionKey = (player) => {
+  const basePlayerId = getNormalizedBasePlayerId(player);
+  if (basePlayerId != null) return `base:${basePlayerId}`;
+
+  const definitionId = normalizeIdentityValue(
+    player?.definitionId ?? player?.defId ?? player?.resourceId,
+  );
+  if (definitionId != null) return `definition:${definitionId}`;
+
+  const itemId = normalizeIdentityValue(player?.id ?? player?.itemId);
+  return itemId == null ? null : `item:${itemId}`;
+};
 
 const getDuplicateDefinitionKeys = (squad, squadSize = null) => {
   const n = Math.min(

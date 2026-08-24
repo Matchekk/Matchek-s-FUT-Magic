@@ -2,6 +2,21 @@
   "version": 1,
   "releases": [
     {
+      "version": "2.1.2",
+      "date": "2026-08-24",
+      "headline": "Fail-closed workflow and reward hardening.",
+      "summary": "Hardened GrindPilot state ownership, destructive recovery, protected-card handling, reward correlation and player identity.",
+      "details": [
+        "Moved runtime state behind typed service-worker commands with serialized revisions and per-tab run ownership.",
+        "Verified the full content-script bootstrap and added immediate safe run recovery after the previous owner tab closes.",
+        "Blocked ambiguous destructive resumes and unverified unassigned or reward-pack states.",
+        "Preserved complete profile limits and hidden protection settings from load through Start.",
+        "Prevented locked cards and base/promo versions of the same footballer from being consumed incorrectly.",
+        "Required-special stop conditions now use fresh normalized inventory and optional card-type filters.",
+        "Added focused regression and browser-harness coverage for the hardened paths."
+      ]
+    },
+    {
       "version": "2.1.1",
       "date": "2026-08-24",
       "headline": "A clean blue identity for GrindPilot.",

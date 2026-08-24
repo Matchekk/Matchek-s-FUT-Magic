@@ -121,3 +121,49 @@ test("max zero loan players is enforced", () => {
     Array.from({ length: 11 }, (_, index) => String(index + 21)),
   );
 });
+
+test("live solver never selects base and promo versions of the same footballer", () => {
+  const sameFootballer = [
+    {
+      id: "owned-base",
+      definitionId: 240001,
+      resourceId: 240001,
+      assetId: 240001,
+      basePlayerId: 240001,
+      rating: 75,
+      preferredPositionName: "CM",
+      alternativePositionNames: ["CM"],
+    },
+    {
+      id: "owned-promo",
+      definitionId: 50571649,
+      resourceId: 50571649,
+      assetId: 240001,
+      basePlayerId: 240001,
+      rating: 75,
+      preferredPositionName: "CM",
+      alternativePositionNames: ["CM"],
+    },
+  ];
+  const alternatives = makePlayers(10).map((player, index) => ({
+    ...player,
+    id: `alternative-${index}`,
+    definitionId: 4000 + index,
+    resourceId: 4000 + index,
+    assetId: 5000 + index,
+    basePlayerId: 5000 + index,
+  }));
+  const context = buildSolverContext({
+    players: [...sameFootballer, ...alternatives],
+    requirementsNormalized: [squadSizeRule(11)],
+    requiredPlayers: 11,
+    optimize: { refineSolvedSquad: false, solverTimeBudgetMs: 100 },
+  });
+  const result = solveSquad(context);
+  assert.equal(result.stats.solved, true);
+  assert.equal(result.solutions[0].length, 11);
+  assert.equal(
+    result.solutions[0].includes("owned-base") && result.solutions[0].includes("owned-promo"),
+    false,
+  );
+});

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GrindPilot FC26 | SBC Grind Manager",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "One local-first FC26 extension for SBC solving, safe reward loops, inventory policies, profiles and diagnostics.",
   "icons": {
     "16": "icons/icon16.png",

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.1.2 - 2026-08-24
+
+- Moved GrindPilot persistence into typed, schema-validated extension commands
+  and added serialized, tab-owned workflow revisions.
+- Added fail-closed recovery, EA response, unassigned and reward-pack
+  correlation behavior around destructive actions.
+- Fixed the isolated content-script bootstrap and allow immediate, verified
+  recovery when a previous workflow-owner tab has been closed.
+- Preserved complete imported profile limits and hidden protected-card rules.
+- Protected locked/upstream-protected cards, serialized inventory refreshes and
+  prevented base/promo versions of one footballer from sharing a solved squad.
+- Made required-special stop conditions use fresh normalized inventory instead
+  of treating missing context as an empty club.
+- Added targeted service-worker, workflow, UI, reward and solver regressions.
+
 ## 2.1.1 - 2026-08-24
 
 - Replaced the inherited shield artwork with an original, clean blue

@@ -385,6 +385,8 @@ const initSolverWorker = () => {
     solverPortProtocol = null;
     throw error;
   });
+  return solverWorkerInitPromise;
+};
 
 const requestGrindPilotRpcInstall = () =>
   new Promise((resolve, reject) => {
@@ -429,8 +431,6 @@ const installIsolatedGrindPilotEaProxy = () => {
     },
     openSequencePlanner: method("openSequencePlanner"),
   };
-};
-  return solverWorkerInitPromise;
 };
 
 const isRetryableSolverError = (error) => {

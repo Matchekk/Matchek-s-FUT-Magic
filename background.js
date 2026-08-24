@@ -947,14 +947,56 @@ const gpCaller = (sender, ownerValue) => ({
   ownerId: gpSafeId(ownerValue, "Workflow owner id"),
 });
 
-const gpAssertOrClaimOwner = (record, caller, { allowClaim = false } = {}) => {
+const gpIsMissingTabError = (error) =>
+  /^No tab with id\b/i.test(String(error?.message ?? error ?? "").trim());
+
+const gpIsTabGone = (tabId) => {
+  if (!Number.isInteger(tabId) || typeof chrome.tabs?.get !== "function") {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId = null;
+    const finish = (gone) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(gone === true);
+    };
+    timeoutId = setTimeout(() => finish(false), 1000);
+    try {
+      const pending = chrome.tabs.get(tabId, () => {
+        const error = chrome.runtime?.lastError;
+        finish(error ? gpIsMissingTabError(error) : false);
+      });
+      if (pending && typeof pending.then === "function") {
+        pending.then(
+          () => finish(false),
+          (error) => finish(gpIsMissingTabError(error)),
+        );
+      }
+    } catch (error) {
+      finish(gpIsMissingTabError(error));
+    }
+  });
+};
+
+const gpAssertOrClaimOwner = (
+  record,
+  caller,
+  { allowClaim = false, ownerTabGone = false } = {},
+) => {
   const now = Date.now();
   const lease = record.lease;
   const ownedByCaller =
     lease?.tabId === caller.tabId && lease?.ownerId === caller.ownerId;
   const sameTab = lease?.tabId === caller.tabId;
-  const expired = !Number.isFinite(Number(lease?.expiresAt)) || Number(lease.expiresAt) <= now;
-  if (!ownedByCaller && !(allowClaim && (sameTab || expired || !lease))) {
+  const expired =
+    !Number.isFinite(Number(lease?.expiresAt)) || Number(lease.expiresAt) <= now;
+  if (
+    !ownedByCaller &&
+    !(allowClaim && (sameTab || expired || ownerTabGone || !lease))
+  ) {
     throw gpStateError(
       "WORKFLOW_OWNED_BY_OTHER_TAB",
       "This active workflow is owned by another EA Web App tab",
@@ -1033,7 +1075,10 @@ const gpHandleStateAction = async (action, payload, sender) => {
   if (action === "RUN_LOAD_ACTIVE" || action === "RUN_LOAD") {
     if (action === "RUN_LOAD" && String(record.run.runId) !== String(input.runId)) return null;
     if (!GP_TERMINAL_STATUSES.has(record.run.status)) {
-      gpAssertOrClaimOwner(record, caller, { allowClaim: true });
+      const ownerTabGone =
+        record.lease?.tabId !== caller.tabId &&
+        (await gpIsTabGone(record.lease?.tabId));
+      gpAssertOrClaimOwner(record, caller, { allowClaim: true, ownerTabGone });
       await gpWriteRunRecord(record);
     }
     return record.run;
@@ -1136,6 +1181,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleSolverRequest(message, sendResponse);
   return true;
 });
+
+if (chrome.tabs?.onRemoved?.addListener) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    if (!Number.isInteger(tabId)) return;
+    const releaseLease = async () => {
+      const record = await gpReadRunRecord();
+      if (!record || record.lease?.tabId !== tabId) return;
+      record.lease = null;
+      await gpWriteRunRecord(record);
+    };
+    const pending = grindPilotStateQueue.then(releaseLease, releaseLease);
+    grindPilotStateQueue = pending.catch((error) => {
+      console.warn("[GrindPilot] Failed to release removed-tab workflow lease", {
+        tabId,
+        code: error?.code ?? null,
+        message: error?.message ?? String(error),
+      });
+    });
+  });
+}
 
 chrome.runtime.onConnect.addListener((port) => {
   if (!port || port.name !== SOLVER_PORT_NAME) return;

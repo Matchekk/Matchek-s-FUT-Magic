@@ -54,6 +54,35 @@ test("profiles forbid executable condition expressions", () => {
   })), { code: "ARBITRARY_CODE_FORBIDDEN" });
 });
 
+test("profiles reject unknown stop-condition types and preserve every run ceiling", () => {
+  assert.throws(() => normalizeProfile(completeProfile({
+    stopConditions: [{ type: "MYSTERY_STOP" }],
+  })), { code: "INVALID_PROFILE" });
+
+  const normalized = normalizeProfile(completeProfile({
+    workflow: {
+      id: "custom-bounded-workflow",
+      name: "Custom bounded workflow",
+      version: 3,
+      steps: [{ id: "pause-first", type: "PAUSE", config: { reason: "Review" } }],
+    },
+    runLimits: {
+      maxIterations: 9,
+      maxSbcSubmissions: 2,
+      maxPacksOpened: 1,
+      maxDurationMinutes: 15,
+    },
+  }));
+  assert.equal(normalized.workflow.id, "custom-bounded-workflow");
+  assert.equal(normalized.workflow.steps[0].type, "PAUSE");
+  assert.deepEqual(normalized.runLimits, {
+    maxIterations: 9,
+    maxSbcSubmissions: 2,
+    maxPacksOpened: 1,
+    maxDurationMinutes: 15,
+  });
+});
+
 test("profile pack configuration cannot authorize purchases", () => {
   assert.throws(() => normalizeProfile(completeProfile({
     packPolicy: { mode: "OPEN_ALL_ALLOWED_PACKS", spendPoints: true },

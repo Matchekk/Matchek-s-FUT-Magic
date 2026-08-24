@@ -72,6 +72,7 @@ class GrindPilotRuntime {
     this.listeners = new Set();
     this.drivePromise = null;
     this.inventoryRefreshPromise = null;
+    this.inventoryAvailable = false;
     this.wakeTimer = null;
     this.config = this.defaultConfig();
     this.state = {
@@ -244,7 +245,31 @@ class GrindPilotRuntime {
       return Number(context.storageFreeSlots ?? 0) <= 0;
     }
     if (type === "REQUIRED_SPECIAL_MISSING") {
-      return Number(context.requiredSpecialCount ?? 0) <= 0;
+      if (context.inventoryAvailable !== true) {
+        throw new Error(
+          context.inventoryUnavailableReason ||
+            "Current inventory is unavailable for required-special evaluation",
+        );
+      }
+      const requestedTypes = condition?.requiredSpecialTypes ?? condition?.cardTypes;
+      if (requestedTypes != null) {
+        if (!Array.isArray(requestedTypes)) {
+          throw new TypeError("Required special types must be an array");
+        }
+        const normalizedTypes = new Set(
+          requestedTypes.map((value) => String(value).trim().toLowerCase()).filter(Boolean),
+        );
+        if (normalizedTypes.size) {
+          if (!Array.isArray(context.requiredSpecialCardTypes)) {
+            throw new Error("Current special-card types are unavailable");
+          }
+          return !context.requiredSpecialCardTypes.some((cardType) =>
+            normalizedTypes.has(cardType),
+          );
+        }
+      }
+      const requiredSpecialCount = Number(context.requiredSpecialCount);
+      return !Number.isSafeInteger(requiredSpecialCount) || requiredSpecialCount <= 0;
     }
     if (type === "CONDITION") return evaluateCondition(condition.condition, context);
     if (["COMPARE", "ALL", "ANY", "NOT", "TRUTHY", "EXISTS"].includes(type)) {
@@ -285,9 +310,31 @@ class GrindPilotRuntime {
 
   conditionContext(runOverride = null) {
     const inventory = this.inventory.getStatus();
+    let snapshot = null;
+    let inventoryUnavailableReason = null;
+    try {
+      snapshot = this.inventory.getSnapshot();
+    } catch (error) {
+      inventoryUnavailableReason =
+        error?.message || "Current inventory snapshot is unavailable";
+    }
+    const inventoryAvailable =
+      this.inventoryAvailable === true &&
+      snapshot?.updatedAt != null &&
+      Array.isArray(snapshot?.items);
+    const specialItems = inventoryAvailable
+      ? snapshot.items.filter((item) => item?.isSpecial === true)
+      : [];
     const run = runOverride || this.engine?.getSnapshot();
     return { inventory, workflowIterations: run?.counters?.loopIterations || 0,
-      storageFreeSlots: inventory.storageFreeSlots, unresolvedUnassigned: inventory.unassignedCount };
+      storageFreeSlots: inventory.storageFreeSlots, unresolvedUnassigned: inventory.unassignedCount,
+      inventoryAvailable, requiredSpecialCount: inventoryAvailable ? specialItems.length : null,
+      inventoryUnavailableReason,
+      requiredSpecialCardTypes: inventoryAvailable
+        ? specialItems.flatMap((item) => [item.cardType, item.rarityName, ...(item.specialGroups || [])])
+          .map((value) => String(value ?? "").trim().toLowerCase())
+          .filter(Boolean)
+        : null };
   }
 
   getState() { return structuredClone(this.state); }
@@ -388,8 +435,10 @@ class GrindPilotRuntime {
   async refreshInventory() {
     if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
     this.inventoryRefreshPromise = (async () => {
+      this.inventoryAvailable = false;
       const raw=await this.adapter.readInventory();
       const snapshot=this.inventory.synchronize({ club:raw.club, storage:raw.storage, unassigned:raw.unassigned, storageCapacity:this.state.storageCapacity });
+      this.inventoryAvailable = true;
       const status=this.inventory.getStatus(); this.state.inventory=status; this.state.storageCount=status.storageCount; this.state.unassignedCount=status.unassignedCount; this.emit(); return snapshot;
     })().finally(() => { this.inventoryRefreshPromise = null; });
     return this.inventoryRefreshPromise;

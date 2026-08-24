@@ -2,37 +2,59 @@ import { PackPolicyError, assertOwnedFreePack } from "./pack-policy.js";
 
 const idOf = (pack) => String(pack?.packId ?? pack?.id ?? "");
 
+const countPacksById = (packs) => {
+  const counts = new Map();
+  const packsById = new Map();
+  for (const pack of packs) {
+    const id = idOf(pack);
+    const count = Number(pack?.count ?? 1);
+    if (!id || !Number.isSafeInteger(count) || count < 0) {
+      throw new PackPolicyError("INVALID_PACKS", "Pack snapshot contains an invalid ID or count");
+    }
+    const nextCount = (counts.get(id) ?? 0) + count;
+    if (!Number.isSafeInteger(nextCount)) {
+      throw new PackPolicyError("INVALID_PACKS", "Pack snapshot count exceeds the safe range");
+    }
+    counts.set(id, nextCount);
+    const matches = packsById.get(id) ?? [];
+    matches.push(pack);
+    packsById.set(id, matches);
+  }
+  return { counts, packsById };
+};
+
 /**
- * Identifies a claimed reward without guessing. A unique explicit ID wins;
- * otherwise exactly one newly-owned pack must have appeared.
+ * Identifies a claimed reward only when exactly one owned pack count increased.
+ * An explicit claimed ID must correlate to that same positive count delta.
  */
 export function identifyClaimedRewardPack({ claim, packsBefore = [], packsAfter = [] } = {}) {
   if (!Array.isArray(packsBefore) || !Array.isArray(packsAfter)) {
     throw new PackPolicyError("INVALID_PACKS", "Pack snapshots must be arrays");
   }
 
+  const before = countPacksById(packsBefore);
+  const after = countPacksById(packsAfter);
+  const positiveDeltaIds = Array.from(after.counts.entries())
+    .filter(([id, count]) => count - (before.counts.get(id) ?? 0) > 0)
+    .map(([id]) => id);
   const explicitId = String(claim?.packId ?? claim?.rewardPackId ?? "");
-  if (explicitId) {
-    const matches = packsAfter.filter((pack) => idOf(pack) === explicitId);
-    if (matches.length === 1) {
-      assertOwnedFreePack(matches[0]);
-      return matches[0];
-    }
-    throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Claimed reward ID was not uniquely present", {
-      explicitId,
-      matches: matches.length,
+  if (
+    positiveDeltaIds.length !== 1 ||
+    (explicitId && positiveDeltaIds[0] !== explicitId)
+  ) {
+    throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Could not uniquely identify the newly claimed pack", {
+      explicitId: explicitId || null,
+      positiveDeltaIds,
     });
   }
 
-  const beforeIds = new Set(packsBefore.map(idOf).filter(Boolean));
-  const added = packsAfter.filter((pack) => !beforeIds.has(idOf(pack)));
-  if (added.length !== 1) {
-    throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Could not uniquely identify the newly claimed pack", {
-      added: added.map(idOf),
-    });
+  const correlatedId = positiveDeltaIds[0];
+  const matches = after.packsById.get(correlatedId) ?? [];
+  if (!matches.length) {
+    throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Correlated reward pack was not present");
   }
-  assertOwnedFreePack(added[0]);
-  return added[0];
+  for (const pack of matches) assertOwnedFreePack(pack);
+  return matches[0];
 }
 
 export class RewardService {
