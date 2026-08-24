@@ -2149,20 +2149,30 @@
     return markItemsAsUnassigned([]);
   };
 
-  const getUnassignedItems = async ({ refresh = false } = {}) => {
+  const getUnassignedItems = async ({ refresh = false, failClosed = false } = {}) => {
     const lookup = services?.Item?.getUnassignedItems ?? null;
     let initial = [];
+    let verifiedRead = false;
+    const failures = [];
     if (typeof lookup === "function") {
       try {
         initial = extractUnassignedItemsFromResult(
           await observableToPromise(lookup(false)),
         );
-      } catch {
+        verifiedRead = true;
+      } catch (error) {
+        failures.push(error);
         initial = [];
       }
     }
 
     if (!refresh || typeof services?.Item?.requestUnassignedItems !== "function") {
+      if (failClosed && !verifiedRead) {
+        const error = new Error("Unassigned state could not be verified");
+        error.code = "EA_UNASSIGNED_UNVERIFIED";
+        error.causes = failures;
+        throw error;
+      }
       return initial;
     }
 
@@ -2174,18 +2184,28 @@
           { minGapMs: 400, maxAttempts: 1 },
         ),
       );
-      if (Array.isArray(requested) && requested.length) return requested;
-    } catch {}
+      if (Array.isArray(requested)) return requested;
+    } catch (error) {
+      failures.push(error);
+    }
 
     if (typeof lookup === "function") {
       try {
         const refreshed = extractUnassignedItemsFromResult(
           await observableToPromise(lookup(false)),
         );
-        if (Array.isArray(refreshed) && refreshed.length) return refreshed;
-      } catch {}
+        if (Array.isArray(refreshed)) return refreshed;
+      } catch (error) {
+        failures.push(error);
+      }
     }
 
+    if (failClosed) {
+      const error = new Error("Fresh unassigned state could not be verified");
+      error.code = "EA_UNASSIGNED_UNVERIFIED";
+      error.causes = failures;
+      throw error;
+    }
     return initial;
   };
 
@@ -30235,6 +30255,17 @@
         ? Boolean(item.isEvolution())
         : Boolean(item.isEvolution ?? item.upgrades);
     const isAcademy = Boolean(item.isEnrolledInAcademy?.());
+    const readItemBoolean = (...keys) => {
+      for (const key of keys) {
+        if (typeof item?.[key] === "function") {
+          try {
+            return Boolean(item[key]());
+          } catch {}
+        }
+        if (typeof item?.[key] === "boolean") return item[key];
+      }
+      return false;
+    };
     const isDuplicate =
       Boolean(duplicateDefIds?.has(item.definitionId)) &&
       !isStorage &&
@@ -30257,6 +30288,9 @@
       isUntradeable,
       isStorage,
       isUnassigned,
+      isLocked: readItemBoolean("isLocked", "locked"),
+      isFavorite: readItemBoolean("isFavorite", "isFavourite", "favorite"),
+      isInStartingSquad: readItemBoolean("isInStartingSquad", "isInActive11"),
       hasStorageDuplicate: false,
       hasClubDuplicate: false,
       isDuplicate,
@@ -30272,6 +30306,7 @@
       isEnrolledInAcademy: item.isEnrolledInAcademy?.(),
       rarityId,
       rarityName,
+      cardType: rarityName,
       isSpecial,
       isTotw,
       isEvolution,
@@ -30622,7 +30657,12 @@
         requirementsNormalized,
         requiredPlayers: payload?.requiredPlayers ?? null,
         squadSlots: payload?.squadSlots ?? [],
-        prioritize: payload?.prioritize,
+        prioritize: {
+          ...(payload?.prioritize ?? {}),
+          ...(options?.prioritize && typeof options.prioritize === "object"
+            ? options.prioritize
+            : {}),
+        },
         filters: {
           ...(payload?.filters ?? {}),
           ...poolFilters,
@@ -30834,7 +30874,7 @@
   };
 
   const grindPilotOpenRewardPack = async ({ packId } = {}) => {
-    const unassigned = await getUnassignedItems({ refresh: true });
+    const unassigned = await getUnassignedItems({ refresh: true, failClosed: true });
     if (unassigned.length) {
       return grindPilotResult("not_applied", { unresolvedUnassigned: unassigned.length }, "Unassigned items must be resolved before opening another pack");
     }
@@ -30871,7 +30911,7 @@
   };
 
   const grindPilotResolveUnassigned = async ({ storageCapacity = 100 } = {}) => {
-    const items = await getUnassignedItems({ refresh: true });
+    const items = await getUnassignedItems({ refresh: true, failClosed: true });
     const storage = await getStorageItems();
     const freeStorage = Math.max(0, Number(storageCapacity) - storage.length);
     const readFlag = (item, key) =>
@@ -30893,13 +30933,35 @@
     await grindPilotMoveItems(toClub, GRINDPILOT_CLUB_PILE);
     await grindPilotMoveItems(toStorage, GRINDPILOT_STORAGE_PILE);
     clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
-    const remaining = await getUnassignedItems({ refresh: true });
+    const [remaining, clubAfter, storageAfter] = await Promise.all([
+      getUnassignedItems({ refresh: true, failClosed: true }),
+      toClub.length
+        ? getClubPlayers({ ignoreLoaned: false, excludeActiveSquad: false })
+        : Promise.resolve([]),
+      toStorage.length ? getStorageItems() : Promise.resolve(storage),
+    ]);
+    const clubIds = new Set(clubAfter.map((item) => String(item?.id ?? "")));
+    const storageIds = new Set(storageAfter.map((item) => String(item?.id ?? "")));
+    const missingClubIds = toClub
+      .map((item) => String(item.id))
+      .filter((id) => !clubIds.has(id));
+    const missingStorageIds = toStorage
+      .map((item) => String(item.id))
+      .filter((id) => !storageIds.has(id));
+    if (missingClubIds.length || missingStorageIds.length) {
+      return grindPilotResult(
+        "ambiguous",
+        null,
+        "Item moves completed but destination state could not be verified",
+        { missingClubIds, missingStorageIds },
+      );
+    }
     return grindPilotResult("verified", {
       movedToClub: toClub.map((item) => String(item.id)),
       movedToStorage: toStorage.map((item) => String(item.id)),
       unresolvedItemIds: remaining.map((item) => String(item.id)),
       unresolvedUnassigned: remaining.length,
-      storageUsed: storage.length + toStorage.length,
+      storageUsed: storageAfter.length,
       storageCapacity: Number(storageCapacity),
     }, remaining.length ? "Unresolved items require a policy decision" : null);
   };
@@ -30935,7 +30997,7 @@
       openOwnedRewardPack: (intent) => grindPilotOpenRewardPack(intent),
       resolveUnassigned: (policy) => grindPilotResolveUnassigned(policy),
       readPlayerPick: async () => {
-        const items = await getUnassignedItems({ refresh: true });
+        const items = await getUnassignedItems({ refresh: true, failClosed: true });
         const picks = items.filter((item) => item?.isPlayerPickItem?.());
         return grindPilotResult("verified", {
           pending: picks.length > 0,

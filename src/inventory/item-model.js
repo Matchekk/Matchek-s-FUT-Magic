@@ -145,6 +145,11 @@ export const normalizeInventoryItem = (raw, options = {}) => {
     isUntradeable: !isTradable,
     isDuplicate: Boolean(raw.isDuplicate),
     isLocked: Boolean(raw.isLocked ?? raw.locked),
+    isFavorite: Boolean(raw.isFavorite ?? raw.isFavourite),
+    isFavourite: Boolean(raw.isFavorite ?? raw.isFavourite),
+    isInStartingSquad: Boolean(raw.isInStartingSquad ?? raw.isInActive11),
+    isInActive11: Boolean(raw.isInStartingSquad ?? raw.isInActive11),
+    isStorage: location === INVENTORY_LOCATIONS.SBC_STORAGE,
     isProtected: Boolean(raw.isProtected),
   });
 };

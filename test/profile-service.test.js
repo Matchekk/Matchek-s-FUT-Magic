@@ -59,3 +59,21 @@ test("profile pack configuration cannot authorize purchases", () => {
     packPolicy: { mode: "OPEN_ALL_ALLOWED_PACKS", spendPoints: true },
   })), { code: "PURCHASE_FORBIDDEN" });
 });
+
+test("complete grind profiles preserve mode, projects and extended policies", async () => {
+  const service = new ProfileService({ repository: new InMemoryProfileRepository() });
+  const saved = await service.save(completeProfile({
+    automationMode: "ASSISTED",
+    fodderPolicy: {
+      protectRatingAtOrAbove: 93,
+      protectedItemIds: ["owned-1"],
+      minimumReserveByRating: { 89: 3 },
+    },
+    duplicatePolicy: { unresolved: "PAUSE", storageCapacity: 120 },
+    targetProjects: [{ id: "project-1", name: "Arbitrary target" }],
+  }));
+  assert.equal(saved.automationMode, "ASSISTED");
+  assert.deepEqual(saved.fodderPolicy.protectedItemIds, ["owned-1"]);
+  assert.equal(saved.duplicatePolicy.storageCapacity, 120);
+  assert.equal(saved.targetProjects[0].name, "Arbitrary target");
+});
