@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "AutoSBC Best-of | FC26 SBC Solver",
+  "version": "2.0.0",
+  "description": "Local-first FC26 SBC solver combining AutoPilot's extension runtime with selected Auto-SBC solver policies.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "AutoSBC Best-of",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "permissions": ["storage", "scripting"],
+  "host_permissions": ["https://www.fut.gg/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "js": ["content-script.js"],
+      "run_at": "document_start",
+      "matches": [
+        "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
+        "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
+      ]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page/ea-data-bridge.js",
+        "page/ea-data-bridge.css",
+        "data/changelog.json"
+      ],
+      "matches": ["https://www.ea.com/*"],
+      "use_dynamic_url": true
+    }
+  ]
+}

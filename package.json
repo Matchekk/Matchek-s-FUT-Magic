@@ -1,0 +1,15 @@
+{
+  "name": "autosbc-best-of",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hardened local-first FC26 SBC browser extension derived from AutoPilot-SBC with selected Auto-SBC policies.",
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/verify.mjs"
+  },
+  "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=20"
+  }
+}

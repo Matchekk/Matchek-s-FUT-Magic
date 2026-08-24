@@ -1,0 +1,8 @@
+sources/
+dist/
+*.zip
+node_modules/
+solver/glpk.js
+solver/glpk.wasm
+.DS_Store
+Thumbs.db
