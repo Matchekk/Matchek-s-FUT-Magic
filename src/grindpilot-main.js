@@ -13,6 +13,8 @@ import { ProfileService } from "./profiles/profile-service.js";
 import { GrindPanel } from "./ui/grind-panel.js";
 import {
   createAutoApproval,
+  evaluateCondition,
+  evaluateWorkflowModeGate,
   RunStatus,
   WorkflowEngine,
   WorkflowMode,
@@ -20,9 +22,6 @@ import {
 } from "./workflow/index.js";
 
 const VERSION = globalThis.document?.documentElement?.dataset?.eaDataExtensionVersion || "unknown";
-const ACTIVITY_KEY = "grindpilot.activity.v1";
-const PROJECTS_KEY = "grindpilot.projects.v1";
-const SETTINGS_KEY = "grindpilot.settings.v1";
 
 const outcome = (result) => ({ status: "completed", result });
 const latestResult = (run, type) =>
@@ -72,6 +71,7 @@ class GrindPilotRuntime {
     });
     this.listeners = new Set();
     this.drivePromise = null;
+    this.inventoryRefreshPromise = null;
     this.wakeTimer = null;
     this.config = this.defaultConfig();
     this.state = {
@@ -92,6 +92,7 @@ class GrindPilotRuntime {
       repository: new PageWorkflowRepository(this.storage),
       handlers: this.createHandlers(),
       contextProvider: () => this.conditionContext(),
+      modeGate: (input) => this.evaluateRunGate(input),
     });
     this.engineUnsubscribe = null;
     this.logger.subscribe(() => { this.state.logs = this.logger.entries(); this.persistActivity(); this.emit(); });
@@ -103,7 +104,8 @@ class GrindPilotRuntime {
       protectStartingSquad: true, protectFavorites: true, protectTradables: false,
       preferUntradeables: true, preferDuplicates: true, preferSbcStorage: true,
       minimumReserveByRating: {}, packMode: "OPEN_CURRENT_REWARD", maxPacks: 1,
-      pickMode: "PAUSE_FOR_USER", stopConditions: [] };
+      pickMode: "PAUSE_FOR_USER", workflow: null,
+      runLimits: { maxIterations: 1 }, stopConditions: [] };
   }
 
   domainLogger() {
@@ -127,14 +129,14 @@ class GrindPilotRuntime {
   }
 
   async loadPersistentState() {
-    const stored = await this.storage.get([ACTIVITY_KEY, PROJECTS_KEY, SETTINGS_KEY]);
-    for (const entry of Array.isArray(stored[ACTIVITY_KEY]) ? stored[ACTIVITY_KEY] : []) {
+    const stored = await this.storage.loadBootstrap();
+    for (const entry of Array.isArray(stored.activity) ? stored.activity : []) {
       this.logger.log(entry.level || "info", entry.action || "Restored", entry.message || "", entry.data ?? null);
     }
-    const projects = Array.isArray(stored[PROJECTS_KEY]) ? stored[PROJECTS_KEY] : [];
+    const projects = Array.isArray(stored.projects) ? stored.projects : [];
     this.targets = new TargetProjectService(projects);
     this.state.projects = this.targets.list();
-    this.config = { ...this.defaultConfig(), ...(stored[SETTINGS_KEY] || {}) };
+    this.config = { ...this.defaultConfig(), ...(stored.settings || {}) };
     this.state.storageCapacity = Math.max(1, Math.min(1000, Math.trunc(this.config.storageCapacity || 100)));
     this.state.draft = this.config;
     this.state.profiles = await this.profileService.list();
@@ -233,9 +235,57 @@ class GrindPilotRuntime {
     };
   }
 
-  conditionContext() {
+  stopConditionTriggered(condition, context) {
+    const type = String(condition?.type ?? "").trim().toUpperCase();
+    if (type === "UNRESOLVED_UNASSIGNED") {
+      return Number(context.unresolvedUnassigned ?? 0) > 0;
+    }
+    if (type === "STORAGE_FULL") {
+      return Number(context.storageFreeSlots ?? 0) <= 0;
+    }
+    if (type === "REQUIRED_SPECIAL_MISSING") {
+      return Number(context.requiredSpecialCount ?? 0) <= 0;
+    }
+    if (type === "CONDITION") return evaluateCondition(condition.condition, context);
+    if (["COMPARE", "ALL", "ANY", "NOT", "TRUTHY", "EXISTS"].includes(type)) {
+      return evaluateCondition(condition, context);
+    }
+    // An unknown persisted stop condition is a schema mismatch, not permission
+    // to continue an AUTO run.
+    return true;
+  }
+
+  evaluateRunGate({ run, node }) {
+    const limits = this.config.runLimits || { maxIterations: this.config.maxIterations };
+    const cleanupStep = [WorkflowStepType.HANDLE_PLAYER_PICK, WorkflowStepType.RESOLVE_ITEMS].includes(node?.step?.type);
+    const completed = (type) =>
+      (run?.nodes || []).filter(
+        (entry) => entry.step?.type === type && entry.status === "completed",
+      ).length;
+    const checks = [
+      [limits.maxIterations != null && Number(run?.counters?.loopIterations || 0) > Number(limits.maxIterations), "Maximum workflow iterations reached"],
+      [limits.maxSbcSubmissions != null && [WorkflowStepType.SOLVE_SBC, WorkflowStepType.SUBMIT_SBC].includes(node?.step?.type) && completed(WorkflowStepType.SUBMIT_SBC) >= Number(limits.maxSbcSubmissions), "Maximum SBC submissions reached"],
+      [limits.maxPacksOpened != null && !cleanupStep && completed(WorkflowStepType.OPEN_REWARD_PACK) >= Number(limits.maxPacksOpened), "Maximum opened packs reached"],
+      [limits.maxDurationMinutes != null && !cleanupStep && Date.now() - Number(run?.createdAt || Date.now()) >= Number(limits.maxDurationMinutes) * 60_000, "Maximum workflow duration reached"],
+    ];
+    const reached = checks.find(([blocked]) => blocked);
+    if (reached) return { allowed: false, code: "RUN_LIMIT_REACHED", message: reached[1] };
+    const context = this.conditionContext(run);
+    for (const condition of this.config.stopConditions || []) {
+      try {
+        if (!cleanupStep && this.stopConditionTriggered(condition, context)) {
+          return { allowed: false, code: "STOP_CONDITION_REACHED", message: `Stop condition reached: ${condition.type}` };
+        }
+      } catch (error) {
+        return { allowed: false, code: "STOP_CONDITION_INVALID", message: error?.message || "Stop condition could not be evaluated" };
+      }
+    }
+    return evaluateWorkflowModeGate({ run, node });
+  }
+
+  conditionContext(runOverride = null) {
     const inventory = this.inventory.getStatus();
-    const run = this.engine?.getSnapshot();
+    const run = runOverride || this.engine?.getSnapshot();
     return { inventory, workflowIterations: run?.counters?.loopIterations || 0,
       storageFreeSlots: inventory.storageFreeSlots, unresolvedUnassigned: inventory.unassignedCount };
   }
@@ -273,17 +323,34 @@ class GrindPilotRuntime {
   }
 
   async start(config) {
-    this.config = { ...this.defaultConfig(), ...config, maxIterations: Math.max(1, Math.min(1000, Math.trunc(config.maxIterations || 1))) };
+    const previous = this.config || this.defaultConfig();
+    const ceilings = previous.profileCeilings || null;
+    const requestedIterations = Math.max(1, Math.min(1000, Math.trunc(config.maxIterations || previous.maxIterations || 1)));
+    const maxIterations = ceilings?.maxIterations == null
+      ? requestedIterations
+      : Math.min(requestedIterations, Number(ceilings.maxIterations));
+    const requestedLimits = { ...(previous.runLimits || {}), ...(config.runLimits || {}), maxIterations };
+    if (ceilings) {
+      for (const field of ["maxSbcSubmissions", "maxPacksOpened", "maxDurationMinutes"]) {
+        if (ceilings[field] != null) {
+          requestedLimits[field] = requestedLimits[field] == null
+            ? Number(ceilings[field])
+            : Math.min(Number(requestedLimits[field]), Number(ceilings[field]));
+        }
+      }
+    }
+    this.config = { ...this.defaultConfig(), ...previous, ...config, maxIterations, runLimits: requestedLimits };
     this.config.maxPacks = Math.max(1, Math.min(100, Math.trunc(this.config.maxPacks || 1)));
+    if (ceilings?.maxPacks != null) this.config.maxPacks = Math.min(this.config.maxPacks, Number(ceilings.maxPacks));
     this.state.storageCapacity = Math.max(1, Math.min(1000, Math.trunc(this.config.storageCapacity || 100)));
-    const definition = buildWorkflow(this.config);
+    const definition = this.config.workflow || buildWorkflow(this.config);
     let approval = null;
     if (this.config.mode === WorkflowMode.AUTO) {
-      const summary = [`SBC: currently open challenge`, `Iterations: ${this.config.maxIterations}`, `Protected rating: ${this.config.protectRatingAtOrAbove}+`, `Protected types: ${this.config.protectedCardTypes.join(", ") || "none"}`, `Packs: ${this.config.packMode}, max ${this.config.maxPacks} (owned rewards only)`, `Duplicates: Storage, otherwise pause`, `Player picks: ${this.config.pickMode}`].join("\n");
+      const summary = [`Workflow: ${definition.name}`, `Iterations: ${this.config.maxIterations}`, `Max submissions: ${requestedLimits.maxSbcSubmissions ?? "workflow bound"}`, `Max opened packs: ${requestedLimits.maxPacksOpened ?? "workflow bound"}`, `Max duration: ${requestedLimits.maxDurationMinutes ? `${requestedLimits.maxDurationMinutes} min` : "workflow bound"}`, `Protected rating: ${this.config.protectRatingAtOrAbove}+`, `Protected types: ${this.config.protectedCardTypes.join(", ") || "none"}`, `Packs: ${this.config.packMode}, max ${this.config.maxPacks} per step (owned rewards only)`, `Duplicates: Storage, otherwise pause`, `Player picks: ${this.config.pickMode}`].join("\n");
       if (!window.confirm(`Authorize this GrindPilot AUTO run?\n\n${summary}`)) return;
       approval = createAutoApproval(definition);
     }
-    await this.storage.set({ [SETTINGS_KEY]: this.config });
+    await this.storage.saveSettings(this.config);
     this.state.draft = this.config; this.state.maxIterations = this.config.maxIterations;
     await this.engine.start(definition, { mode: this.config.mode, approval });
     this.logger.info("Start", `Workflow started in ${this.config.mode} mode`, { maxIterations: this.config.maxIterations });
@@ -319,32 +386,36 @@ class GrindPilotRuntime {
   }
 
   async refreshInventory() {
-    const raw=await this.adapter.readInventory();
-    const snapshot=this.inventory.synchronize({ club:raw.club, storage:raw.storage, unassigned:raw.unassigned, storageCapacity:this.state.storageCapacity });
-    const status=this.inventory.getStatus(); this.state.inventory=status; this.state.storageCount=status.storageCount; this.state.unassignedCount=status.unassignedCount; this.emit(); return snapshot;
+    if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
+    this.inventoryRefreshPromise = (async () => {
+      const raw=await this.adapter.readInventory();
+      const snapshot=this.inventory.synchronize({ club:raw.club, storage:raw.storage, unassigned:raw.unassigned, storageCapacity:this.state.storageCapacity });
+      const status=this.inventory.getStatus(); this.state.inventory=status; this.state.storageCount=status.storageCount; this.state.unassignedCount=status.unassignedCount; this.emit(); return snapshot;
+    })().finally(() => { this.inventoryRefreshPromise = null; });
+    return this.inventoryRefreshPromise;
   }
 
   async saveDraftProfile() {
-    const fodderPolicy=Object.fromEntries(["protectRatingAtOrAbove","protectedCardTypes","protectedItemIds","protectedPlayerIds","protectedResourceIds","protectStartingSquad","protectFavorites","protectTradables","preferUntradeables","preferDuplicates","preferSbcStorage","minimumReserveByRating"].map((key)=>[key,this.config[key]]));
-    const id=`profile-${Date.now()}`; const profile=await this.profileService.save({ id, name:`Grind profile ${new Date().toLocaleString()}`, automationMode:this.config.mode, workflow:buildWorkflow(this.config), solverSettings:this.config.solverSettings||{}, fodderPolicy, duplicatePolicy:{ ...(this.config.duplicatePolicy||{}), quicksell:false, unresolved:"PAUSE", storageCapacity:this.config.storageCapacity }, packPolicy:{ mode:this.config.packMode, maxPacks:this.config.maxPacks||1 }, pickPolicy:{ type:this.config.pickMode, ...(this.config.pickPolicy||{}) }, runLimits:{ maxIterations:this.config.maxIterations }, stopConditions:this.config.stopConditions||[], targetProjects:this.targets.list() });
+    const fodderPolicy=Object.fromEntries(["protectRatingAtOrAbove","preferredFodderRange","protectedCardTypes","allowedSpecialTypes","protectedItemIds","protectedPlayerIds","protectedResourceIds","protectedRatings","protectStartingSquad","protectFavorites","protectTradables","preferUntradeables","preferDuplicates","preferSbcStorage","minimumReserveByRating","specialReserveByCardType"].map((key)=>[key,this.config[key]]));
+    const id=`profile-${Date.now()}`; const profile=await this.profileService.save({ id, name:`Grind profile ${new Date().toLocaleString()}`, automationMode:this.config.mode, workflow:this.config.workflow||buildWorkflow(this.config), solverSettings:this.config.solverSettings||{}, fodderPolicy, duplicatePolicy:{ ...(this.config.duplicatePolicy||{}), quicksell:false, unresolved:"PAUSE", storageCapacity:this.config.storageCapacity }, packPolicy:{ mode:this.config.packMode, maxPacks:this.config.maxPacks||1 }, pickPolicy:{ type:this.config.pickMode, ...(this.config.pickPolicy||{}) }, runLimits:{ ...(this.config.runLimits||{}), maxIterations:this.config.maxIterations }, stopConditions:this.config.stopConditions||[], targetProjects:this.targets.list() });
     this.state.profiles=await this.profileService.list(); this.emit(); return profile;
   }
-  async loadProfile(id) { const p=await this.profileService.get(id); if(!p)return; this.config={...this.defaultConfig(),...p.fodderPolicy,mode:p.automationMode||WorkflowMode.REVIEW,maxIterations:p.runLimits.maxIterations,storageCapacity:p.duplicatePolicy.storageCapacity||100,solverSettings:p.solverSettings,duplicatePolicy:p.duplicatePolicy,packMode:p.packPolicy.mode,maxPacks:p.packPolicy.maxPacks,pickMode:p.pickPolicy.type,pickPolicy:p.pickPolicy,stopConditions:p.stopConditions}; this.state.storageCapacity=this.config.storageCapacity; if(Array.isArray(p.targetProjects)){this.targets=new TargetProjectService(p.targetProjects);this.state.projects=this.targets.list();} this.state.draft=this.config; this.emit(); }
+  async loadProfile(id) { const p=await this.profileService.get(id); if(!p)return; this.config={...this.defaultConfig(),...p.fodderPolicy,mode:p.automationMode||WorkflowMode.REVIEW,workflow:p.workflow,runLimits:{...p.runLimits},maxIterations:p.runLimits.maxIterations,storageCapacity:p.duplicatePolicy.storageCapacity||100,solverSettings:p.solverSettings,duplicatePolicy:p.duplicatePolicy,packMode:p.packPolicy.mode,maxPacks:p.packPolicy.maxPacks,pickMode:p.pickPolicy.type,pickPolicy:p.pickPolicy,stopConditions:p.stopConditions,loadedProfileId:p.id,profileCeilings:{...p.runLimits,maxPacks:p.packPolicy.maxPacks}}; this.state.storageCapacity=this.config.storageCapacity; if(Array.isArray(p.targetProjects)){this.targets=new TargetProjectService(p.targetProjects);this.state.projects=this.targets.list();} this.state.draft=this.config; this.emit(); }
   async exportCurrentProfile() { const p=this.state.profiles.at(-1) || await this.saveDraftProfile(); return this.profileService.export(p.id); }
   async importProfile(text) { await this.profileService.import(text,{overwrite:false}); this.state.profiles=await this.profileService.list(); this.emit(); }
   async addTargetProject(input) {
     const name=String(input?.name||"").trim(); if(!name)throw new Error("Target project name is required");
     const project=this.targets.upsert({ id:`project-${Date.now()}`, name, active:true, priority:Math.max(0,Math.trunc(input.priority||0)), requiredSquadsRemaining:Math.max(0,Math.trunc(input.requiredSquadsRemaining||0)), protectedRatings:{ atOrAbove:input.protectRatingAtOrAbove||null }, ratingRequirements:[], specialCardRequirements:[], completionProgress:0 });
-    this.state.projects=this.targets.list(); await this.storage.set({[PROJECTS_KEY]:this.state.projects}); this.emit(); return project;
+    this.state.projects=this.targets.list(); await this.storage.saveProjects(this.state.projects); this.emit(); return project;
   }
-  async removeTargetProject(id) { this.targets.remove(id); this.state.projects=this.targets.list(); await this.storage.set({[PROJECTS_KEY]:this.state.projects}); this.emit(); }
+  async removeTargetProject(id) { this.targets.remove(id); this.state.projects=this.targets.list(); await this.storage.saveProjects(this.state.projects); this.emit(); }
   async setDeveloperMode(enabled) { enabled?this.dev.enable():this.dev.disable(); this.state.diagnostics={...this.dev.getStatus(),latest:this.state.diagnostics.latest||null}; this.emit(); }
   async takeDiagnosticSnapshot() { const health=await this.adapter.health().catch(error=>({error:error.message})); const latest=this.dev.captureSnapshot({ bridgeHealth:health,route:location.pathname,selectors:{controllerBridge:Boolean(window.eaData?.grindPilot)} }); this.state.diagnostics={...this.dev.getStatus(),latest,diff:this.dev.compareLatestSnapshots()}; this.emit(); return latest; }
   async exportDiagnostics() { return this.dev.exportDiagnostics({ healthChecks:[await this.adapter.health().catch(error=>({error:error.message}))], logs:this.logger.entries() }); }
   reportUiError(error) { this.state.error=error?.message||String(error); this.logger.error("Error",this.state.error,{code:error?.code||null}); this.emit(); }
   persistActivity() {
     clearTimeout(this.activityTimer);
-    this.activityTimer=setTimeout(()=>this.storage.set({[ACTIVITY_KEY]:this.logger.entries()}).catch((error)=>{
+    this.activityTimer=setTimeout(()=>this.storage.saveActivity(this.logger.entries()).catch((error)=>{
       console.warn("[GrindPilot] Activity persistence failed", { code:error?.code||null, message:error?.message||String(error) });
     }),250);
   }

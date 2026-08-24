@@ -655,6 +655,9 @@ export class WorkflowEngine {
       });
       await this._persist();
 
+      if (isDestructive(node.step) && typeof this.repository.assertOwnership === "function") {
+        await this.repository.assertOwnership(this.run.runId);
+      }
       const abortController = typeof AbortController === "function"
         ? new AbortController()
         : null;

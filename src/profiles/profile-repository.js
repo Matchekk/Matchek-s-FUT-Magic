@@ -30,11 +30,14 @@ export class InMemoryProfileRepository {
 /** Repository backed by chrome.storage.local (or a compatible injected area). */
 export class ChromeStorageProfileRepository {
   constructor(storageArea = globalThis.chrome?.storage?.local, storageKey = DEFAULT_STORAGE_KEY) {
-    if (!storageArea?.get || !storageArea?.set || !storageArea?.remove) {
+    const domainApi = storageArea?.listProfiles && storageArea?.putProfile;
+    const legacyApi = storageArea?.get && storageArea?.set && storageArea?.remove;
+    if (!domainApi && !legacyApi) {
       throw new TypeError("ChromeStorageProfileRepository requires a storage.local-compatible area");
     }
     this.storageArea = storageArea;
     this.storageKey = storageKey;
+    this.domainApi = Boolean(domainApi);
   }
 
   async #readRecords() {
@@ -44,15 +47,18 @@ export class ChromeStorageProfileRepository {
   }
 
   async list() {
+    if (this.domainApi) return (await this.storageArea.listProfiles()).map(clone);
     return Object.values(await this.#readRecords()).map(clone);
   }
 
   async get(id) {
+    if (this.domainApi) return clone(await this.storageArea.getProfile(id));
     const records = await this.#readRecords();
     return clone(records[id] ?? null);
   }
 
   async put(profile) {
+    if (this.domainApi) return clone(await this.storageArea.putProfile(clone(profile)));
     const records = await this.#readRecords();
     records[profile.id] = clone(profile);
     await this.storageArea.set({ [this.storageKey]: records });
@@ -60,6 +66,7 @@ export class ChromeStorageProfileRepository {
   }
 
   async delete(id) {
+    if (this.domainApi) return Boolean(await this.storageArea.deleteProfile(id));
     const records = await this.#readRecords();
     if (!Object.hasOwn(records, id)) return false;
     delete records[id];

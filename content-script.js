@@ -61,6 +61,9 @@ const injectPageScript = async (path, { type = "module" } = {}) =>
   });
 
 const BRIDGE_INJECT_REQUEST = "EA_PAGE_BRIDGE_INJECT";
+const GRINDPILOT_RPC_INSTALL_REQUEST = "EA_GRINDPILOT_RPC_INSTALL";
+const GRINDPILOT_EA_REQUEST = "GRINDPILOT_EA_REQUEST_V1";
+const GRINDPILOT_EA_RESPONSE = "GRINDPILOT_EA_RESPONSE_V1";
 
 const requestBackgroundBridgeInject = (path) =>
   new Promise((resolve, reject) => {
@@ -184,7 +187,9 @@ void (async () => {
   }
   if (!bridgeInjected) return;
   try {
-    await injectPageScript("src/grindpilot-main.js", { type: "module" });
+    await requestGrindPilotRpcInstall();
+    installIsolatedGrindPilotEaProxy();
+    await import(chrome.runtime.getURL("src/grindpilot-main.js"));
   } catch (error) {
     console.error("[GrindPilot] Runtime injection failed", {
       path: error?.path ?? "src/grindpilot-main.js",
@@ -222,19 +227,6 @@ const PREF_BRIDGE_GET = "EA_DATA_PREF_GET";
 const PREF_BRIDGE_SET = "EA_DATA_PREF_SET";
 const PREF_BRIDGE_RES = "EA_DATA_PREF_RES";
 const PREF_ALLOWED_KEYS = new Set(["eaData.preferences.v1"]);
-const GP_STORAGE_REQUEST = "GRINDPILOT_STORAGE_REQUEST_V1";
-const GP_STORAGE_RESPONSE = "GRINDPILOT_STORAGE_RESPONSE_V1";
-const GP_STORAGE_SOURCE = "grindpilot-fc26";
-const GP_STORAGE_MAX_BYTES = 2 * 1024 * 1024;
-const GP_STORAGE_ALLOWED_KEYS = new Set([
-  "grindpilot.workflows.v1",
-  "grindpilot.activeRun.v1",
-  "grindpilot.activity.v1",
-  "grindpilot.profiles.v1",
-  "grindpilot.projects.v1",
-  "grindpilot.settings.v1",
-  "grindpilot.devSnapshots.v1",
-]);
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
 const PRICE_BRIDGE_RESPONSE = "EA_DATA_PRICE_RESPONSE";
 const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
@@ -393,6 +385,51 @@ const initSolverWorker = () => {
     solverPortProtocol = null;
     throw error;
   });
+
+const requestGrindPilotRpcInstall = () =>
+  new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: GRINDPILOT_RPC_INSTALL_REQUEST }, (response) => {
+      const runtimeError = chrome.runtime?.lastError;
+      if (runtimeError || !response?.ok) {
+        reject(new Error(runtimeError?.message || response?.error?.message || "EA RPC installation failed"));
+      } else resolve(response.data);
+    });
+  });
+
+const installIsolatedGrindPilotEaProxy = () => {
+  const pending = new Map();
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (event.source !== window || data?.type !== GRINDPILOT_EA_RESPONSE) return;
+    const request = pending.get(String(data.requestId ?? ""));
+    if (!request) return;
+    pending.delete(String(data.requestId));
+    clearTimeout(request.timeoutId);
+    if (data.ok) request.resolve(data.value);
+    else request.reject(Object.assign(new Error(data?.error?.message || "EA RPC failed"), { code: data?.error?.code || "EA_RPC_FAILED" }));
+  }, true);
+  const invoke = (method, payload) => new Promise((resolve, reject) => {
+    const requestId = createRequestId();
+    const timeoutId = setTimeout(() => {
+      pending.delete(requestId);
+      reject(Object.assign(new Error(`EA RPC timed out: ${method}`), { code: "EA_RPC_TIMEOUT" }));
+    }, 130_000);
+    pending.set(requestId, { resolve, reject, timeoutId });
+    window.postMessage({ type: GRINDPILOT_EA_REQUEST, requestId, method, payload }, "*");
+  });
+  const method = (name) => (payload) => invoke(name, payload);
+  window.eaData = {
+    grindPilot: {
+      getHealth: method("getHealth"), getContext: method("getContext"),
+      readInventory: method("readInventory"), solveCurrentSbc: method("solveCurrentSbc"),
+      submitCurrentSbc: method("submitCurrentSbc"), listOwnedRewardPacks: method("listOwnedRewardPacks"),
+      claimCurrentReward: method("claimCurrentReward"), openOwnedRewardPack: method("openOwnedRewardPack"),
+      resolveUnassigned: method("resolveUnassigned"), readPlayerPick: method("readPlayerPick"),
+      selectPlayerPick: method("selectPlayerPick"),
+    },
+    openSequencePlanner: method("openSequencePlanner"),
+  };
+};
   return solverWorkerInitPromise;
 };
 
@@ -657,132 +694,6 @@ const handleSolverBridgeRequest = async (data) => {
   }
 };
 
-const storageLocalGet = (key) =>
-  new Promise((resolve, reject) => {
-    try {
-      if (!chrome?.storage?.local?.get) {
-        reject(new Error("chrome.storage.local unavailable"));
-        return;
-      }
-      chrome.storage.local.get([key], (items) => {
-        const err = chrome?.runtime?.lastError;
-        if (err) {
-          reject(new Error(err.message || "storage get failed"));
-          return;
-        }
-        resolve(items ? items[key] : null);
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-
-const storageLocalSet = (key, value) =>
-  new Promise((resolve, reject) => {
-    try {
-      if (!chrome?.storage?.local?.set) {
-        reject(new Error("chrome.storage.local unavailable"));
-        return;
-      }
-      chrome.storage.local.set({ [key]: value }, () => {
-        const err = chrome?.runtime?.lastError;
-        if (err) {
-          reject(new Error(err.message || "storage set failed"));
-          return;
-        }
-        resolve(true);
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-
-const storageLocalRemove = (key) =>
-  new Promise((resolve, reject) => {
-    try {
-      chrome.storage.local.remove([key], () => {
-        const err = chrome?.runtime?.lastError;
-        if (err) reject(new Error(err.message || "storage remove failed"));
-        else resolve(true);
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-
-const estimateJsonBytes = (value) => {
-  const encoded = JSON.stringify(value);
-  return new TextEncoder().encode(encoded ?? "null").byteLength;
-};
-
-const postGrindPilotStorageResponse = (requestId, ok, data, error) => {
-  window.postMessage(
-    {
-      type: GP_STORAGE_RESPONSE,
-      source: GP_STORAGE_SOURCE,
-      requestId,
-      ok: Boolean(ok),
-      data,
-      error,
-    },
-    "*",
-  );
-};
-
-const handleGrindPilotStorageRequest = async (data) => {
-  if (window !== window.top) return;
-  if (data?.type !== GP_STORAGE_REQUEST || data?.source !== GP_STORAGE_SOURCE)
-    return;
-  const requestId = String(data?.requestId ?? "");
-  const operation = String(data?.operation ?? "").toUpperCase();
-  const key = String(data?.key ?? "");
-  if (!requestId || requestId.length > 200) return;
-  if (!GP_STORAGE_ALLOWED_KEYS.has(key)) {
-    postGrindPilotStorageResponse(requestId, false, null, {
-      code: "GP_STORAGE_KEY_FORBIDDEN",
-      message: "Storage key is not allowlisted",
-    });
-    return;
-  }
-  if (!new Set(["GET", "SET", "REMOVE"]).has(operation)) {
-    postGrindPilotStorageResponse(requestId, false, null, {
-      code: "GP_STORAGE_OPERATION_FORBIDDEN",
-      message: "Storage operation is not allowed",
-    });
-    return;
-  }
-
-  try {
-    if (operation === "GET") {
-      postGrindPilotStorageResponse(
-        requestId,
-        true,
-        await storageLocalGet(key),
-        null,
-      );
-      return;
-    }
-    if (operation === "REMOVE") {
-      await storageLocalRemove(key);
-      postGrindPilotStorageResponse(requestId, true, true, null);
-      return;
-    }
-    const bytes = estimateJsonBytes(data?.value);
-    if (bytes > GP_STORAGE_MAX_BYTES) {
-      throw Object.assign(new Error("Storage value exceeds the 2 MiB limit"), {
-        code: "GP_STORAGE_VALUE_TOO_LARGE",
-      });
-    }
-    await storageLocalSet(key, data?.value ?? null);
-    postGrindPilotStorageResponse(requestId, true, { stored: true, bytes }, null);
-  } catch (error) {
-    postGrindPilotStorageResponse(requestId, false, null, {
-      code: error?.code || "GP_STORAGE_FAILED",
-      message: error?.message || "Storage request failed",
-    });
-  }
-};
-
 const postPrefResponse = (requestId, ok, data, error) => {
   const detail = {
     type: PREF_BRIDGE_RES,
@@ -970,16 +881,6 @@ window.addEventListener(
     if (window !== window.top) return;
     if (!isTrustedPageMessageEvent(event)) return;
     handleSolverBridgeRequest(event.data);
-  },
-  true,
-);
-
-window.addEventListener(
-  "message",
-  (event) => {
-    if (window !== window.top) return;
-    if (!isTrustedPageMessageEvent(event)) return;
-    handleGrindPilotStorageRequest(event.data);
   },
   true,
 );

@@ -1,5 +1,6 @@
 import { normalizePackPolicy } from "../packs/pack-policy.js";
 import { normalizePlayerPickPolicy } from "../picks/pick-policy.js";
+import { validateCondition } from "../workflow/conditions.js";
 
 export const PROFILE_SCHEMA_VERSION = 1;
 
@@ -104,6 +105,20 @@ function validateStopConditions(stopConditions) {
     }
     if (Object.hasOwn(condition, "expression") || Object.hasOwn(condition, "script")) {
       throw new ProfileValidationError("ARBITRARY_CODE_FORBIDDEN", "Profiles cannot contain executable expressions");
+    }
+    const type = condition.type.trim().toUpperCase();
+    const aliases = new Set([
+      "UNRESOLVED_UNASSIGNED", "STORAGE_FULL", "REQUIRED_SPECIAL_MISSING",
+    ]);
+    const typedConditions = new Set(["COMPARE", "ALL", "ANY", "NOT", "TRUTHY", "EXISTS"]);
+    if (type === "CONDITION") {
+      const result = validateCondition(condition.condition);
+      if (!result.ok) throw new ProfileValidationError("INVALID_PROFILE", `stopConditions[${index}] contains an invalid condition`);
+    } else if (typedConditions.has(type)) {
+      const result = validateCondition(condition);
+      if (!result.ok) throw new ProfileValidationError("INVALID_PROFILE", `stopConditions[${index}] is invalid`);
+    } else if (!aliases.has(type)) {
+      throw new ProfileValidationError("INVALID_PROFILE", `Unsupported stop condition: ${type}`);
     }
   }
 }

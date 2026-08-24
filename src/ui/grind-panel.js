@@ -95,7 +95,7 @@ export class GrindPanel {
 
   readDraft(root) {
     const get = (name) => root.querySelector(`[data-field="${name}"]`);
-    return { mode:get("mode")?.value||"REVIEW", maxIterations:Number(get("maxIterations")?.value||1), storageCapacity:Number(get("storageCapacity")?.value||100), protectRatingAtOrAbove:Number(get("protectRatingAtOrAbove")?.value||94), protectedCardTypes:String(get("protectedCardTypes")?.value||"").split(",").map(v=>v.trim()).filter(Boolean), packMode:get("packMode")?.value||"OPEN_CURRENT_REWARD", maxPacks:Number(get("maxPacks")?.value||1), pickMode:get("pickMode")?.value||"PAUSE_FOR_USER" };
+    return { ...(this.state.draft || {}), mode:get("mode")?.value||"REVIEW", maxIterations:Number(get("maxIterations")?.value||1), storageCapacity:Number(get("storageCapacity")?.value||100), protectRatingAtOrAbove:Number(get("protectRatingAtOrAbove")?.value||94), protectedCardTypes:String(get("protectedCardTypes")?.value||"").split(",").map(v=>v.trim()).filter(Boolean), packMode:get("packMode")?.value||"OPEN_CURRENT_REWARD", maxPacks:Number(get("maxPacks")?.value||1), pickMode:get("pickMode")?.value||"PAUSE_FOR_USER" };
   }
 
   bindViewActions(root) {
