@@ -294,11 +294,16 @@ class GrindPilotRuntime {
   async stop() { clearTimeout(this.wakeTimer); await this.engine.stop({ reason: "Stopped by user" }); }
   async resume() {
     const run=this.engine.getSnapshot(); const current=run?.nodes?.[run.cursor];
+    if (run?.status === RunStatus.RECOVERY_REQUIRED) {
+      const error = new Error("The interrupted destructive step must be reconciled before this run can resume");
+      error.code = "RECOVERY_RECONCILIATION_REQUIRED";
+      throw error;
+    }
     let approveCurrent=false;
     if(run?.mode===WorkflowMode.ASSISTED && current && [WorkflowStepType.SUBMIT_SBC,WorkflowStepType.CLAIM_REWARD,WorkflowStepType.OPEN_REWARD_PACK,WorkflowStepType.RESOLVE_ITEMS,WorkflowStepType.HANDLE_PLAYER_PICK].includes(current.step.type)) {
       approveCurrent=window.confirm(`Approve destructive step ${current.step.type}?`); if(!approveCurrent)return;
     }
-    await this.engine.resume({ approveCurrent, acknowledgeRecovery: run?.status===RunStatus.RECOVERY_REQUIRED, retryCurrent: current?.status==="failed" });
+    await this.engine.resume({ approveCurrent, retryCurrent: current?.status==="failed" });
     await this.drive();
   }
 

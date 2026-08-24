@@ -2136,7 +2136,21 @@
   };
 
   const extractUnassignedItemsFromResult = (result) => {
-    const data = result?.data ?? result ?? null;
+    const status = parseStatusNumber(result?.status);
+    if (
+      result == null ||
+      result?.success === false ||
+      result?.error != null ||
+      (status != null && status >= 400)
+    ) {
+      const error = new Error("EA unassigned request failed");
+      error.code = "EA_UNASSIGNED_REQUEST_FAILED";
+      error.response = result ?? null;
+      throw error;
+    }
+    const data = Object.prototype.hasOwnProperty.call(result, "data")
+      ? result.data
+      : result;
     if (Array.isArray(data)) return markItemsAsUnassigned(data);
     if (Array.isArray(data?.items)) return markItemsAsUnassigned(data.items);
     if (Array.isArray(data?.data?.items))
@@ -2146,7 +2160,10 @@
     if (Array.isArray(data?.list)) return markItemsAsUnassigned(data.list);
     if (Array.isArray(data?._collection))
       return markItemsAsUnassigned(data._collection);
-    return markItemsAsUnassigned([]);
+    const error = new Error("EA unassigned response shape was not recognized");
+    error.code = "EA_UNASSIGNED_RESPONSE_UNKNOWN";
+    error.response = result;
+    throw error;
   };
 
   const getUnassignedItems = async ({ refresh = false, failClosed = false } = {}) => {
@@ -30846,6 +30863,14 @@
     const beforeResult = Array.isArray(beforePacks)
       ? grindPilotResult("verified", beforePacks)
       : await grindPilotListOwnedPacks();
+    if (beforeResult.status !== "verified" || !Array.isArray(beforeResult.value)) {
+      return grindPilotResult(
+        "not_applied",
+        null,
+        "Reward was not claimed because the owned-pack baseline could not be verified",
+        { beforeStatus: beforeResult?.status ?? null },
+      );
+    }
     const handled = await detectAndConfirmRewardPopup({
       maxAttempts: 2,
       intervalMs: 350,
@@ -30859,12 +30884,26 @@
     if (afterResult.status !== "verified") {
       return grindPilotResult("ambiguous", null, "Reward clicked but pack inventory could not be verified");
     }
-    const beforeCounts = new Map(
-      (beforeResult?.value ?? []).map((pack) => [String(pack.id), Number(pack.count ?? 1)]),
+    const countPacksById = (packs) => {
+      const counts = new Map();
+      for (const pack of packs) {
+        const id = String(pack?.id ?? "");
+        const count = Number(pack?.count ?? 1);
+        if (!id || !Number.isFinite(count) || count < 0) continue;
+        counts.set(id, (counts.get(id) ?? 0) + count);
+      }
+      return counts;
+    };
+    const beforeCounts = countPacksById(beforeResult.value);
+    const afterCounts = countPacksById(afterResult.value);
+    const positiveDeltaIds = [...afterCounts].filter(
+      ([id, count]) => count - (beforeCounts.get(id) ?? 0) > 0,
     );
-    const deltas = (afterResult.value ?? []).filter(
-      (pack) => Number(pack.count ?? 1) > (beforeCounts.get(String(pack.id)) ?? 0),
-    );
+    const deltas = positiveDeltaIds.map(([id, count]) => ({
+      ...(afterResult.value ?? []).find((pack) => String(pack?.id ?? "") === id),
+      id,
+      count,
+    }));
     if (deltas.length !== 1) {
       return grindPilotResult("ambiguous", { candidates: deltas }, "Claimed reward could not be correlated to exactly one pack");
     }

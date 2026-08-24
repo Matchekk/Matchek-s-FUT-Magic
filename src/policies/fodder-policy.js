@@ -220,6 +220,8 @@ export class FodderPolicy {
     const protectedCardTypes = new Set(this.config.protectedCardTypes);
     const allowedSpecialTypes = new Set(this.config.allowedSpecialTypes);
 
+    if (item?.isLocked === true) reasons.push("locked-item");
+    if (item?.isProtected === true) reasons.push("protected-item-flag");
     if (itemId != null && protectedItemIds.has(itemId)) reasons.push("protected-item");
     if (playerId != null && protectedPlayerIds.has(playerId)) reasons.push("protected-player");
     if (resourceId != null && protectedResourceIds.has(resourceId)) {

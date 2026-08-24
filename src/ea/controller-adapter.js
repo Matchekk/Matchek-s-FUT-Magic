@@ -19,6 +19,10 @@ const verifiedValue = (result, operation) => {
         : "EA_OPERATION_UNAVAILABLE";
   error.evidence = result?.evidence ?? null;
   error.result = result ?? null;
+  if (result?.status === "not_applied") {
+    error.notApplied = true;
+    error.safeToRetry = true;
+  }
   throw error;
 };
 
@@ -109,4 +113,3 @@ export class ControllerAdapter {
 }
 
 export { verifiedValue as requireVerifiedEaResult };
-
