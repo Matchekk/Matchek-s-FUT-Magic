@@ -30878,13 +30878,15 @@
       typeof item?.[key] === "function"
         ? Boolean(item[key]())
         : Boolean(item?.[key]);
+    const isDuplicate = (item) =>
+      readFlag(item, "isDuplicate") || Number(item?.duplicateId ?? 0) > 0;
     const toClub = items.filter((item) => readFlag(item, "isMovable"));
     const toStorage = items
       .filter(
         (item) =>
           !readFlag(item, "isMovable") &&
           readFlag(item, "isStorable") &&
-          readFlag(item, "isDuplicate") &&
+          isDuplicate(item) &&
           !readFlag(item, "isTradeable"),
       )
       .slice(0, freeStorage);
