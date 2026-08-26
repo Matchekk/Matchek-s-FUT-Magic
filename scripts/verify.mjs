@@ -90,8 +90,8 @@ for (const entry of manifest.web_accessible_resources || []) {
   ) {
     errors.push("web-accessible resources must remain limited to the EA origin");
   }
-  if (entry.use_dynamic_url !== true) {
-    errors.push("web-accessible resources must use per-session dynamic URLs");
+  if (entry.use_dynamic_url === true) {
+    errors.push("isolated-world modules must retain the extension origin");
   }
 }
 
@@ -100,9 +100,13 @@ if (JSON.stringify(manifest.permissions || []) !== JSON.stringify(["storage", "s
 }
 if (
   JSON.stringify(manifest.host_permissions || []) !==
-  JSON.stringify(["https://www.fut.gg/*"])
+  JSON.stringify([
+    "https://www.fut.gg/*",
+    "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
+    "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*",
+  ])
 ) {
-  errors.push("host_permissions must remain limited to FUT.GG");
+  errors.push("host_permissions must remain limited to FUT.GG and the EA Web App");
 }
 if (changelog.releases?.[0]?.version !== manifest.version) {
   errors.push("manifest version must match the newest changelog release");

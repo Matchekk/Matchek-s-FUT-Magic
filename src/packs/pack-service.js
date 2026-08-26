@@ -32,6 +32,13 @@ export class PackService {
 
   async open({ policy, currentReward } = {}) {
     const plan = await this.plan({ policy, currentReward });
+    return this.openPlan(plan);
+  }
+
+  async openPlan(plan = {}) {
+    if (!Array.isArray(plan?.packs)) {
+      throw new PackPolicyError("INVALID_PACK_PLAN", "A verified owned-pack plan is required");
+    }
     const opened = [];
 
     for (const pack of plan.packs) {

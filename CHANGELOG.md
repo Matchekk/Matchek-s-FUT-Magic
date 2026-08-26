@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.2.0 - 2026-08-25
+
+- Integrated soft fodder conservation into the production solver while keeping
+  explicit protected cards as hard exclusions.
+- Added complete Target Project import/synchronization, a nested workflow
+  builder, five templates and Legacy Sequence migration using stable IDs.
+- Added controller-level Player Pick inspection/selection with typed policies,
+  identity rechecks and fail-safe ambiguity handling.
+- Added persisted intents and three-way reload reconciliation for every
+  destructive grind operation.
+- Added rating-bucket inventory views, capability health, per-run analytics and
+  structured policy/project editors in the unified blue GrindPilot panel.
+- Added a 20-iteration fake-EA suite with destructive reloads, a real-browser
+  integration harness, deterministic ZIP packaging and CI coverage.
+- Added production guides for Target Projects, Player Picks, the Workflow
+  Builder and controlled live verification.
+
 ## 2.1.2 - 2026-08-24
 
 - Moved GrindPilot persistence into typed, schema-validated extension commands

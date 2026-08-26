@@ -307,6 +307,17 @@ const deriveValuesFromLabel = (rule, fallback = []) => {
   return fallback;
 };
 
+const deriveNumericTargetFromLabel = (raw, type) => {
+  const label = normalizeString(raw?.label || raw?.raw?.label);
+  if (!label) return null;
+  const patterns = {
+    team_rating: /team rating[^0-9]*(\d{2,3})/i,
+    players_in_squad: /players in the squad[^0-9]*(\d{1,2})/i,
+  };
+  const match = label.match(patterns[type]);
+  return match ? toNumber(match[1]) : null;
+};
+
 const categoryForType = (type) => CATEGORY_BY_TYPE[type] || "unknown";
 
 const resolveConstraintTarget = (constraint, fallbackSquadSize) => {
@@ -362,12 +373,18 @@ export const compileConstraintSet = (requirementsNormalized = [], options = {}) 
     const values = deriveValuesFromLabel({ ...raw, type }, rawValues);
     const baseCount = toNumber(raw.count);
     const derivedCount = toNumber(raw.derivedCount);
+    const labelDerivedCount = deriveNumericTargetFromLabel(raw, type);
     const count =
       derivedCount != null &&
+      derivedCount >= 0 &&
       (baseCount == null || baseCount === -1) &&
       DERIVED_COUNT_ALLOWED_TYPES.has(type)
         ? derivedCount
-        : baseCount;
+        : labelDerivedCount != null &&
+            (baseCount == null || baseCount === -1) &&
+            DERIVED_COUNT_ALLOWED_TYPES.has(type)
+          ? labelDerivedCount
+          : baseCount;
     const op =
       raw.op ||
       scopeNameToOp(raw.scopeName) ||

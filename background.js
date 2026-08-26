@@ -7,6 +7,8 @@ const SOLVER_WORKER_RESPONSE = "SOLVER_WORKER_RESPONSE";
 const LEGACY_SOLVER_WORKER_REQUEST = SOLVER_WORKER_RESPONSE;
 const BRIDGE_INJECT_REQUEST = "EA_PAGE_BRIDGE_INJECT";
 const GRINDPILOT_RPC_INSTALL_REQUEST = "EA_GRINDPILOT_RPC_INSTALL";
+const GRINDPILOT_RPC_CALL_REQUEST = "EA_GRINDPILOT_RPC_CALL_V2";
+const grindPilotRpcSecrets = new Map();
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
 const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
 const GP_STATE_COMMAND = "GRINDPILOT_STATE_COMMAND_V2";
@@ -47,7 +49,7 @@ const FUT_PLAYERS_ALLOWED_FILTERS = new Set([
 import {
   buildSolverContext,
   solveSquad,
-} from "./solver/solver.js?v=2026-02-22d";
+} from "./solver/solver.js?v=2026-08-25a";
 import { normalizeProfile } from "./src/profiles/profile-service.js";
 import { normalizeWorkflowDefinition } from "./src/workflow/definitions.js";
 
@@ -321,51 +323,145 @@ const markFutPriceBatchError = (ids, reason = null) => {
   }
 };
 
-const installGrindPilotMainWorldRpc = () => {
+export const installGrindPilotMainWorldRpc = (secret) => {
   if (window.__grindPilotEaRpcInstalled) return;
-  window.__grindPilotEaRpcInstalled = true;
-  const requestType = "GRINDPILOT_EA_REQUEST_V1";
-  const responseType = "GRINDPILOT_EA_RESPONSE_V1";
+  if (typeof secret !== "string" || secret.length < 32) throw new Error("EA RPC secret missing");
   const methods = new Set([
-    "getHealth", "getContext", "readInventory", "solveCurrentSbc",
+    "getHealth", "getCapabilityHealth", "getContext", "readInventory", "readCurrentSbcProject", "findSbcTarget", "readLegacySequences", "solveCurrentSbc",
     "submitCurrentSbc", "listOwnedRewardPacks", "claimCurrentReward",
     "openOwnedRewardPack", "resolveUnassigned", "readPlayerPick",
-    "selectPlayerPick", "openSequencePlanner",
+    "selectPlayerPick", "openSequencePlanner", "organizeIntoSbc", "readSbcChallengeState",
   ]);
-  window.addEventListener("message", async (event) => {
-    const data = event.data;
-    if (event.source !== window || data?.type !== requestType) return;
-    const requestId = String(data.requestId ?? "");
-    const method = String(data.method ?? "");
-    if (!requestId || !methods.has(method)) return;
+  const cloneSafe = (root) => {
+    const seen = new WeakSet();
+    let visited = 0;
+    const copy = (value, depth = 0) => {
+      if (value == null || ["string", "number", "boolean"].includes(typeof value)) return value;
+      if (["function", "symbol", "undefined", "bigint"].includes(typeof value)) return undefined;
+      if (depth > 32 || ++visited > 20_000) return null;
+      if (typeof value !== "object") return String(value);
+      if (seen.has(value)) return null;
+      seen.add(value);
+      if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+      const output = Array.isArray(value) ? [] : {};
+      let keys = [];
+      try { keys = Object.getOwnPropertyNames(value).slice(0, 500); } catch { return null; }
+      for (const key of keys) {
+        if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+        let descriptor;
+        try { descriptor = Object.getOwnPropertyDescriptor(value, key); } catch { continue; }
+        if (!descriptor || !("value" in descriptor)) continue;
+        const next = copy(descriptor.value, depth + 1);
+        if (next === undefined) continue;
+        if (Array.isArray(output) && /^\d+$/.test(key)) output[Number(key)] = next;
+        else output[key] = next;
+      }
+      return output;
+    };
+    return copy(root);
+  };
+  const api = window.eaData?.grindPilot;
+  if (!api) throw new Error("EA operation bridge unavailable");
+  const encoder = new TextEncoder();
+  const fromBase64 = (value) => Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+  const keyPromise = crypto.subtle.importKey("raw", fromBase64(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const used = new Set();
+  const invoke = async (ticket) => {
+    const requestId = String(ticket?.requestId ?? "");
+    const method = String(ticket?.method ?? "");
+    const expiresAt = Number(ticket?.expiresAt ?? 0);
+    const payloadJson = String(ticket?.payloadJson ?? "null");
+    if (!requestId || !methods.has(method) || used.has(requestId) || expiresAt < Date.now() || expiresAt > Date.now() + 30_000)
+      throw new Error("EA RPC capability rejected");
+    const signed = `${requestId}\n${method}\n${expiresAt}\n${payloadJson}`;
+    const valid = await crypto.subtle.verify("HMAC", await keyPromise, fromBase64(String(ticket?.signature ?? "")), encoder.encode(signed));
+    if (!valid) throw new Error("EA RPC capability signature invalid");
+    used.add(requestId);
+    if (used.size > 1000) used.delete(used.values().next().value);
     try {
       const target = method === "openSequencePlanner"
         ? window.eaData
-        : window.eaData?.grindPilot;
+        : api;
       const operation = target?.[method];
       if (typeof operation !== "function") throw new Error(`EA operation unavailable: ${method}`);
-      const value = await operation(data.payload ?? undefined);
-      window.postMessage({ type: responseType, requestId, ok: true, value }, "*");
+      const value = await operation(JSON.parse(payloadJson));
+      return { ok: true, value: cloneSafe(value) };
     } catch (error) {
-      window.postMessage({ type: responseType, requestId, ok: false, error: {
+      return { ok: false, error: {
         code: error?.code || "EA_RPC_FAILED",
         message: error?.message || "EA operation failed",
-      } }, "*");
+      } };
     }
-  }, true);
+  };
+  Object.defineProperty(window, "__grindPilotEaRpcBrokerV2", { value: Object.freeze({ invoke }), writable: false, configurable: false });
+  const safeNames = ["getHealth", "getCapabilityHealth", "getContext", "readInventory", "readCurrentSbcProject", "findSbcTarget", "readLegacySequences", "listOwnedRewardPacks", "readPlayerPick", "readSbcChallengeState"];
+  window.eaData.grindPilot = Object.freeze(Object.fromEntries(safeNames.filter((name) => typeof api[name] === "function").map((name) => [name, api[name]])));
+  window.__grindPilotEaRpcInstalled = true;
+};
+
+const gpBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const gpRpcSecret = async (tabId) => {
+  let secret = grindPilotRpcSecrets.get(tabId);
+  const storageKey = `grindpilot.rpc.secret.${tabId}`;
+  if (!secret && chrome.storage?.session) {
+    const stored = await chrome.storage.session.get(storageKey);
+    if (typeof stored?.[storageKey] === "string" && stored[storageKey].length >= 32) secret = stored[storageKey];
+  }
+  if (!secret) secret = gpBase64(crypto.getRandomValues(new Uint8Array(32)));
+  grindPilotRpcSecrets.set(tabId, secret);
+  if (chrome.storage?.session) await chrome.storage.session.set({ [storageKey]: secret });
+  return secret;
+};
+const gpSignRpcTicket = async (secret, ticket) => {
+  const key = await crypto.subtle.importKey("raw", Uint8Array.from(atob(secret), (char) => char.charCodeAt(0)), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const data = `${ticket.requestId}\n${ticket.method}\n${ticket.expiresAt}\n${ticket.payloadJson}`;
+  return gpBase64(new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data))));
 };
 
 const handleGrindPilotRpcInstallRequest = async (sender, sendResponse) => {
   try {
+    const secret = await gpRpcSecret(sender.tab.id);
     const result = await chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, frameIds: [0] },
       world: "MAIN",
       injectImmediately: true,
       func: installGrindPilotMainWorldRpc,
+      args: [secret],
     });
     sendResponse({ ok: true, data: { installed: true, results: result?.length ?? 0 } });
   } catch (error) {
     sendResponse({ ok: false, error: { code: "EA_RPC_INSTALL_FAILED", message: error?.message || "EA RPC installation failed" } });
+  }
+};
+
+const handleGrindPilotRpcCallRequest = async (message, sender, sendResponse) => {
+  const methods = new Set(["getHealth","getCapabilityHealth","getContext","readInventory","readCurrentSbcProject","findSbcTarget","readLegacySequences","solveCurrentSbc","organizeIntoSbc","readSbcChallengeState","submitCurrentSbc","listOwnedRewardPacks","claimCurrentReward","openOwnedRewardPack","resolveUnassigned","readPlayerPick","selectPlayerPick","openSequencePlanner"]);
+  try {
+    const requestId = String(message?.requestId ?? "");
+    const method = String(message?.method ?? "");
+    if (!requestId || !methods.has(method)) throw new Error("EA RPC method forbidden");
+    const payload = message?.payload ?? null;
+    const requireText = (value, field) => { if (!String(value ?? "").trim()) throw new Error(`EA RPC intent missing ${field}`); };
+    const requireArray = (value, field) => { if (!Array.isArray(value)) throw new Error(`EA RPC intent missing ${field}`); };
+    if (method === "submitCurrentSbc") { requireText(payload?.expectedChallengeId, "expectedChallengeId"); requireArray(payload?.expectedItemIds, "expectedItemIds"); requireArray(payload?.protectedItemIds, "protectedItemIds"); }
+    if (method === "organizeIntoSbc") { requireText(payload?.challengeId, "challengeId"); requireArray(payload?.requiredItemIds, "requiredItemIds"); requireArray(payload?.protectedItemIds, "protectedItemIds"); }
+    if (method === "openOwnedRewardPack") requireText(payload?.packId, "packId");
+    if (method === "claimCurrentReward") requireArray(payload?.beforePacks, "beforePacks");
+    if (method === "resolveUnassigned") requireArray(payload?.expectedActions, "expectedActions");
+    if (method === "selectPlayerPick") { requireText(payload?.pickIdentity, "pickIdentity"); requireText(payload?.itemId, "itemId"); }
+    const payloadJson = JSON.stringify(message?.payload ?? null);
+    if (payloadJson.length > 250_000) throw new Error("EA RPC payload too large");
+    const ticket = { requestId, method, expiresAt: Date.now() + 15_000, payloadJson };
+    ticket.signature = await gpSignRpcTicket(await gpRpcSecret(sender.tab.id), ticket);
+    const result = await chrome.scripting.executeScript({ target: { tabId: sender.tab.id, frameIds: [0] }, world: "MAIN", injectImmediately: true,
+      func: async (capability) => {
+        const broker = window.__grindPilotEaRpcBrokerV2;
+        if (!broker?.invoke) throw new Error("EA RPC broker unavailable");
+        return broker.invoke(capability);
+      }, args: [ticket] });
+    sendResponse(result?.[0]?.result ?? { ok: false, error: { code: "EA_RPC_EMPTY", message: "EA RPC returned no result" } });
+  } catch (error) {
+    sendResponse({ ok: false, error: { code: "EA_RPC_FAILED", message: error?.message || "EA RPC failed" } });
   }
 };
 
@@ -1142,6 +1238,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const knownType =
     message.type === BRIDGE_INJECT_REQUEST ||
     message.type === GRINDPILOT_RPC_INSTALL_REQUEST ||
+    message.type === GRINDPILOT_RPC_CALL_REQUEST ||
     message.type === PRICE_BRIDGE_REQUEST ||
     message.type === FUTGG_PLAYERS_BRIDGE_REQUEST ||
     message.type === GP_STATE_COMMAND ||
@@ -1170,6 +1267,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleGrindPilotRpcInstallRequest(sender, sendResponse);
     return true;
   }
+  if (message?.type === GRINDPILOT_RPC_CALL_REQUEST) {
+    handleGrindPilotRpcCallRequest(message, sender, sendResponse);
+    return true;
+  }
   if (message?.type === GP_STATE_COMMAND) {
     handleGrindPilotStateCommand(message, sender, sendResponse);
     return true;
@@ -1185,6 +1286,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 if (chrome.tabs?.onRemoved?.addListener) {
   chrome.tabs.onRemoved.addListener((tabId) => {
     if (!Number.isInteger(tabId)) return;
+    grindPilotRpcSecrets.delete(tabId);
+    chrome.storage?.session?.remove?.(`grindpilot.rpc.secret.${tabId}`).catch?.(() => {});
     const releaseLease = async () => {
       const record = await gpReadRunRecord();
       if (!record || record.lease?.tabId !== tabId) return;

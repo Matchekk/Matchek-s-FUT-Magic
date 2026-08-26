@@ -90,6 +90,66 @@ const normalizeSpecialRequirements = (requirements) =>
     })
     .filter(Boolean);
 
+const normalizeSourceChallenges = (challenges) =>
+  (Array.isArray(challenges) ? challenges : [])
+    .map((challenge) => {
+      const id = String(challenge?.id ?? challenge?.challengeId ?? "").trim();
+      if (!id) return null;
+      const rating = finiteNumber(
+        challenge?.requiredSquadRating ?? challenge?.rating,
+        null,
+      );
+      return {
+        id,
+        name: challenge?.name == null ? null : String(challenge.name),
+        completed: challenge?.completed === true,
+        requiredSquadRating:
+          rating == null ? null : Math.max(1, Math.min(99, Math.trunc(rating))),
+        specialCardRequirements: normalizeSpecialRequirements(
+          challenge?.specialCardRequirements,
+        ),
+        unknownRequirements: Array.isArray(challenge?.unknownRequirements)
+          ? challenge.unknownRequirements.map((value) => String(value))
+          : [],
+      };
+    })
+    .filter(Boolean);
+
+const aggregateSourceChallenges = (challenges) => {
+  const rating = new Map();
+  const specials = new Map();
+  for (const challenge of challenges) {
+    if (challenge.requiredSquadRating != null) {
+      const entry = rating.get(challenge.requiredSquadRating) || {
+        rating: challenge.requiredSquadRating,
+        count: 0,
+        completed: 0,
+      };
+      entry.count += 1;
+      if (challenge.completed) entry.completed += 1;
+      rating.set(challenge.requiredSquadRating, entry);
+    }
+    for (const requirement of challenge.specialCardRequirements) {
+      const entry = specials.get(requirement.cardType) || {
+        cardType: requirement.cardType,
+        count: 0,
+        completed: 0,
+        perRemainingSquad: false,
+      };
+      entry.count += requirement.count;
+      if (challenge.completed) entry.completed += requirement.count;
+      specials.set(requirement.cardType, entry);
+    }
+  }
+  const completedChallenges = challenges.filter((challenge) => challenge.completed).length;
+  return {
+    ratingRequirements: [...rating.values()].sort((a, b) => a.rating - b.rating),
+    specialCardRequirements: [...specials.values()].sort((a, b) => a.cardType.localeCompare(b.cardType)),
+    requiredSquadsRemaining: Math.max(0, challenges.length - completedChallenges),
+    completionProgress: challenges.length ? completedChallenges / challenges.length : 0,
+  };
+};
+
 export const normalizeTargetProject = (project, index = 0) => {
   if (!project || typeof project !== "object") {
     throw new TypeError("target project must be an object");
@@ -97,6 +157,12 @@ export const normalizeTargetProject = (project, index = 0) => {
   const id = String(project.id ?? `target-project-${index + 1}`);
   const name = String(project.name ?? "").trim();
   if (!name) throw new TypeError(`target project ${id} requires a name`);
+  const sourceChallenges = normalizeSourceChallenges(project.sourceChallenges);
+  const sourceChallengeIds = normalizeIdList(
+    project.sourceChallengeIds?.length
+      ? project.sourceChallengeIds
+      : sourceChallenges.map((challenge) => challenge.id),
+  );
   return {
     id,
     name,
@@ -112,6 +178,12 @@ export const normalizeTargetProject = (project, index = 0) => {
     protectedRatings: normalizeProtectedRatings(project.protectedRatings),
     protectedPlayerIds: normalizeIdList(project.protectedPlayerIds),
     protectedResourceIds: normalizeIdList(project.protectedResourceIds),
+    sourceSetId:
+      project.sourceSetId == null || project.sourceSetId === ""
+        ? null
+        : String(project.sourceSetId),
+    sourceChallengeIds,
+    sourceChallenges,
     completionProgress: Math.min(
       1,
       Math.max(0, finiteNumber(project.completionProgress, 0)),
@@ -162,6 +234,114 @@ export class TargetProjectService {
     const before = this.#projects.length;
     this.#projects = this.#projects.filter((project) => project.id !== String(id));
     return this.#projects.length !== before;
+  }
+
+  importCurrentSbc(snapshot, overrides = {}) {
+    if (!snapshot || typeof snapshot !== "object" || !snapshot.setId) {
+      throw new TypeError("A verified current SBC set is required");
+    }
+    const sourceChallenges = normalizeSourceChallenges(snapshot.challenges);
+    if (!sourceChallenges.length) {
+      throw new TypeError("The current SBC exposes no verifiable challenges");
+    }
+    const aggregated = aggregateSourceChallenges(sourceChallenges);
+    return this.upsert({
+      id: overrides.id ?? `project-${String(snapshot.setId)}`,
+      name: overrides.name ?? snapshot.setName ?? "Imported Target SBC",
+      active: overrides.active !== false,
+      priority: overrides.priority ?? 50,
+      ...aggregated,
+      protectedRatings: overrides.protectedRatings ?? {},
+      protectedPlayerIds: overrides.protectedPlayerIds ?? [],
+      protectedResourceIds: overrides.protectedResourceIds ?? [],
+      sourceSetId: String(snapshot.setId),
+      sourceChallengeIds: sourceChallenges.map((challenge) => challenge.id),
+      sourceChallenges,
+    });
+  }
+
+  synchronizeFromCurrentSbc(id, snapshot) {
+    const current = this.#projects.find((project) => project.id === String(id));
+    if (!current) throw new TypeError(`Unknown target project: ${String(id)}`);
+    if (!current.sourceSetId || String(snapshot?.setId ?? "") !== current.sourceSetId) {
+      throw new TypeError("The open SBC set does not match this Target Project");
+    }
+    const observed = normalizeSourceChallenges(snapshot?.challenges);
+    const observedById = new Map(observed.map((challenge) => [challenge.id, challenge]));
+    if (
+      current.sourceChallengeIds.length === 0 ||
+      current.sourceChallengeIds.some((challengeId) => !observedById.has(challengeId))
+    ) {
+      throw new TypeError("Target Project challenges could not be mapped uniquely");
+    }
+    const sourceChallenges = current.sourceChallengeIds.map((challengeId) =>
+      observedById.get(challengeId),
+    );
+    const aggregated = aggregateSourceChallenges(sourceChallenges);
+    return this.upsert({
+      ...current,
+      ...aggregated,
+      sourceChallenges,
+    });
+  }
+
+  markVerifiedChallengeCompleted({ setId, challengeId } = {}) {
+    const matches = this.#projects.filter(
+      (project) =>
+        project.sourceSetId === String(setId ?? "") &&
+        project.sourceChallengeIds.includes(String(challengeId ?? "")),
+    );
+    if (matches.length !== 1) return null;
+    const project = matches[0];
+    const sourceChallenges = project.sourceChallenges.map((challenge) =>
+      challenge.id === String(challengeId)
+        ? { ...challenge, completed: true }
+        : challenge,
+    );
+    return this.upsert({
+      ...project,
+      ...aggregateSourceChallenges(sourceChallenges),
+      sourceChallenges,
+    });
+  }
+
+  getDashboard(items = []) {
+    const ratingCounts = {};
+    for (const item of Array.isArray(items) ? items : []) {
+      const rating = nonNegativeInteger(item?.rating);
+      if (rating > 0) ratingCounts[rating] = (ratingCounts[rating] || 0) + 1;
+    }
+    return this.getActiveProjects().map((project) => ({
+      id: project.id,
+      name: project.name,
+      priority: project.priority,
+      completedSquads:
+        project.sourceChallenges.filter((challenge) => challenge.completed).length,
+      totalSquads:
+        project.sourceChallenges.length ||
+        project.requiredSquadsRemaining +
+          project.ratingRequirements.reduce((sum, requirement) => sum + requirement.completed, 0),
+      requiredSquadsRemaining: project.requiredSquadsRemaining,
+      remainingRatings: project.ratingRequirements.map((requirement) => ({
+        rating: requirement.rating,
+        remaining: Math.max(0, requirement.count - requirement.completed),
+        clubCount: ratingCounts[requirement.rating] || 0,
+        covered:
+          (ratingCounts[requirement.rating] || 0) >=
+          Math.max(0, requirement.count - requirement.completed),
+      })),
+      remainingSpecials: project.specialCardRequirements.map((requirement) => ({
+        cardType: requirement.cardType,
+        remaining:
+          Math.max(0, requirement.count - requirement.completed) *
+          (requirement.perRemainingSquad
+            ? Math.max(1, project.requiredSquadsRemaining)
+            : 1),
+      })),
+      protectedRatings: project.protectedRatings,
+      completionProgress: project.completionProgress,
+      sourceSetId: project.sourceSetId,
+    }));
   }
 
   /** Aggregate only explicit hard protection and auditable project demand. */

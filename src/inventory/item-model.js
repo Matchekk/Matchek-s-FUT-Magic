@@ -143,6 +143,10 @@ export const normalizeInventoryItem = (raw, options = {}) => {
     // Keep the spelling used by existing AutoPilot payloads as a read-only alias.
     isTradeable: isTradable,
     isUntradeable: !isTradable,
+    // Older/fake adapters did not expose these EA capabilities. Preserve their
+    // historical permissive behavior, while honoring explicit live false flags.
+    isMovable: raw.isMovable == null ? true : Boolean(raw.isMovable),
+    isStorable: raw.isStorable == null ? true : Boolean(raw.isStorable),
     isDuplicate: Boolean(raw.isDuplicate),
     isLocked: Boolean(raw.isLocked ?? raw.locked),
     isFavorite: Boolean(raw.isFavorite ?? raw.isFavourite),

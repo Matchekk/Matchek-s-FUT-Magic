@@ -1,5 +1,96 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+const bridgeSource = fs.readFileSync(
+  path.join(testDirectory, "..", "page", "ea-data-bridge.js"),
+  "utf8",
+);
+const contentScriptSource = fs.readFileSync(
+  path.join(testDirectory, "..", "content-script.js"),
+  "utf8",
+);
+const backgroundSource = fs.readFileSync(
+  path.join(testDirectory, "..", "background.js"),
+  "utf8",
+);
+const solverSource = fs.readFileSync(
+  path.join(testDirectory, "..", "solver", "solver.js"),
+  "utf8",
+);
+
+test("organizer canonicalizes serialized set IDs before challenge lookup", () => {
+  assert.match(
+    bridgeSource,
+    /String\(s\?\.id \?\? ""\) === String\(setId \?\? ""\)/,
+  );
+});
+
+test("every SBC submit refreshes and blocks active-squad definitions", () => {
+  assert.match(bridgeSource, /getActiveSquadPlayerIds\(\{ force: true \}\)/);
+  assert.match(bridgeSource, /EA_SUBMIT_ACTIVE_SQUAD_PROTECTED/);
+  assert.match(bridgeSource, /strictExcludeActiveSquad: options\?\.strictExcludeActiveSquad \?\? true/);
+});
+
+test("Exclude Special is opt-in instead of silently enabled", () => {
+  assert.match(
+    bridgeSource,
+    /excludeSpecial: false,\s*\/\/|excludeSpecial: false,/,
+  );
+});
+
+test("solver preferences have concrete Chrome local-storage wrappers", () => {
+  assert.match(contentScriptSource, /const storageLocalGet = \(key\) =>/);
+  assert.match(contentScriptSource, /chrome\.storage\.local\.get\(\[key\]/);
+  assert.match(contentScriptSource, /const storageLocalSet = \(key, value\) =>/);
+  assert.match(contentScriptSource, /chrome\.storage\.local\.set\(\{ \[key\]: value \}/);
+});
+
+test("background solver import cache key tracks the current live fix", () => {
+  assert.match(backgroundSource, /solver\/solver\.js\?v=2026-08-25a/);
+  assert.match(solverSource, /constraint-compiler\.js\?v=2026-08-25a/);
+});
+
+test("organizer required cards reach every solver attempt", () => {
+  const wrapperStart = bridgeSource.indexOf("const solveWithConceptFallback = async ({");
+  const wrapperEnd = bridgeSource.indexOf("const LEAGUE_CONFLICT_GENERIC_TYPE_TOKENS", wrapperStart);
+  const wrapperSource = bridgeSource.slice(wrapperStart, wrapperEnd);
+
+  assert.ok(wrapperStart >= 0);
+  assert.match(wrapperSource, /requiredItemIds = \[\]/);
+  assert.equal(
+    [...wrapperSource.matchAll(/requiredItemIds,/g)].length,
+    2,
+    "the owned solve and concept retry must both preserve requiredItemIds",
+  );
+});
+
+test("organizer apply preserves exact unassigned item IDs", () => {
+  assert.match(
+    bridgeSource,
+    /forceDefaultApply: true,\s*preserveExistingValid: false,\s*preserveExactItemIds: Array\.from\(requiredIds\)/,
+  );
+  assert.match(bridgeSource, /preserveExactItemIds\.has\(String\(id\)\)/);
+  assert.match(bridgeSource, /missingAppliedIds/);
+  assert.match(bridgeSource, /filter\(\(id\) => Boolean\(id\) && id !== "0"\)/);
+});
+
+test("Recycle Cards always hands unresolved leftovers to Organizer", () => {
+  const runtimeSource = readFileSync(
+    new URL("../src/grindpilot-main.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(runtimeSource, /allowPartial: true,\s*allowUnresolved: true/);
+  assert.match(runtimeSource, /id: "organize-remaining-items"/);
+  assert.doesNotMatch(
+    runtimeSource,
+    /plan\.requiresUserAction\s*\?\s*\[\{\s*id: "organize-remaining-items"/,
+  );
+});
+import { readFileSync } from "node:fs";
 
 import { requireVerifiedEaResult } from "../src/ea/controller-adapter.js";
 import { PageStorageArea } from "../src/ea/page-storage-area.js";
@@ -20,6 +111,30 @@ const destructiveWorkflow = {
   version: 1,
   steps: [{ id: "submit", type: "SUBMIT_SBC", config: {} }],
 };
+
+test("Solve Squad does not inherit EA's disabled action state", () => {
+  const bridgeSource = readFileSync(
+    new URL("../page/ea-data-bridge.js", import.meta.url),
+    "utf8",
+  );
+  const classCopy = bridgeSource.indexOf(
+    "button.className = `${referenceButton.className} ea-data-solve-button`;",
+  );
+  const disabledRemoval = bridgeSource.indexOf(
+    'button.classList.remove("disabled");',
+    classCopy,
+  );
+
+  assert.ok(classCopy >= 0);
+  assert.ok(disabledRemoval > classCopy);
+  assert.ok(disabledRemoval - classCopy < 1_000);
+});
+
+test("single-solve failures expose the concrete failing requirements", () => {
+  assert.match(bridgeSource, /result\?\.failingRequirements/);
+  assert.match(bridgeSource, /Not possible with current player pool \(\$\{details\.join\(", "\)\}\)/);
+  assert.match(bridgeSource, /title: "Solver Error",\s*message: error\?\.message/);
+});
 
 test("verified EA not_applied results are explicitly safe to retry", () => {
   assert.throws(
@@ -59,6 +174,47 @@ test("isolated-world state client exposes typed commands instead of raw storage 
   assert.equal(storage.get, undefined);
   assert.equal(storage.set, undefined);
   assert.equal(storage.remove, undefined);
+});
+
+test("isolated-world state client uses AutoSBC direct storage for local GrindPilot state", async () => {
+  const memory = {};
+  const messages = [];
+  const runtime = {
+    lastError: null,
+    sendMessage(message, callback) {
+      messages.push(message);
+      callback({ ok: true, data: null });
+    },
+  };
+  const directStorage = {
+    get(keys, callback) {
+      callback(Object.fromEntries(
+        keys.filter((key) => Object.hasOwn(memory, key)).map((key) => [key, structuredClone(memory[key])]),
+      ));
+    },
+    set(entries, callback) {
+      Object.assign(memory, structuredClone(entries));
+      callback();
+    },
+    remove(keys, callback) {
+      for (const key of keys) delete memory[key];
+      callback();
+    },
+  };
+  const storage = new PageStorageArea({ runtime, storage: directStorage, timeoutMs: 100 });
+
+  await storage.saveActivity([{ level: "info", action: "Solve" }]);
+  await storage.saveSettings({ mode: "REVIEW" });
+  const bootstrap = await storage.loadBootstrap();
+
+  assert.deepEqual(bootstrap.activity, [{ level: "info", action: "Solve" }]);
+  assert.deepEqual(bootstrap.settings, { mode: "REVIEW" });
+  assert.deepEqual(bootstrap.projects, []);
+  assert.equal(messages.length, 0);
+
+  await storage.loadActiveRun("owner-1");
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].action, "RUN_LOAD_ACTIVE");
 });
 
 test("workflow repository forwards one private owner identity to every run mutation", async () => {

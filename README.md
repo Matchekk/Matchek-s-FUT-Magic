@@ -24,6 +24,19 @@ REVIEW erstellt nur die Vorschau. ASSISTED fragt vor destruktiven Schritten.
 AUTO zeigt vor dem Start eine Zusammenfassung und bindet die einmalige
 Bestätigung an exakt diese Workflow-Version und ihren Hash.
 
+## Feature-Matrix 2.2
+
+| Bereich | Produktionsstatus | Fail-safe-Verhalten |
+|---|---|---|
+| Single/Multi/Set/Sequence Solver | bestehender AutoPilot-Pfad beibehalten | unbekannte Requirements oder ungeprüfte Lösungen stoppen |
+| Persistente Reward-Loops | produktiv mit REVIEW/ASSISTED/AUTO | harte Limits, Stop-Bedingungen und Recovery vor Wiederholung |
+| Fodder Conservation | im Produktionssolver aktiv | harte Schutzkarten werden ausgeschlossen; Reserven bleiben weich |
+| Target Projects | manuell und aus offenem SBC importierbar | unbekannte Regeln werden angezeigt, nicht geraten |
+| Workflow Builder | Templates, verschachtelte Schritte und Legacy-Import | nur typisierte Bedingungen und stabile IDs |
+| Player Picks | Policy-Auswahl bei vollständig beobachtbaren Angeboten | Standard ist Pause; Ties/fehlende Identität wählen nie automatisch |
+| Packs und Unassigned | nur korrelierte eigene Gratis-/Reward-Packs | kein Kauf, kein Market-Flow, kein automatischer Quicksell |
+| Analytics/Diagnostics | lokaler, redigierter JSON-Export | keine Credentials, Header, Requests oder Owned-Item-IDs im Analytics-Export |
+
 ## Was bewusst kombiniert wurde
 
 Aus AutoPilot-SBC stammen das Manifest-V3-Grundgerüst, die EA-Web-App-Adapter,
@@ -76,8 +89,11 @@ Es ist kein lokaler Python-Dienst erforderlich.
 Voraussetzung: Node.js 20 oder neuer.
 
 ```bash
+npm ci
 npm test
+npm run test:browser
 npm run check
+npm run package
 ```
 
 `npm test` enthält Regressionstests für Solver, FC26-Rating, Identitäten,
@@ -85,6 +101,9 @@ Inventory, Storage, Duplikate, Schutzrichtlinien, Target Projects, Packs,
 Player Picks, Profile, Workflow-Zustände/Recovery und Developer Mode.
 `npm run check` validiert JavaScript-Syntax, Manifest-Assets und
 Least-Privilege-Invarianten.
+`npm run package` erzeugt reproduzierbar
+`dist/grindpilot-fc26-<version>.zip`; Testquellen, temporäre Artefakte und
+opaque Solver-Binaries sind nicht Bestandteil des Release-Archivs.
 
 ## Architektur
 
@@ -117,6 +136,13 @@ Die Lösung läuft lokal im Browser. Einstellungen liegen in
 an FUT.GG übertragen; Requests werden ohne Cookies oder Zugangsdaten gesendet.
 Details: [`PRIVACY.md`](PRIVACY.md).
 
+## Bedienungs- und Prüfdokumentation
+
+- [`docs/workflow-builder.md`](docs/workflow-builder.md)
+- [`docs/target-projects.md`](docs/target-projects.md)
+- [`docs/player-picks.md`](docs/player-picks.md)
+- [`docs/live-verification-checklist.md`](docs/live-verification-checklist.md)
+
 ## Grenzen
 
 - Die Extension verwendet undokumentierte EA-Web-App-Controller; EA-Updates
@@ -124,9 +150,9 @@ Details: [`PRIVACY.md`](PRIVACY.md).
 - Der aktuelle Squad-Selektor ist eine validierte Heuristik, kein mathematischer
   Optimalitätsbeweis. Ein sauber neu modellierter CP-SAT-Kern bleibt eine
   geplante zweite Engine.
-- Die verifizierte EA-Controller-Oberfläche liefert derzeit keine vollständigen
-  Player-Pick-Angebote. GrindPilot erkennt den Zustand und pausiert deshalb,
-  statt eine Auswahl zu erraten.
+- Player-Pick-Automation hängt davon ab, dass die jeweilige EA-Web-App-Version
+  vollständige Angebote und einen der bekannten Selection-Controller offenlegt.
+  Capability Health nennt den konkreten Status; fehlende Daten führen zur Pause.
 - Sonderkarten mit eigenen Chemistry-Boost-Regeln benötigen reale FC-26-
   Golden-Fixtures, bevor sie sicher modelliert werden können.
 - Das Tool ist inoffiziell, nicht mit EA verbunden und wird auf eigenes Risiko

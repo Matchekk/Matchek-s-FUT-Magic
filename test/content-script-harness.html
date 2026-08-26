@@ -2,30 +2,31 @@
 <html lang="en">
   <head><meta charset="utf-8"><title>GrindPilot content-script harness</title></head>
   <body style="margin:0;background:#20251e;color:#eef5e8;font-family:system-ui">
-    <main style="padding:32px"><h1>Content-script test surface</h1><p>No EA account or network session is used.</p></main>
+    <main style="padding:32px">
+      <h1>Content-script test surface</h1><p>No EA account or network session is used.</p>
+      <section class="ut-store-pack-details-view" data-pack-id="content-owned-pack">
+        <h2>Premium Electrum Players Pack</h2>
+        <img alt="Premium Electrum Players Pack" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+        <div class="ea-pack-actions"><button class="call-to-action">Open</button></div>
+      </section>
+      <section class="ut-unassigned-view">
+        <header class="ut-unassigned-header"><h2>Items</h2><button class="ea-more-menu" aria-label="More options">⋮</button></header>
+      </section>
+    </main>
     <script>
       const state = { activeRun:null, activity:[], profiles:{}, projects:[], settings:{} };
       const verified = (value) => ({ status:"verified", value, at:Date.now() });
       const eaController = {
         getHealth: () => verified({ eaReady:true, bridgeReady:true, storeAvailable:true, itemMoveAvailable:true }),
-        getContext: () => ({ setName:"Test SBC", challengeName:"85+ Upgrade" }),
+        getCapabilityHealth: () => verified([{ id:"inventory", status:"AVAILABLE", evidence:{ harness:true } }]),
+        getContext: () => ({ setId:"test-set", setName:"Test SBC", challengeId:"content-script-test", challengeName:"85+ Upgrade" }),
         readInventory: () => verified({ club:[], storage:[], unassigned:[] }),
+        readCurrentSbcProject: () => verified({ setId:"test-set", setName:"Test SBC", challenges:[{ id:"content-script-test", name:"85+ Upgrade", completed:false, requiredSquadRating:85, specialCardRequirements:[], unknownRequirements:[] }] }),
+        readLegacySequences: () => verified([]),
         solveCurrentSbc: () => verified({ challengeId:"content-script-test", submitReady:true, solutionIds:[] }),
-        listOwnedRewardPacks: () => verified([]),
+        listOwnedRewardPacks: () => verified([{ id:"content-owned-pack", packName:"Premium Electrum Players Pack", count:1, isReward:true }]),
         readPlayerPick: () => verified({ pending:false, pickItemIds:[] }),
       };
-      window.addEventListener("message", async (event) => {
-        const data = event.data;
-        if (event.source !== window || data?.type !== "GRINDPILOT_EA_REQUEST_V1") return;
-        try {
-          const operation = eaController[data.method];
-          if (typeof operation !== "function") throw new Error(`Unavailable test operation: ${data.method}`);
-          window.postMessage({ type:"GRINDPILOT_EA_RESPONSE_V1", requestId:data.requestId, ok:true, value:await operation(data.payload) }, "*");
-        } catch (error) {
-          window.postMessage({ type:"GRINDPILOT_EA_RESPONSE_V1", requestId:data.requestId, ok:false, error:{ message:error.message } }, "*");
-        }
-      }, true);
-
       const originalAppendChild = Element.prototype.appendChild;
       Element.prototype.appendChild = function (node) {
         if (node?.tagName === "SCRIPT" && String(node.src).includes("page/ea-data-bridge.js")) {
@@ -37,11 +38,21 @@
 
       window.chrome = { runtime: {
         lastError:null,
-        getManifest: () => ({ version:"2.1.2" }),
+        getManifest: () => ({ version:"2.2.0" }),
         getURL: (path = "") => new URL(`../${path}`, location.href).href,
         sendMessage(message, callback) {
           if (message?.type === "EA_GRINDPILOT_RPC_INSTALL" || message?.type === "EA_PAGE_BRIDGE_INJECT") {
             queueMicrotask(() => callback({ ok:true, data:{ installed:true, injected:true } }));
+            return;
+          }
+          if (message?.type === "EA_GRINDPILOT_RPC_CALL_V2") {
+            queueMicrotask(async () => {
+              try {
+                const operation = eaController[message.method];
+                if (typeof operation !== "function") throw new Error(`Unavailable test operation: ${message.method}`);
+                callback({ ok:true, value:await operation(message.payload) });
+              } catch (error) { callback({ ok:false, error:{ message:error.message } }); }
+            });
             return;
           }
           if (message?.type !== "GRINDPILOT_STATE_COMMAND_V2") {
@@ -72,5 +83,6 @@
       }};
     </script>
     <script src="../content-script.js"></script>
+    <script src="../src/generated/grindpilot-content-bundle.js"></script>
   </body>
 </html>

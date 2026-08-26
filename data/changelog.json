@@ -2,6 +2,20 @@
   "version": 1,
   "releases": [
     {
+      "version": "2.2.0",
+      "date": "2026-08-25",
+      "headline": "Production-ready grind workflows and fail-safe recovery.",
+      "summary": "Connected conservation, Target Projects, workflow building, Player Picks, analytics and complete destructive recovery to the live extension path.",
+      "details": [
+        "Soft fodder reserves now rank production solver results without turning valid SBCs into false impossibilities.",
+        "Added Target Project import/sync, five workflow templates, nested editing and Legacy Sequence migration with stable IDs.",
+        "Added conservative controller-level Player Pick reading and selection with explicit pause on incomplete or ambiguous state.",
+        "All destructive steps persist exact intents and reconcile completed, not-applied and ambiguous reload states before any retry.",
+        "Added capability health, inventory rating buckets, per-run rating-flow analytics and structured configuration views.",
+        "Added 20-iteration fake-EA recovery coverage, a Chromium integration harness, deterministic packaging and CI release artifacts."
+      ]
+    },
+    {
       "version": "2.1.2",
       "date": "2026-08-24",
       "headline": "Fail-closed workflow and reward hardening.",

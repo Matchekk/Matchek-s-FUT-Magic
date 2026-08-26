@@ -1,15 +1,22 @@
 {
   "name": "grindpilot-fc26",
-  "version": "2.1.2",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "description": "Unified local-first FC26 SBC grind manager derived from AutoPilot-SBC.",
   "scripts": {
+    "build:runtime": "node scripts/build-runtime.mjs",
     "test": "node --test \"test/**/*.test.js\"",
-    "check": "node scripts/verify.mjs"
+    "test:browser": "npm run build:runtime && node scripts/browser-test.mjs",
+    "check": "node scripts/verify.mjs",
+    "package": "npm run build:runtime && node scripts/package.mjs"
   },
   "license": "GPL-3.0-only",
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.9",
+    "playwright": "^1.62.1"
   }
 }

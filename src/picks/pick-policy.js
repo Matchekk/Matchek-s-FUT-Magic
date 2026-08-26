@@ -75,8 +75,15 @@ function normalizeOffer(offer, index) {
   return {
     ...offer,
     itemId,
-    resourceId: String(offer.resourceId ?? offer.assetId ?? ""),
-    cardType: String(offer.cardType ?? offer.rarity ?? ""),
+    resourceId: String(offer.resourceId ?? ""),
+    basePlayerId: String(offer.basePlayerId ?? offer.assetId ?? ""),
+    name: offer.name == null ? null : String(offer.name),
+    cardType: String(offer.cardType ?? ""),
+    rarityName: String(offer.rarityName ?? offer.rarity ?? ""),
+    specialGroups: Array.isArray(offer.specialGroups)
+      ? offer.specialGroups.map(String)
+      : [],
+    isSpecial: offer.isSpecial === true,
     rating: Number.isFinite(rating) ? rating : null,
     estimatedValue: Number.isFinite(value) && value >= 0 ? value : null,
     isDuplicate: offer.isDuplicate === true,
@@ -112,15 +119,17 @@ function isRequiredSpecial(offer, policy, context) {
   const required = new Set([
     ...policy.requiredSpecialTypes,
     ...(Array.isArray(context?.requiredSpecialTypes) ? context.requiredSpecialTypes.map(String) : []),
-  ]);
-  return required.has(offer.cardType);
+  ].map((value) => String(value).trim().toLowerCase()).filter(Boolean));
+  return [offer.cardType, offer.rarityName, ...(offer.specialGroups || [])]
+    .map((value) => String(value).trim().toLowerCase())
+    .some((value) => required.has(value));
 }
 
 function criterionScore(criterion, offer, policy, context) {
   switch (criterion) {
     case "REQUIRED_SPECIAL": return isRequiredSpecial(offer, policy, context) ? 1 : 0;
     case "NON_DUPLICATE": return offer.isDuplicate ? 0 : 1;
-    case "PREFERRED_PLAYER": return policy.preferredPlayerIds.includes(offer.itemId) ? 1 : 0;
+    case "PREFERRED_PLAYER": return policy.preferredPlayerIds.includes(offer.basePlayerId) ? 1 : 0;
     case "PREFERRED_RESOURCE": return policy.preferredResourceIds.includes(offer.resourceId) ? 1 : 0;
     case "PREFERRED_CARD_TYPE": return policy.preferredCardTypes.includes(offer.cardType) ? 1 : 0;
     case "RATING": return offer.rating;
@@ -141,7 +150,22 @@ export function decidePlayerPick(rawOffers, rawPolicy = {}, context = {}) {
   if (!Array.isArray(rawOffers) || rawOffers.length === 0) {
     throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", "At least one player-pick offer is required");
   }
-  const offers = rawOffers.map(normalizeOffer);
+  const existingResourceIds = new Set(
+    (context?.existingResourceIds || []).map(String),
+  );
+  const duplicateResourceIds = new Set(
+    (context?.duplicateResourceIds || []).map(String),
+  );
+  const duplicateItemIds = new Set((context?.duplicateItemIds || []).map(String));
+  const offers = rawOffers.map(normalizeOffer).map((offer) => ({
+    ...offer,
+    isDuplicate:
+      offer.isDuplicate ||
+      duplicateItemIds.has(offer.itemId) ||
+      (offer.resourceId &&
+        (existingResourceIds.has(offer.resourceId) ||
+          duplicateResourceIds.has(offer.resourceId))),
+  }));
   if (new Set(offers.map((offer) => offer.itemId)).size !== offers.length) {
     throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", "Player-pick item IDs must be unique");
   }

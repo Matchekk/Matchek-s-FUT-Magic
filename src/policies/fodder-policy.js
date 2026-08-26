@@ -143,7 +143,10 @@ export const FODDER_OBJECTIVE_FIELDS = Object.freeze([
   "protectedCardViolations",
   "scarceSpecialUsage",
   "nonExpendableCardUsage",
-  "preferencePenalty",
+  "nonDuplicateUsage",
+  "nonStorageUsage",
+  "tradableUsage",
+  "targetProjectDemandPenalty",
   "premiumFodderPenalty",
   "replacementCost",
   "ratingOvershoot",
@@ -278,45 +281,6 @@ export class FodderPolicy {
       normalizedItems.map((item) => [item.itemId, this.#baseReasons(item)]),
     );
 
-    const protectReserve = (candidates, required, reason) => {
-      const alreadyProtected = candidates.filter(
-        (item) => (reasons.get(item.itemId) || []).length > 0,
-      ).length;
-      const needed = Math.max(0, required - alreadyProtected);
-      if (!needed) return;
-      candidates
-        .filter((item) => (reasons.get(item.itemId) || []).length === 0)
-        .sort((left, right) => {
-          const comparison = lexicographicCompare(
-            this.#preservationTuple(right),
-            this.#preservationTuple(left),
-          );
-          return comparison || left.itemId.localeCompare(right.itemId);
-        })
-        .slice(0, needed)
-        .forEach((item) => reasons.get(item.itemId).push(reason));
-    };
-
-    for (const [rating, required] of this.config.minimumReserveByRating.entries()) {
-      protectReserve(
-        normalizedItems.filter((item) => getRating(item) === rating),
-        required,
-        `minimum-rating-reserve:${rating}`,
-      );
-    }
-    for (const [rawType, rawRequired] of Object.entries(
-      this.config.specialReserveByCardType,
-    )) {
-      const type = String(rawType).trim().toLowerCase();
-      const required = Math.max(0, Math.trunc(numberOrNull(rawRequired) ?? 0));
-      if (!type || !required) continue;
-      protectReserve(
-        normalizedItems.filter((item) => getCardType(item) === type),
-        required,
-        `minimum-special-reserve:${type}`,
-      );
-    }
-
     const protectedItemIds = normalizedItems
       .filter((item) => (reasons.get(item.itemId) || []).length > 0)
       .map((item) => item.itemId);
@@ -332,6 +296,25 @@ export class FodderPolicy {
         [...reasons.entries()].filter(([, itemReasons]) => itemReasons.length),
       ),
       activeTargetProjectIds: [...this.config.activeTargetProjectIds],
+    };
+  }
+
+  /**
+   * Return a serializable soft-conservation policy for the production solver.
+   * Hard protection stays in `protectedItemIds`; reserves are intentionally
+   * soft so a valid SBC is not reported impossible merely to conserve fodder.
+   */
+  toSolverConservationPolicy() {
+    return {
+      enabled: true,
+      objectiveFields: [...FODDER_OBJECTIVE_FIELDS],
+      preferDuplicates: this.config.preferDuplicates,
+      preferSbcStorage: this.config.preferSbcStorage,
+      preferUntradeables: this.config.preferUntradeables,
+      preferredFodderRange: { ...this.config.preferredFodderRange },
+      minimumReserveByRating: Object.fromEntries(this.config.minimumReserveByRating),
+      specialReserveByCardType: { ...this.config.specialReserveByCardType },
+      projectRatingDemand: this.config.projectRatingDemand.map((entry) => ({ ...entry })),
     };
   }
 
@@ -356,7 +339,10 @@ export class FodderPolicy {
     }).length;
     let scarceSpecialUsage = 0;
     let nonExpendableCardUsage = 0;
-    let preferencePenalty = 0;
+    let nonDuplicateUsage = 0;
+    let nonStorageUsage = 0;
+    let tradableUsage = 0;
+    let targetProjectDemandPenalty = 0;
     let premiumFodderPenalty = 0;
     let replacementCost = 0;
 
@@ -366,18 +352,20 @@ export class FodderPolicy {
       const reserve = numberOrNull(this.config.specialReserveByCardType[type]) ?? 0;
       if (reserve > 0 && isSpecial(item)) scarceSpecialUsage += reserve;
       if (isSpecial(item)) nonExpendableCardUsage += 1;
-      if (this.config.preferDuplicates && !item?.isDuplicate) preferencePenalty += 1;
-      if (this.config.preferSbcStorage && !item?.isStorage) preferencePenalty += 1;
-      if (this.config.preferUntradeables && !item?.isUntradeable) preferencePenalty += 1;
+      if (this.config.preferDuplicates && !item?.isDuplicate) nonDuplicateUsage += 1;
+      if (this.config.preferSbcStorage && !item?.isStorage) nonStorageUsage += 1;
+      if (this.config.preferUntradeables && !item?.isUntradeable) tradableUsage += 1;
 
       const preferredMax = this.config.preferredFodderRange.max;
       if (rating > preferredMax) premiumFodderPenalty += Math.pow(rating - preferredMax, 2);
       for (const demand of this.config.projectRatingDemand) {
         if (rating >= demand.rating) {
-          premiumFodderPenalty +=
+          targetProjectDemandPenalty +=
             (rating - demand.rating + 1) * demand.count * Math.max(1, demand.priority);
         }
       }
+      const ratingReserve = this.config.minimumReserveByRating.get(rating) || 0;
+      if (ratingReserve > 0) targetProjectDemandPenalty += ratingReserve;
       replacementCost += getReplacementCost(item);
     }
 
@@ -394,10 +382,47 @@ export class FodderPolicy {
       protectedCardViolations,
       scarceSpecialUsage,
       nonExpendableCardUsage,
-      preferencePenalty,
+      nonDuplicateUsage,
+      nonStorageUsage,
+      tradableUsage,
+      targetProjectDemandPenalty,
       premiumFodderPenalty,
       replacementCost,
       ratingOvershoot,
     ]);
+  }
+
+  explainSelection(selectedItemIds, items, { targetRating = null } = {}) {
+    const selected = new Set((selectedItemIds || []).map(String));
+    const normalized = normalizeOwnedItems(items);
+    const analysis = this.analyze(normalized);
+    const explanations = [];
+    for (const item of normalized.filter((entry) => selected.has(entry.itemId))) {
+      const rating = getRating(item);
+      const location = item.isStorage ? " from SBC Storage" : "";
+      const ownership = item.isUntradeable ? " untradeable" : item.isTradable ? " tradable" : "";
+      const duplicate = item.isDuplicate ? " duplicate" : "";
+      explanations.push(`Used ${rating || "unrated"}${duplicate}${ownership}${location}`);
+    }
+    for (const item of normalized.filter((entry) => !selected.has(entry.itemId))) {
+      const hardReasons = analysis.reasonsByItemId[item.itemId] || [];
+      const rating = getRating(item);
+      if (hardReasons.length) {
+        explanations.push(`Preserved ${rating || "unrated"} because ${hardReasons[0].replaceAll("-", " ")}`);
+        continue;
+      }
+      const type = getCardType(item);
+      if ((this.config.specialReserveByCardType[type] || 0) > 0) {
+        explanations.push(`Preserved ${rating || "unrated"} ${type.toUpperCase()} because its special reserve is active`);
+      } else if (this.config.projectRatingDemand.some((demand) => rating >= demand.rating)) {
+        explanations.push(`Preserved ${rating || "unrated"} because an active Target Project needs high-rated fodder`);
+      }
+      if (explanations.length >= 8) break;
+    }
+    const tuple = this.getSquadObjectiveTuple(
+      normalized.filter((entry) => selected.has(entry.itemId)),
+      { allItems: normalized, targetRating, analysis },
+    );
+    return { explanations: explanations.slice(0, 8), objectiveFields: [...FODDER_OBJECTIVE_FIELDS], objectiveTuple: [...tuple] };
   }
 }
