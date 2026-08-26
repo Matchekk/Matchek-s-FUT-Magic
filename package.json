@@ -7,6 +7,7 @@
   "scripts": {
     "build:runtime": "node scripts/build-runtime.mjs",
     "test": "node --test \"test/**/*.test.js\"",
+    "benchmark:solver": "node scripts/solver-quality-benchmark.mjs",
     "test:browser": "npm run build:runtime && node scripts/browser-test.mjs",
     "check": "node scripts/verify.mjs",
     "package": "npm run build:runtime && node scripts/package.mjs"

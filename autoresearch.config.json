@@ -1,0 +1,15 @@
+{
+  "protectedBenchmarkPaths": [
+    "scripts/solver-quality-benchmark.mjs"
+  ],
+  "commitPaths": [
+    "solver",
+    "src/sbc/solver",
+    "src/policies/fodder-policy.js",
+    "test/solver-constraint-coverage.test.js",
+    "test/solver-policy-adapter.test.js",
+    "test/solver-regressions.test.js",
+    "package.json",
+    "scripts/solver-quality-benchmark.mjs"
+  ]
+}
