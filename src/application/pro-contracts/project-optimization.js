@@ -309,6 +309,10 @@ export const validateProjectOptimizationRequest = (value) => {
   const projects = value.projects.map((entry, index) =>
     validateProject(entry, `$projectOptimizationRequest.projects[${index}]`));
   unique(projects.map((entry) => entry.projectHandle), "$projectOptimizationRequest.projects");
+  if (projects.reduce((sum, project) => sum + project.requirements.length, 0) >
+      PROJECT_OPTIMIZATION_LIMITS.maxRequirements) {
+    invalid("projects contain too many requirements", "$projectOptimizationRequest.projects");
+  }
   const requirementHandles = unique(
     projects.flatMap((project) => project.requirements.map((entry) => entry.requirementHandle)),
     "$projectOptimizationRequest.projects.requirements",
