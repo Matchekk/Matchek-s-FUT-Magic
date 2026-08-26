@@ -5631,7 +5631,9 @@
         this.logger?.info?.("pack.opened", { packId: packId2, itemCount: response.items.length });
         let unresolved;
         try {
-          unresolved = getUnassignedCount(inventory);
+          unresolved = getUnassignedCount(
+            Array.isArray(inventory?.unassigned?.items) ? { ...inventory, unassigned: inventory.unassigned.items } : inventory
+          );
         } catch (error) {
           return { status: "blocked", reason: error.code ?? "INVENTORY_STATE_UNVERIFIED", opened, inventory };
         }
@@ -6018,11 +6020,18 @@
       this.storageArea = storageArea;
       this.storageKey = storageKey;
       this.domainApi = Boolean(domainApi);
+      this.mutationQueue = Promise.resolve();
     }
     async #readRecords() {
       const stored = await this.storageArea.get(this.storageKey);
       const value = stored?.[this.storageKey];
       return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    }
+    #enqueueMutation(operation) {
+      const pending = this.mutationQueue.then(operation);
+      this.mutationQueue = pending.catch(() => {
+      });
+      return pending;
     }
     async list() {
       if (this.domainApi) return (await this.storageArea.listProfiles()).map(clone2);
@@ -6034,20 +6043,25 @@
       return clone2(records[id] ?? null);
     }
     async put(profile) {
-      if (this.domainApi) return clone2(await this.storageArea.putProfile(clone2(profile)));
-      const records = await this.#readRecords();
-      records[profile.id] = clone2(profile);
-      await this.storageArea.set({ [this.storageKey]: records });
-      return clone2(profile);
+      const storedProfile = clone2(profile);
+      return this.#enqueueMutation(async () => {
+        if (this.domainApi) return clone2(await this.storageArea.putProfile(storedProfile));
+        const records = await this.#readRecords();
+        records[storedProfile.id] = storedProfile;
+        await this.storageArea.set({ [this.storageKey]: records });
+        return clone2(storedProfile);
+      });
     }
     async delete(id) {
-      if (this.domainApi) return Boolean(await this.storageArea.deleteProfile(id));
-      const records = await this.#readRecords();
-      if (!Object.hasOwn(records, id)) return false;
-      delete records[id];
-      if (Object.keys(records).length === 0) await this.storageArea.remove(this.storageKey);
-      else await this.storageArea.set({ [this.storageKey]: records });
-      return true;
+      return this.#enqueueMutation(async () => {
+        if (this.domainApi) return Boolean(await this.storageArea.deleteProfile(id));
+        const records = await this.#readRecords();
+        if (!Object.hasOwn(records, id)) return false;
+        delete records[id];
+        if (Object.keys(records).length === 0) await this.storageArea.remove(this.storageKey);
+        else await this.storageArea.set({ [this.storageKey]: records });
+        return true;
+      });
     }
   };
 
@@ -8234,7 +8248,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   var normalizeNestedSteps = (value, context, path) => {
     if (!Array.isArray(value)) return [];
     return value.map(
-      (step2, index) => normalizeStep(step2, context, `${path}[${index}]`, context.depth + 1)
+      (step2, index) => normalizeStep(step2, context, `${path}[${index}]`, context.depth)
     );
   };
   var normalizeStepConfig = (type, value, context, path) => {
@@ -8463,7 +8477,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
     code: String(error?.code ?? "STEP_FAILED"),
     message: String(error?.message ?? error ?? "Workflow step failed"),
     details: cloneSerializable(error?.details ?? null),
-    safeToRetry: error?.safeToRetry === true || error?.notApplied === true,
+    safeToRetry: typeof error?.safeToRetry === "boolean" ? error.safeToRetry : error?.notApplied === true,
     ambiguous: error?.ambiguous === true
   });
   var isDestructive = (step2) => DESTRUCTIVE_STEP_TYPES.has(step2?.type);
@@ -9001,6 +9015,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         return;
       }
       const context = await this._getContext(node);
+      let executionDispatched = false;
       try {
         if (!node.intent) {
           const prepared = await callHandlerMethod(handler, "prepare", {
@@ -9035,6 +9050,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
           await this.repository.assertOwnership(this.run.runId);
         }
         const abortController = typeof AbortController === "function" ? new AbortController() : null;
+        executionDispatched = true;
         const execution = callHandlerMethod(handler, "execute", {
           step: cloneSerializable(node.step),
           intent: cloneSerializable(node.intent),
@@ -9071,7 +9087,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             code: outcome2?.code ?? "STEP_FAILED",
             details: outcome2?.details ?? null
           });
-          error.safeToRetry = outcome2?.safeToRetry === true;
+          if (typeof outcome2?.safeToRetry === "boolean") {
+            error.safeToRetry = outcome2.safeToRetry;
+          }
           error.ambiguous = outcome2?.ambiguous === true;
           throw error;
         } else {
@@ -9079,14 +9097,15 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         }
         await this._persist();
       } catch (error) {
-        await this._handleStepError(node, error);
+        await this._handleStepError(node, error, { executionDispatched });
       }
     }
-    async _handleStepError(node, error) {
+    async _handleStepError(node, error, { executionDispatched = false } = {}) {
       if (node.status !== StepStatus.RUNNING) node.attempt += 1;
       const normalized = normalizeError(error);
       const destructive = isDestructive(node.step);
-      const ambiguous = normalized.ambiguous || destructive && normalized.safeToRetry !== true;
+      const ambiguous = executionDispatched && (normalized.ambiguous || destructive && normalized.safeToRetry !== true);
+      const retryExplicitlyDenied = error?.safeToRetry === false;
       node.error = normalized;
       this.run.lastError = {
         ...normalized,
@@ -9107,7 +9126,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       const policy = node.step.retryPolicy;
       const retryCodes = Array.isArray(policy.retryableCodes) ? policy.retryableCodes : [];
       const codeAllowed = retryCodes.length === 0 || retryCodes.includes(normalized.code);
-      if (node.attempt < policy.maxAttempts && codeAllowed) {
+      if (!retryExplicitlyDenied && node.attempt < policy.maxAttempts && codeAllowed) {
         const delayMs = calculateRetryDelay(policy, node.attempt);
         node.status = StepStatus.WAITING;
         node.waitUntil = this.now() + delayMs;
@@ -9977,7 +9996,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
           },
           execute: async ({ intent }) => {
             const opened = await this.packService.openPlan(intent.plan);
-            if (!opened.opened?.length) return { status: "paused", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack was not opened and verified", result: opened };
+            const packOpened = Array.isArray(opened.opened) && opened.opened.length > 0;
+            const expectedUnassignedStop = packOpened && opened.reason === "UNASSIGNED_BLOCKING";
+            if (!packOpened || opened.status !== "completed" && !expectedUnassignedStop) {
+              return { status: "paused", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack opening requires attention", result: opened };
+            }
             const beforeIds = new Set((intent.inventoryItemIdsBefore ?? []).map(String));
             const receivedItems = this.inventory.getSnapshot().items.filter((item) => !beforeIds.has(String(item.itemId))).map((item) => ({ itemId: item.itemId, rating: item.rating }));
             this.logger.info("Pack", "Reward pack opened", { packId: opened.opened[0].packId });
@@ -11420,7 +11443,9 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       await this.refreshGameContext();
       try {
         this.state.capabilityHealth = await this.adapter.getCapabilityHealth();
-      } catch {
+      } catch (error) {
+        this.state.capabilityHealth = (Array.isArray(this.state.capabilityHealth) ? this.state.capabilityHealth : []).filter((entry) => String(entry?.id || "").trim()).map((entry) => ({ id: entry.id, status: "UNAVAILABLE", evidence: null }));
+        this.state.error = this.state.error || `Capability refresh failed: ${error?.message || error}`;
       }
       this.emit();
       return this.getState();
