@@ -2802,7 +2802,10 @@
       const pile = item?.pile ?? null;
       if (Boolean(item?.isUnassigned)) return true;
       if (pile == null || pile === clubPile) return false;
-      if (pile === storagePile) return true;
+      // SBC Storage items are valid SBC inputs in their current pile. Moving
+      // them to Club first fails when an untradeable Club copy already exists
+      // (including a protected active-squad copy).
+      if (pile === storagePile) return false;
       if (unassignedPile != null && pile === unassignedPile) return true;
       return false;
     });
@@ -3811,7 +3814,16 @@
           (entry) => entry.id == null || entry.id === 0,
         ).length,
       });
-      return { missingAfterApply, slotSummary };
+      return {
+        missingAfterApply,
+        slotSummary,
+        appliedCount: appliedItems.length,
+        conceptCount,
+        complete:
+          missingAfterApply.length === 0 &&
+          appliedItems.length >= (expectedIds?.length ?? 0) &&
+          conceptCount === 0,
+      };
     };
     const resolved = [];
     const unresolvedIds = [];
@@ -3923,7 +3935,8 @@
       squadEntity ??
       [];
     const attemptSummary = summarizeSquad(attemptSlots, "apply");
-    if (attemptSummary?.missingAfterApply?.length) {
+    let finalAttemptSummary = attemptSummary;
+    if (!attemptSummary?.complete) {
       perf.retryTriggered = true;
       perf.retryMissingCount = attemptSummary.missingAfterApply.length;
       const refreshedLookup = await getCachedLookup();
@@ -4008,7 +4021,21 @@
         retryLoaded?.data?.squad ??
         squadEntity ??
         [];
-      summarizeSquad(attemptSlots, "apply-retry");
+      finalAttemptSummary = summarizeSquad(attemptSlots, "apply-retry");
+    }
+
+    if (!finalAttemptSummary?.complete) {
+      const error = new Error(
+        `Cannot apply squad: EA persisted ${finalAttemptSummary?.appliedCount ?? 0}/${applyIds.length} requested player(s).`,
+      );
+      error.code = "EA_APPLY_INCOMPLETE";
+      error.meta = {
+        requestedCount: applyIds.length,
+        appliedCount: finalAttemptSummary?.appliedCount ?? 0,
+        conceptCount: finalAttemptSummary?.conceptCount ?? 0,
+        missingIds: finalAttemptSummary?.missingAfterApply ?? applyIds,
+      };
+      throw error;
     }
 
     const finalItems = Array.isArray(attemptSlots)
@@ -5731,9 +5758,9 @@
   const PREF_STORAGE_KEY = "eaData.preferences.v1";
   const PREF_BRIDGE_TIMEOUT_MS = 3500;
   const PRICE_BRIDGE_TIMEOUT_MS = 25000;
-  const PRICE_BRIDGE_BATCH_SIZE = 10;
-  const PRICE_BRIDGE_MAX_CONCURRENT_BATCHES = 2;
-  const PRICE_BRIDGE_BATCH_DELAY_MS = 350;
+  const PRICE_BRIDGE_BATCH_SIZE = 1000;
+  const PRICE_BRIDGE_MAX_CONCURRENT_BATCHES = 1;
+  const PRICE_BRIDGE_BATCH_DELAY_MS = 0;
   const PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
   const PAGE_BRIDGE_TIMEOUT_MS = 12000;
   const PREF_CACHE_TTL_MS = 10 * 1000;

@@ -62,6 +62,23 @@ test("live solves fetch owned-player prices before optimizing conservation", () 
   assert.match(bridgeSource, /ownedPriceLookup,/);
 });
 
+test("SBC apply keeps Storage cards in place and rejects incomplete persistence", () => {
+  assert.match(
+    bridgeSource,
+    /if \(pile === storagePile\) return false;/,
+  );
+  assert.match(bridgeSource, /error\.code = "EA_APPLY_INCOMPLETE"/);
+  assert.match(
+    bridgeSource,
+    /appliedItems\.length >= \(expectedIds\?\.length \?\? 0\)/,
+  );
+});
+
+test("cold price enrichment coalesces the owned pool into bounded large batches", () => {
+  assert.match(bridgeSource, /const PRICE_BRIDGE_BATCH_SIZE = 1000;/);
+  assert.match(backgroundSource, /const FUT_PRICE_BATCH_SIZE = 50;/);
+});
+
 test("Organizer accepts consumed required cards as submit completion evidence", () => {
   assert.match(bridgeSource, /requiredCardsConsumed = Array\.from\(requiredIds\)\.every/);
   assert.match(bridgeSource, /"required_cards_consumed"/);
