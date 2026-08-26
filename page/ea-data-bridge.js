@@ -31351,8 +31351,12 @@
     if (opened?.success !== true) {
       return grindPilotResult("not_applied", opened, "EA rejected reward pack opening");
     }
-    const items = opened?.data?.items ?? opened?.data ?? [];
-    if (!Array.isArray(items)) {
+    const items = Array.isArray(opened?.data?.items)
+      ? opened.data.items
+      : Array.isArray(opened?.data)
+        ? opened.data
+        : null;
+    if (!items) {
       return grindPilotResult("ambiguous", null, "Pack opened but contents were not observable");
     }
     clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
