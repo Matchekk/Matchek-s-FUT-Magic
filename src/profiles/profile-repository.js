@@ -38,12 +38,19 @@ export class ChromeStorageProfileRepository {
     this.storageArea = storageArea;
     this.storageKey = storageKey;
     this.domainApi = Boolean(domainApi);
+    this.mutationQueue = Promise.resolve();
   }
 
   async #readRecords() {
     const stored = await this.storageArea.get(this.storageKey);
     const value = stored?.[this.storageKey];
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  #enqueueMutation(operation) {
+    const pending = this.mutationQueue.then(operation);
+    this.mutationQueue = pending.catch(() => {});
+    return pending;
   }
 
   async list() {
@@ -58,21 +65,26 @@ export class ChromeStorageProfileRepository {
   }
 
   async put(profile) {
-    if (this.domainApi) return clone(await this.storageArea.putProfile(clone(profile)));
-    const records = await this.#readRecords();
-    records[profile.id] = clone(profile);
-    await this.storageArea.set({ [this.storageKey]: records });
-    return clone(profile);
+    const storedProfile = clone(profile);
+    return this.#enqueueMutation(async () => {
+      if (this.domainApi) return clone(await this.storageArea.putProfile(storedProfile));
+      const records = await this.#readRecords();
+      records[storedProfile.id] = storedProfile;
+      await this.storageArea.set({ [this.storageKey]: records });
+      return clone(storedProfile);
+    });
   }
 
   async delete(id) {
-    if (this.domainApi) return Boolean(await this.storageArea.deleteProfile(id));
-    const records = await this.#readRecords();
-    if (!Object.hasOwn(records, id)) return false;
-    delete records[id];
-    if (Object.keys(records).length === 0) await this.storageArea.remove(this.storageKey);
-    else await this.storageArea.set({ [this.storageKey]: records });
-    return true;
+    return this.#enqueueMutation(async () => {
+      if (this.domainApi) return Boolean(await this.storageArea.deleteProfile(id));
+      const records = await this.#readRecords();
+      if (!Object.hasOwn(records, id)) return false;
+      delete records[id];
+      if (Object.keys(records).length === 0) await this.storageArea.remove(this.storageKey);
+      else await this.storageArea.set({ [this.storageKey]: records });
+      return true;
+    });
   }
 }
 
