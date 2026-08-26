@@ -3215,14 +3215,14 @@
     "hardRequirementViolations",
     "protectedCardViolations",
     "scarceSpecialUsage",
+    "targetProjectDemandPenalty",
     "nonExpendableCardUsage",
+    "replacementCost",
+    "ratingOvershoot",
     "nonDuplicateUsage",
     "nonStorageUsage",
     "tradableUsage",
-    "targetProjectDemandPenalty",
-    "premiumFodderPenalty",
-    "replacementCost",
-    "ratingOvershoot"
+    "premiumFodderPenalty"
   ]);
   var FodderPolicy = class {
     constructor(config = {}, { targetProjects = [] } = {}) {
@@ -3419,14 +3419,14 @@
         Math.max(0, Math.trunc(numberOrNull(hardRequirementViolations) ?? 0)),
         protectedCardViolations,
         scarceSpecialUsage,
+        targetProjectDemandPenalty,
         nonExpendableCardUsage,
+        replacementCost,
+        ratingOvershoot,
         nonDuplicateUsage,
         nonStorageUsage,
         tradableUsage,
-        targetProjectDemandPenalty,
-        premiumFodderPenalty,
-        replacementCost,
-        ratingOvershoot
+        premiumFodderPenalty
       ]);
     }
     explainSelection(selectedItemIds, items, { targetRating = null } = {}) {
@@ -4218,7 +4218,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     }
     renderDeveloper() {
       const d = this.state.diagnostics || {};
-      const health = this.state.capabilityHealth || [];
+      const health = (this.state.capabilityHealth || []).filter((entry) => entry && typeof entry === "object");
       return `<div class="form"><div class="field"><label><input data-field="developerMode" type="checkbox" ${d.enabled ? "checked" : ""}> Developer Mode</label></div></div><div class="section-title">Capability Health</div>${health.map((entry) => `<div class="health"><b>${escapeHtml(entry.id)}</b><span>${escapeHtml(entry.status)}</span><span class="hint">${escapeHtml(JSON.stringify(entry.evidence || {}))}</span></div>`).join("") || '<div class="empty">Refresh to inspect safe capabilities.</div>'}<div class="controls"><button class="action" data-action="refresh">Refresh health</button><button class="action" data-action="diagnostic-snapshot">Take snapshot</button><button class="action" data-action="diagnostic-export">Export diagnostics</button></div><textarea readonly>${escapeHtml(JSON.stringify(d.latest || d, null, 2))}</textarea><p class="hint">Instrumentation remains dormant while Developer Mode is disabled. Export is redacted and excludes request bodies, headers and credentials. UNVERIFIED means capability presence was observed without dispatching a destructive operation.</p>`;
     }
     readDraft(root) {
@@ -6487,11 +6487,13 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
               const ids = inventoryItemIds(observed);
               const expected = (intent.requiredItemIds ?? []).map(String);
               const present = expected.filter((id) => ids.has(id));
-              if (!expected.length || present.length === 0 && challengeState?.completed === true) {
-                await this.recordVerifiedTargetCompletion({
-                  expectedSetId: intent.target?.setId,
-                  expectedChallengeId: intent.target?.challengeId
-                });
+              if (!expected.length || present.length === 0) {
+                if (challengeState?.completed === true) {
+                  await this.recordVerifiedTargetCompletion({
+                    expectedSetId: intent.target?.setId,
+                    expectedChallengeId: intent.target?.challengeId
+                  });
+                }
                 return recovery("completed", { organizedItemIds: expected });
               }
               if (present.length === expected.length && challengeState?.available === true && challengeState?.completed === false) {

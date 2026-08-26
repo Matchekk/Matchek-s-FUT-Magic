@@ -75,3 +75,19 @@ test("objective tuples compare lexicographically and protected use dominates pri
   assert.equal(expendableTuple[1], 0);
   assert.ok(compareObjectiveTuples(expendableTuple, protectedTuple) < 0);
 });
+
+test("actual replacement cost beats a generic SBC Storage preference", () => {
+  const expensiveStorage = card(1, 88, {
+    isStorage: true,
+    marketPrice: 120000,
+  });
+  const cheapClub = card(2, 88, {
+    isStorage: false,
+    marketPrice: 12000,
+  });
+  const policy = new FodderPolicy({ preferSbcStorage: true });
+  const allItems = [expensiveStorage, cheapClub];
+  const storageTuple = policy.getSquadObjectiveTuple([expensiveStorage], { allItems });
+  const clubTuple = policy.getSquadObjectiveTuple([cheapClub], { allItems });
+  assert.ok(compareObjectiveTuples(clubTuple, storageTuple) < 0);
+});

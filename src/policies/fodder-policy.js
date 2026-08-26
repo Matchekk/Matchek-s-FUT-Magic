@@ -142,14 +142,14 @@ export const FODDER_OBJECTIVE_FIELDS = Object.freeze([
   "hardRequirementViolations",
   "protectedCardViolations",
   "scarceSpecialUsage",
+  "targetProjectDemandPenalty",
   "nonExpendableCardUsage",
+  "replacementCost",
+  "ratingOvershoot",
   "nonDuplicateUsage",
   "nonStorageUsage",
   "tradableUsage",
-  "targetProjectDemandPenalty",
   "premiumFodderPenalty",
-  "replacementCost",
-  "ratingOvershoot",
 ]);
 
 export class FodderPolicy {
@@ -381,14 +381,14 @@ export class FodderPolicy {
       Math.max(0, Math.trunc(numberOrNull(hardRequirementViolations) ?? 0)),
       protectedCardViolations,
       scarceSpecialUsage,
+      targetProjectDemandPenalty,
       nonExpendableCardUsage,
+      replacementCost,
+      ratingOvershoot,
       nonDuplicateUsage,
       nonStorageUsage,
       tradableUsage,
-      targetProjectDemandPenalty,
       premiumFodderPenalty,
-      replacementCost,
-      ratingOvershoot,
     ]);
   }
 

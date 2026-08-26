@@ -26761,6 +26761,7 @@
     timeoutMs = null,
     onStatus = null,
   }) => {
+    const ownedPriceLookup = await attachPriceMetaToConceptCandidates(players);
     const baseResult = await callSolveBridge(
       {
         players,
@@ -26777,6 +26778,14 @@
       requirementsNormalized,
       timeoutMs,
     );
+    if (baseResult && typeof baseResult === "object") {
+      baseResult.stats = {
+        ...(baseResult.stats && typeof baseResult.stats === "object"
+          ? baseResult.stats
+          : {}),
+        ownedPriceLookup,
+      };
+    }
     if (baseResult?.solutions?.length) return baseResult;
 
     try {
@@ -30799,6 +30808,7 @@
       const id = player?.id == null ? "" : String(player.id);
       return requiredIds.has(id) || !protectedIds.has(id);
     });
+    const ownedPriceLookup = await attachPriceMetaToConceptCandidates(safePlayers);
     const requirements = (payload?.openChallenge?.requirements ?? []).map(
       serializeRequirementForSolver,
     );
@@ -30871,7 +30881,10 @@
       setId: challenge?.setId == null ? null : String(challenge.setId),
       solutionIds,
       solutionSlots: result?.solutionSlots?.[0] ?? null,
-      stats: result?.stats ?? null,
+      stats: {
+        ...(result?.stats && typeof result.stats === "object" ? result.stats : {}),
+        ownedPriceLookup,
+      },
     };
     if (options?.previewOnly === true) {
       return grindPilotResult("verified", solveValue, null, { applied: false });
@@ -31161,8 +31174,11 @@
         `Organizer target submit was not verified (${submitResult?.error ?? submitResult?.status ?? "unknown"})`,
       );
     }
-    const completionDeadline = Date.now() + 8000;
+    clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
+    const completionDeadline = Date.now() + 12_000;
     let completionObserved = false;
+    let requiredCardsConsumed = false;
+    let remaining = [];
     while (Date.now() < completionDeadline) {
       const setSnapshot = await refreshSbcSetChallengesSnapshot(
         setId,
@@ -31176,11 +31192,18 @@
       );
       if (match?.isCompleted?.() || match?.status === "COMPLETED") {
         completionObserved = true;
-        break;
       }
-      await delayMs(250);
+      remaining = await getUnassignedItems({ refresh: true, failClosed: true });
+      const remainingIds = new Set(
+        remaining.map((item) => String(item?.id ?? "")).filter(Boolean),
+      );
+      requiredCardsConsumed = Array.from(requiredIds).every(
+        (id) => !remainingIds.has(String(id)),
+      );
+      if (completionObserved || requiredCardsConsumed) break;
+      await delayMs(350);
     }
-    if (!completionObserved) {
+    if (!completionObserved && !requiredCardsConsumed) {
       return grindPilotResult(
         "ambiguous",
         submitResult,
@@ -31188,9 +31211,9 @@
         { setId: String(setId), challengeId: resolvedChallengeId },
       );
     }
-    clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
-    await delayMs(500);
-    const remaining = await getUnassignedItems({ refresh: true, failClosed: true });
+    if (!remaining.length) {
+      remaining = await getUnassignedItems({ refresh: true, failClosed: true });
+    }
     const remainingIds = new Set(
       remaining.map((item) => String(item?.id ?? "")).filter(Boolean),
     );
@@ -31210,6 +31233,9 @@
       challengeId: resolvedChallengeId,
       requiredItemIds: Array.from(requiredIds),
       solutionIds,
+      completionEvidence: completionObserved
+        ? "challenge_completed"
+        : "required_cards_consumed",
       unresolvedItemIds: remaining.map((item) => String(item?.id ?? "")).filter(Boolean),
     });
   };

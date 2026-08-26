@@ -8629,14 +8629,14 @@ const CONSERVATION_OBJECTIVE_FIELDS = Object.freeze([
   "hardRequirementViolations",
   "protectedCardViolations",
   "scarceSpecialUsage",
+  "targetProjectDemandPenalty",
   "nonExpendableCardUsage",
+  "replacementCost",
+  "ratingOvershoot",
   "nonDuplicateUsage",
   "nonStorageUsage",
   "tradableUsage",
-  "targetProjectDemandPenalty",
   "premiumFodderPenalty",
-  "replacementCost",
-  "ratingOvershoot",
 ]);
 
 const readConservationCardType = (player) =>
@@ -8751,14 +8751,14 @@ const attachConservationObjective = (
     hardRequirementViolations,
     protectedCardViolations,
     scarceSpecialUsage,
+    targetProjectDemandPenalty,
     nonExpendableCardUsage,
+    replacementCost,
+    ratingOvershoot,
     nonDuplicateUsage,
     nonStorageUsage,
     tradableUsage,
-    targetProjectDemandPenalty,
     premiumFodderPenalty,
-    replacementCost,
-    ratingOvershoot,
   ];
   return {
     ...result,
@@ -8839,14 +8839,14 @@ const getConservationObjectiveTupleForSquad = (
     0,
     protectedCardViolations,
     scarceSpecialUsage,
+    targetProjectDemandPenalty,
     nonExpendableCardUsage,
+    replacementCost,
+    ratingOvershoot,
     nonDuplicateUsage,
     nonStorageUsage,
     tradableUsage,
-    targetProjectDemandPenalty,
     premiumFodderPenalty,
-    replacementCost,
-    ratingOvershoot,
   ];
 };
 

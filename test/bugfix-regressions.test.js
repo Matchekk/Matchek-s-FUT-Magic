@@ -50,8 +50,21 @@ test("solver preferences have concrete Chrome local-storage wrappers", () => {
 });
 
 test("background solver import cache key tracks the current live fix", () => {
-  assert.match(backgroundSource, /solver\/solver\.js\?v=2026-08-26a/);
+  assert.match(backgroundSource, /solver\/solver\.js\?v=2026-08-26b/);
   assert.match(solverSource, /constraint-compiler\.js\?v=2026-08-25a/);
+});
+
+test("live solves fetch owned-player prices before optimizing conservation", () => {
+  assert.match(
+    bridgeSource,
+    /ownedPriceLookup = await attachPriceMetaToConceptCandidates\(safePlayers\)/,
+  );
+  assert.match(bridgeSource, /ownedPriceLookup,/);
+});
+
+test("Organizer accepts consumed required cards as submit completion evidence", () => {
+  assert.match(bridgeSource, /requiredCardsConsumed = Array\.from\(requiredIds\)\.every/);
+  assert.match(bridgeSource, /"required_cards_consumed"/);
 });
 
 test("organizer required cards reach every solver attempt", () => {

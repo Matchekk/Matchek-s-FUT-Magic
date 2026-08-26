@@ -668,11 +668,13 @@ class GrindPilotRuntime {
             const ids = inventoryItemIds(observed);
             const expected = (intent.requiredItemIds ?? []).map(String);
             const present = expected.filter((id) => ids.has(id));
-            if (!expected.length || (present.length === 0 && challengeState?.completed === true)) {
-              await this.recordVerifiedTargetCompletion({
-                expectedSetId: intent.target?.setId,
-                expectedChallengeId: intent.target?.challengeId,
-              });
+            if (!expected.length || present.length === 0) {
+              if (challengeState?.completed === true) {
+                await this.recordVerifiedTargetCompletion({
+                  expectedSetId: intent.target?.setId,
+                  expectedChallengeId: intent.target?.challengeId,
+                });
+              }
               return recovery("completed", { organizedItemIds: expected });
             }
             if (
