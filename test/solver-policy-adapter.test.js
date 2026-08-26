@@ -50,3 +50,27 @@ test("AutoPilot adapter builds a valid 86 squad without burning a protected 94",
   assert.deepEqual(result.policy.protectedItemIds, ["12"]);
   assert.equal(result.policy.objectiveTuple[1], 0);
 });
+
+test("AutoPilot adapter forwards conservation policy into the production solver", () => {
+  let observedContext = null;
+  const solver = new ExistingAutoPilotSolver({
+    buildContext: (context) => {
+      observedContext = context;
+      return context;
+    },
+    solve: () => ({ stats: { solved: false }, solutions: [], failingRequirements: [] }),
+  });
+  solver.solve({
+    players: [player(0, 84, { isDuplicate: true, isStorage: true })],
+    requirementsNormalized: [],
+    fodderPolicy: {
+      preferDuplicates: true,
+      preferSbcStorage: true,
+      minimumReserveByRating: { 89: 2 },
+    },
+  });
+  assert.equal(observedContext.conservationPolicy.enabled, true);
+  assert.equal(observedContext.conservationPolicy.preferDuplicates, true);
+  assert.equal(observedContext.conservationPolicy.preferSbcStorage, true);
+  assert.equal(observedContext.conservationPolicy.minimumReserveByRating[89], 2);
+});

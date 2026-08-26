@@ -75,6 +75,10 @@ export class ExistingAutoPilotSolver extends SolverInterface {
       players,
       filters: { ...(request.filters || {}), excludedPlayerIds },
       prioritize,
+      conservationPolicy: {
+        ...fodderPolicy.toSolverConservationPolicy(),
+        protectedItemIds: policyAnalysis.protectedItemIds,
+      },
     });
     const result = this.solveImplementation(context);
     const selectedIds = Array.isArray(result?.solutions?.[0])

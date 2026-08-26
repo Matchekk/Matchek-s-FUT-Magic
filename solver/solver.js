@@ -8770,6 +8770,375 @@ const attachConservationObjective = (
   };
 };
 
+const getConservationObjectiveTupleForSquad = (
+  squad,
+  policy,
+  targetRating,
+) => {
+  const protectedIds = new Set((policy?.protectedItemIds || []).map(String));
+  const specialReserves = policy?.specialReserveByCardType || {};
+  const ratingReserves = policy?.minimumReserveByRating || {};
+  const demands = Array.isArray(policy?.projectRatingDemand)
+    ? policy.projectRatingDemand
+    : [];
+  const preferredMax = Math.max(
+    1,
+    toNumber(policy?.preferredFodderRange?.max) ?? 99,
+  );
+  let protectedCardViolations = 0;
+  let scarceSpecialUsage = 0;
+  let nonExpendableCardUsage = 0;
+  let nonDuplicateUsage = 0;
+  let nonStorageUsage = 0;
+  let tradableUsage = 0;
+  let targetProjectDemandPenalty = 0;
+  let premiumFodderPenalty = 0;
+  let replacementCost = 0;
+  for (const player of squad || []) {
+    const id = String(player?.id ?? "");
+    const rating = Math.max(0, toNumber(player?.rating) ?? 0);
+    const cardType = readConservationCardType(player);
+    const special = Boolean(player?.isSpecial);
+    if (protectedIds.has(id)) protectedCardViolations += 1;
+    if (special && Number(specialReserves[cardType] || 0) > 0) {
+      scarceSpecialUsage += Number(specialReserves[cardType]);
+    }
+    if (special) nonExpendableCardUsage += 1;
+    if (policy?.preferDuplicates !== false && !player?.isDuplicate) {
+      nonDuplicateUsage += 1;
+    }
+    if (policy?.preferSbcStorage !== false && !player?.isStorage) {
+      nonStorageUsage += 1;
+    }
+    if (policy?.preferUntradeables !== false && !player?.isUntradeable) {
+      tradableUsage += 1;
+    }
+    for (const demand of demands) {
+      const requiredRating = Math.max(0, toNumber(demand?.rating) ?? 0);
+      if (rating >= requiredRating) {
+        targetProjectDemandPenalty +=
+          (rating - requiredRating + 1) *
+          Math.max(0, toNumber(demand?.count) ?? 0) *
+          Math.max(1, toNumber(demand?.priority) ?? 1);
+      }
+    }
+    targetProjectDemandPenalty += Math.max(
+      0,
+      toNumber(ratingReserves[String(rating)]) ?? 0,
+    );
+    if (rating > preferredMax) {
+      premiumFodderPenalty += Math.pow(rating - preferredMax, 2);
+    }
+    replacementCost += readConservationReplacementCost(player);
+  }
+  const ratingOvershoot =
+    targetRating == null
+      ? 0
+      : Math.max(0, getSquadRating(squad || []) - targetRating);
+  return [
+    0,
+    protectedCardViolations,
+    scarceSpecialUsage,
+    nonExpendableCardUsage,
+    nonDuplicateUsage,
+    nonStorageUsage,
+    tradableUsage,
+    targetProjectDemandPenalty,
+    premiumFodderPenalty,
+    replacementCost,
+    ratingOvershoot,
+  ];
+};
+
+const compareConservationObjectiveTuples = (left, right) => {
+  const length = Math.max(left?.length ?? 0, right?.length ?? 0);
+  for (let index = 0; index < length; index += 1) {
+    const difference =
+      (toNumber(left?.[index]) ?? 0) - (toNumber(right?.[index]) ?? 0);
+    if (difference) return difference;
+  }
+  return 0;
+};
+
+const getConservationCardTuple = (player, policy) => {
+  const rating = Math.max(0, toNumber(player?.rating) ?? 0);
+  const cardType = readConservationCardType(player);
+  const special = Boolean(player?.isSpecial);
+  const specialReserve = Number(
+    policy?.specialReserveByCardType?.[cardType] || 0,
+  );
+  let targetDemand = Math.max(
+    0,
+    toNumber(policy?.minimumReserveByRating?.[String(rating)]) ?? 0,
+  );
+  for (const demand of policy?.projectRatingDemand || []) {
+    const requiredRating = Math.max(0, toNumber(demand?.rating) ?? 0);
+    if (rating >= requiredRating) {
+      targetDemand +=
+        (rating - requiredRating + 1) *
+        Math.max(0, toNumber(demand?.count) ?? 0) *
+        Math.max(1, toNumber(demand?.priority) ?? 1);
+    }
+  }
+  const preferredMax = Math.max(
+    1,
+    toNumber(policy?.preferredFodderRange?.max) ?? 99,
+  );
+  return [
+    special && specialReserve > 0 ? specialReserve : 0,
+    Number(special),
+    policy?.preferDuplicates !== false && !player?.isDuplicate ? 1 : 0,
+    policy?.preferSbcStorage !== false && !player?.isStorage ? 1 : 0,
+    policy?.preferUntradeables !== false && !player?.isUntradeable ? 1 : 0,
+    targetDemand,
+    rating > preferredMax ? Math.pow(rating - preferredMax, 2) : 0,
+    readConservationReplacementCost(player),
+  ];
+};
+
+const optimizeSolvedPolicySquad = (
+  squad,
+  pool,
+  rules,
+  squadSize,
+  lockedIds,
+  policy,
+  targetRating,
+  debugPush,
+  options = {},
+) => {
+  const startedAt = Date.now();
+  const unchanged = (extra = {}) => ({
+    squad,
+    changed: false,
+    ran: false,
+    before: null,
+    after: null,
+    evaluations: 0,
+    singleSwaps: 0,
+    pairSwaps: 0,
+    elapsedMs: Date.now() - startedAt,
+    ...extra,
+  });
+  if (
+    policy?.enabled !== true ||
+    !Array.isArray(squad) ||
+    squad.length < squadSize ||
+    !Array.isArray(pool) ||
+    pool.length <= squadSize ||
+    options?.chemistryRequired
+  ) {
+    return unchanged();
+  }
+
+  const timeBudgetMs = Math.max(
+    0,
+    toNumber(options?.timeBudgetMs) ?? 220,
+  );
+  const deadlineAt = timeBudgetMs > 0 ? startedAt + timeBudgetMs : null;
+  const maxEvaluations = Math.max(
+    100,
+    toNumber(options?.maxEvaluations) ?? 3200,
+  );
+  const maxIterations = Math.max(
+    1,
+    toNumber(options?.maxIterations) ?? 6,
+  );
+  const maxCandidates = Math.max(
+    16,
+    toNumber(options?.maxCandidates) ?? 72,
+  );
+  const pairCandidateLimit = Math.max(
+    8,
+    toNumber(options?.pairCandidateLimit) ?? 44,
+  );
+  const locked = new Set(
+    Array.from(lockedIds instanceof Set ? lockedIds : lockedIds || []).map(String),
+  );
+  const working = squad.slice(0, squadSize);
+  const before = getConservationObjectiveTupleForSquad(
+    working,
+    policy,
+    targetRating,
+  );
+  let bestTuple = before;
+  let evaluations = 0;
+  let singleSwaps = 0;
+  let pairSwaps = 0;
+  let changed = false;
+  const isExpired = () =>
+    evaluations >= maxEvaluations ||
+    (deadlineAt != null && Date.now() >= deadlineAt);
+  const isLocked = (player) =>
+    player?.id != null && locked.has(String(player.id));
+
+  const buildCandidates = () => {
+    const usedIds = new Set(
+      working
+        .map((player) => (player?.id == null ? null : String(player.id)))
+        .filter(Boolean),
+    );
+    const usedDefinitions = new Set(
+      working
+        .map((player) => getDefinitionKey(player))
+        .filter((value) => value != null)
+        .map(String),
+    );
+    const relevantRatings = new Set();
+    for (const player of working) {
+      const rating = Math.max(0, toNumber(player?.rating) ?? 0);
+      for (let delta = -4; delta <= 4; delta += 1) {
+        relevantRatings.add(rating + delta);
+      }
+    }
+    const numericTarget = toNumber(targetRating);
+    if (numericTarget != null) {
+      for (let rating = numericTarget - 15; rating <= numericTarget + 10; rating += 1) {
+        relevantRatings.add(rating);
+      }
+    }
+    const buckets = new Map();
+    for (const player of pool) {
+      if (!player || player.id == null || usedIds.has(String(player.id))) continue;
+      const definition = getDefinitionKey(player);
+      if (definition != null && usedDefinitions.has(String(definition))) continue;
+      const rating = Math.max(0, toNumber(player?.rating) ?? 0);
+      if (!relevantRatings.has(rating)) continue;
+      if (!buckets.has(rating)) buckets.set(rating, []);
+      buckets.get(rating).push(player);
+    }
+    const candidates = [];
+    for (const entries of buckets.values()) {
+      entries.sort((a, b) =>
+        compareConservationObjectiveTuples(
+          getConservationCardTuple(a, policy),
+          getConservationCardTuple(b, policy),
+        ),
+      );
+      candidates.push(...entries.slice(0, 5));
+    }
+    candidates.sort((a, b) => {
+      const policyDifference = compareConservationObjectiveTuples(
+        getConservationCardTuple(a, policy),
+        getConservationCardTuple(b, policy),
+      );
+      if (policyDifference) return policyDifference;
+      const target = numericTarget ?? 84;
+      return (
+        Math.abs((toNumber(a?.rating) ?? 0) - target) -
+        Math.abs((toNumber(b?.rating) ?? 0) - target)
+      );
+    });
+    return candidates.slice(0, maxCandidates);
+  };
+
+  const evaluate = (candidateSquad) => {
+    if (isExpired() || hasDuplicateDefinitions(candidateSquad, squadSize)) {
+      return null;
+    }
+    evaluations += 1;
+    if (!isSquadValid(rules, candidateSquad, squadSize)) return null;
+    const tuple = getConservationObjectiveTupleForSquad(
+      candidateSquad,
+      policy,
+      targetRating,
+    );
+    return compareConservationObjectiveTuples(tuple, bestTuple) < 0
+      ? tuple
+      : null;
+  };
+
+  for (let iteration = 0; iteration < maxIterations && !isExpired(); iteration += 1) {
+    const candidates = buildCandidates();
+    if (!candidates.length) break;
+    const usedIds = new Set(working.map((player) => String(player?.id ?? "")));
+    let bestMove = null;
+    for (let index = 0; index < working.length && !isExpired(); index += 1) {
+      const outgoing = working[index];
+      if (isLocked(outgoing)) continue;
+      for (const incoming of candidates) {
+        if (isExpired() || usedIds.has(String(incoming?.id ?? ""))) continue;
+        const trial = working.slice();
+        trial[index] = incoming;
+        const tuple = evaluate(trial);
+        if (!tuple) continue;
+        if (!bestMove || compareConservationObjectiveTuples(tuple, bestMove.tuple) < 0) {
+          bestMove = { type: "single", index, incoming, tuple };
+        }
+      }
+    }
+
+    if (!bestMove && !isExpired()) {
+      const pairCandidates = candidates.slice(0, pairCandidateLimit);
+      for (let left = 0; left < working.length && !isExpired(); left += 1) {
+        if (isLocked(working[left])) continue;
+        for (let right = left + 1; right < working.length && !isExpired(); right += 1) {
+          if (isLocked(working[right])) continue;
+          for (let a = 0; a < pairCandidates.length && !isExpired(); a += 1) {
+            const incomingA = pairCandidates[a];
+            if (usedIds.has(String(incomingA?.id ?? ""))) continue;
+            for (let b = a + 1; b < pairCandidates.length && !isExpired(); b += 1) {
+              const incomingB = pairCandidates[b];
+              if (usedIds.has(String(incomingB?.id ?? ""))) continue;
+              const trial = working.slice();
+              trial[left] = incomingA;
+              trial[right] = incomingB;
+              const tuple = evaluate(trial);
+              if (!tuple) continue;
+              if (!bestMove || compareConservationObjectiveTuples(tuple, bestMove.tuple) < 0) {
+                bestMove = {
+                  type: "pair",
+                  left,
+                  right,
+                  incomingA,
+                  incomingB,
+                  tuple,
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (!bestMove) break;
+    if (bestMove.type === "single") {
+      working[bestMove.index] = bestMove.incoming;
+      singleSwaps += 1;
+    } else {
+      working[bestMove.left] = bestMove.incomingA;
+      working[bestMove.right] = bestMove.incomingB;
+      pairSwaps += 1;
+    }
+    bestTuple = bestMove.tuple;
+    changed = true;
+  }
+
+  debugPush?.({
+    stage: "policy_conservation",
+    action: "summary",
+    ran: true,
+    changed,
+    before,
+    after: bestTuple,
+    evaluations,
+    singleSwaps,
+    pairSwaps,
+    elapsedMs: Date.now() - startedAt,
+  });
+  return {
+    squad: changed ? working : squad,
+    changed,
+    ran: true,
+    before,
+    after: bestTuple,
+    evaluations,
+    singleSwaps,
+    pairSwaps,
+    elapsedMs: Date.now() - startedAt,
+  };
+};
+
 const isNoRatingSolvedResultWasteful = (result, profile) => {
   if (!profile?.enabled || !result?.stats?.solved) return false;
   const value = result?.stats?.solvedValue ?? null;
@@ -12100,6 +12469,16 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     evaluations: 0,
     elapsedMs: 0,
   };
+  let policyOptimization = {
+    ran: false,
+    changed: false,
+    before: null,
+    after: null,
+    evaluations: 0,
+    singleSwaps: 0,
+    pairSwaps: 0,
+    elapsedMs: 0,
+  };
 
   if (solved && context?.optimize?.refineSolvedSquad !== false) {
     const refineStart = Date.now();
@@ -12168,6 +12547,54 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
         ? refineResult?.chemistry ??
           computeChemistryEval(squad, slotsForChemistry, squadSize)
         : null;
+      failingRequirements = buildFailingRequirements(squad, chemistry);
+      solved = failingRequirements.length === 0;
+    }
+  }
+
+  if (
+    solved &&
+    context?.conservationPolicy?.enabled === true &&
+    context?.optimize?.policyOptimization !== false
+  ) {
+    const policyOptimizationStart = Date.now();
+    const policyResult = optimizeSolvedPolicySquad(
+      squad,
+      normalizedPlayers,
+      rules,
+      squadSize,
+      lockedIds,
+      context.conservationPolicy,
+      ratingRequirement?.target ?? null,
+      debugPush,
+      {
+        chemistryRequired,
+        timeBudgetMs:
+          context?.optimize?.policyOptimizationTimeBudgetMs ?? 260,
+        maxEvaluations:
+          context?.optimize?.policyOptimizationMaxEvaluations ?? 3600,
+        maxIterations:
+          context?.optimize?.policyOptimizationMaxIterations ?? 6,
+        maxCandidates:
+          context?.optimize?.policyOptimizationMaxCandidates ?? 72,
+        pairCandidateLimit:
+          context?.optimize?.policyOptimizationPairCandidateLimit ?? 44,
+      },
+    );
+    timingsMs.policyOptimization = Date.now() - policyOptimizationStart;
+    policyOptimization = {
+      ran: Boolean(policyResult?.ran),
+      changed: Boolean(policyResult?.changed),
+      before: policyResult?.before ?? null,
+      after: policyResult?.after ?? null,
+      evaluations: policyResult?.evaluations ?? 0,
+      singleSwaps: policyResult?.singleSwaps ?? 0,
+      pairSwaps: policyResult?.pairSwaps ?? 0,
+      elapsedMs:
+        policyResult?.elapsedMs ?? timingsMs.policyOptimization,
+    };
+    if (policyResult?.changed) {
+      squad = policyResult.squad;
       failingRequirements = buildFailingRequirements(squad, chemistry);
       solved = failingRequirements.length === 0;
     }
@@ -12637,6 +13064,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       debugEnabled,
       debugLog,
       refinement,
+      policyOptimization,
       conservation,
       solvedValue,
       debugSquad: debugEnabled
