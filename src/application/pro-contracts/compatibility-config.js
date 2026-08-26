@@ -68,7 +68,29 @@ const compareSemanticVersions = (left, right) => {
   const leftPrerelease = left.includes("-");
   const rightPrerelease = right.includes("-");
   if (leftPrerelease !== rightPrerelease) return leftPrerelease ? -1 : 1;
-  return left.localeCompare(right);
+  if (!leftPrerelease) return 0;
+  const leftIdentifiers = left.slice(left.indexOf("-") + 1).split(".");
+  const rightIdentifiers = right.slice(right.indexOf("-") + 1).split(".");
+  const length = Math.max(leftIdentifiers.length, rightIdentifiers.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = leftIdentifiers[index];
+    const rightIdentifier = rightIdentifiers[index];
+    if (leftIdentifier == null) return -1;
+    if (rightIdentifier == null) return 1;
+    if (leftIdentifier === rightIdentifier) continue;
+    const leftNumeric = /^\d+$/.test(leftIdentifier);
+    const rightNumeric = /^\d+$/.test(rightIdentifier);
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    if (leftNumeric) {
+      const leftValue = leftIdentifier.replace(/^0+(?=\d)/, "");
+      const rightValue = rightIdentifier.replace(/^0+(?=\d)/, "");
+      if (leftValue.length !== rightValue.length) return leftValue.length - rightValue.length;
+      if (leftValue === rightValue) continue;
+      return leftValue < rightValue ? -1 : 1;
+    }
+    return leftIdentifier < rightIdentifier ? -1 : 1;
+  }
+  return 0;
 };
 
 const normalizeCapabilityDowngrade = (input, index) => {
