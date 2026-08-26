@@ -46,7 +46,9 @@ const normalizeError = (error) => ({
   code: String(error?.code ?? "STEP_FAILED"),
   message: String(error?.message ?? error ?? "Workflow step failed"),
   details: cloneSerializable(error?.details ?? null),
-  safeToRetry: error?.safeToRetry === true || error?.notApplied === true,
+  safeToRetry: typeof error?.safeToRetry === "boolean"
+    ? error.safeToRetry
+    : error?.notApplied === true,
   ambiguous: error?.ambiguous === true,
 });
 
@@ -623,6 +625,7 @@ export class WorkflowEngine {
       return;
     }
     const context = await this._getContext(node);
+    let executionDispatched = false;
     try {
       if (!node.intent) {
         const prepared = await callHandlerMethod(handler, "prepare", {
@@ -661,6 +664,7 @@ export class WorkflowEngine {
       const abortController = typeof AbortController === "function"
         ? new AbortController()
         : null;
+      executionDispatched = true;
       const execution = callHandlerMethod(handler, "execute", {
         step: cloneSerializable(node.step),
         intent: cloneSerializable(node.intent),
@@ -699,7 +703,9 @@ export class WorkflowEngine {
           code: outcome?.code ?? "STEP_FAILED",
           details: outcome?.details ?? null,
         });
-        error.safeToRetry = outcome?.safeToRetry === true;
+        if (typeof outcome?.safeToRetry === "boolean") {
+          error.safeToRetry = outcome.safeToRetry;
+        }
         error.ambiguous = outcome?.ambiguous === true;
         throw error;
       } else {
@@ -707,17 +713,19 @@ export class WorkflowEngine {
       }
       await this._persist();
     } catch (error) {
-      await this._handleStepError(node, error);
+      await this._handleStepError(node, error, { executionDispatched });
     }
   }
 
-  async _handleStepError(node, error) {
+  async _handleStepError(node, error, { executionDispatched = false } = {}) {
     if (node.status !== StepStatus.RUNNING) node.attempt += 1;
     const normalized = normalizeError(error);
     const destructive = isDestructive(node.step);
-    const ambiguous =
+    const ambiguous = executionDispatched && (
       normalized.ambiguous ||
-      (destructive && normalized.safeToRetry !== true);
+      (destructive && normalized.safeToRetry !== true)
+    );
+    const retryExplicitlyDenied = error?.safeToRetry === false;
     node.error = normalized;
     this.run.lastError = {
       ...normalized,
@@ -739,7 +747,7 @@ export class WorkflowEngine {
     const policy = node.step.retryPolicy;
     const retryCodes = Array.isArray(policy.retryableCodes) ? policy.retryableCodes : [];
     const codeAllowed = retryCodes.length === 0 || retryCodes.includes(normalized.code);
-    if (node.attempt < policy.maxAttempts && codeAllowed) {
+    if (!retryExplicitlyDenied && node.attempt < policy.maxAttempts && codeAllowed) {
       const delayMs = calculateRetryDelay(policy, node.attempt);
       node.status = StepStatus.WAITING;
       node.waitUntil = this.now() + delayMs;
