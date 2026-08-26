@@ -30,6 +30,18 @@ test("rating and value ties pause instead of silently selecting", () => {
   assert.equal(decidePlayerPick(tied, { type: "HIGHEST_VALUE" }).reason, "AMBIGUOUS_PICK");
 });
 
+test("highest-value policy falls back to rating value when prices are missing", () => {
+  const decision = decidePlayerPick(
+    [
+      { itemId: "low", rating: 86 },
+      { itemId: "high", rating: 91 },
+    ],
+    { type: "HIGHEST_VALUE" },
+  );
+  assert.equal(decision.status, "selected");
+  assert.equal(decision.selectedItemId, "high");
+});
+
 test("typed custom priority resolves lexicographically", () => {
   const decision = decidePlayerPick([
     { itemId: "duplicate-95", rating: 95, isDuplicate: true, cardType: "BASE" },

@@ -102,6 +102,9 @@ test("Recycle Cards always hands unresolved leftovers to Organizer", () => {
     runtimeSource,
     /plan\.requiresUserAction\s*\?\s*\[\{\s*id: "organize-remaining-items"/,
   );
+  assert.match(runtimeSource, /playerPickSteps = Array\.from\(\{ length: 11 \}/);
+  assert.match(runtimeSource, /\.\.\.playerPickSteps,\s*\{/);
+  assert.match(runtimeSource, /pendingUnassignedCount === 0/);
 });
 import { readFileSync } from "node:fs";
 

@@ -691,9 +691,13 @@ class GrindPilotRuntime {
         },
       },
       [WorkflowStepType.HANDLE_PLAYER_PICK]: {
-        prepare: async ({ run }) => {
+        prepare: async ({ run, step }) => {
+          const pickPolicy =
+            step?.config?.policy && typeof step.config.policy === "object"
+              ? step.config.policy
+              : this.currentPickPolicy();
           const decision = await this.playerPickService.handle({
-            policy: this.currentPickPolicy(),
+            policy: pickPolicy,
             context: this.playerPickContext(),
             execute: false,
           });
@@ -712,6 +716,7 @@ class GrindPilotRuntime {
             : null;
           return {
             pickIntent,
+            pickPolicy,
             decisionStatus: decision.status,
             decisionReason: decision.reason,
             reviewOnly: run.mode === WorkflowMode.REVIEW,
@@ -726,19 +731,22 @@ class GrindPilotRuntime {
               status: "paused",
               code: intent?.decisionReason || "PLAYER_PICK_UNVERIFIED",
               message: "Player-pick offers are unavailable, incomplete, or ambiguous. No selection was made.",
-              result: { policy: this.currentPickPolicy() },
+              result: { policy: intent?.pickPolicy ?? this.currentPickPolicy() },
             };
           }
           const decision = await this.playerPickService.handle({
             pickId: intent.pickIntent.pickIdentity,
-            policy: this.currentPickPolicy(),
+            policy: intent.pickPolicy ?? this.currentPickPolicy(),
             context: this.playerPickContext(),
             execute: run.mode !== WorkflowMode.REVIEW,
             approved: run.mode !== WorkflowMode.REVIEW,
             expectedIntent: intent.pickIntent,
           });
           if (decision.status === "completed" || (run.mode === WorkflowMode.REVIEW && decision.status === "selected")) {
-            if (decision.status === "completed") this.state.picksCompleted = Number(this.state.picksCompleted || 0) + 1;
+            if (decision.status === "completed") {
+              this.state.picksCompleted = Number(this.state.picksCompleted || 0) + 1;
+              await this.refreshInventory();
+            }
             return outcome({ ...decision, reviewOnly: run.mode === WorkflowMode.REVIEW });
           }
           return {
@@ -1012,7 +1020,8 @@ class GrindPilotRuntime {
       tradableWhenStorageUnavailable: "SAFE_HOLD",
       untradeableWhenStorageUnavailable: "PAUSE",
     });
-    if (!plan.actions.length) {
+    const pendingUnassignedCount = this.inventory.getSnapshot().unassigned.items.length;
+    if (!plan.actions.length && pendingUnassignedCount === 0) {
       this.logger.info("Recycle Cards", "No unassigned cards need recycling", null);
       return { status: "completed", result: plan };
     }
@@ -1020,14 +1029,30 @@ class GrindPilotRuntime {
     const toStorage = plan.actions.filter(
       (action) => action.type === "MOVE_TO_SBC_STORAGE",
     ).length;
-    const organizerTarget = plan.requiresUserAction ? await this.getOrganizerTarget() : null;
+    // Resolve player picks and safe moves first. The Organizer step discovers a
+    // target only if cards still remain, so pick-only queues never require an SBC.
+    const organizerTarget = null;
 
+    const configuredPickPolicy = this.currentPickPolicy();
+    const organizerPickPolicy =
+      configuredPickPolicy.type === "PAUSE_FOR_USER"
+        ? { type: "HIGHEST_VALUE" }
+        : configuredPickPolicy;
+    const playerPickSteps = Array.from({ length: 11 }, (_, index) => ({
+      id: `organize-player-pick-${index + 1}`,
+      type: WorkflowStepType.HANDLE_PLAYER_PICK,
+      config: { policy: organizerPickPolicy },
+      timeoutMs: 30_000,
+      retryPolicy: { maxAttempts: 1 },
+      onFailure: "PAUSE",
+    }));
     const definition = {
       id: "recycle-cards",
       name: "Recycle Cards",
       version: 1,
       metadata: { source: "grindpilot-recycle-button", safetyModel: "fail-closed" },
       steps: [
+        ...playerPickSteps,
         {
           id: "recycle-unassigned-items",
           type: WorkflowStepType.RESOLVE_ITEMS,

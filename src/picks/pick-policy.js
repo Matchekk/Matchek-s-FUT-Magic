@@ -177,7 +177,11 @@ export function decidePlayerPick(rawOffers, rawPolicy = {}, context = {}) {
     case PLAYER_PICK_POLICIES.HIGHEST_RATING:
       return uniqueBest(offers, (offer) => offer.rating, "HIGHEST_RATING");
     case PLAYER_PICK_POLICIES.HIGHEST_VALUE:
-      return uniqueBest(offers, (offer) => offer.estimatedValue, "HIGHEST_VALUE");
+      return uniqueBest(
+        offers,
+        (offer) => offer.estimatedValue ?? Math.pow(Math.max(0, offer.rating ?? 0), 3),
+        "HIGHEST_VALUE",
+      );
     case PLAYER_PICK_POLICIES.PREFER_NON_DUPLICATE: {
       const candidates = offers.filter((offer) => !offer.isDuplicate);
       if (candidates.length === 1) return selected(candidates[0], offers, "PREFER_NON_DUPLICATE");

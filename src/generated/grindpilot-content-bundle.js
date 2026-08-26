@@ -2579,7 +2579,11 @@
       case PLAYER_PICK_POLICIES.HIGHEST_RATING:
         return uniqueBest(offers, (offer) => offer.rating, "HIGHEST_RATING");
       case PLAYER_PICK_POLICIES.HIGHEST_VALUE:
-        return uniqueBest(offers, (offer) => offer.estimatedValue, "HIGHEST_VALUE");
+        return uniqueBest(
+          offers,
+          (offer) => offer.estimatedValue ?? Math.pow(Math.max(0, offer.rating ?? 0), 3),
+          "HIGHEST_VALUE"
+        );
       case PLAYER_PICK_POLICIES.PREFER_NON_DUPLICATE: {
         const candidates = offers.filter((offer) => !offer.isDuplicate);
         if (candidates.length === 1) return selected(candidates[0], offers, "PREFER_NON_DUPLICATE");
@@ -6506,9 +6510,10 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
           }
         },
         [WorkflowStepType.HANDLE_PLAYER_PICK]: {
-          prepare: async ({ run }) => {
+          prepare: async ({ run, step: step2 }) => {
+            const pickPolicy = step2?.config?.policy && typeof step2.config.policy === "object" ? step2.config.policy : this.currentPickPolicy();
             const decision = await this.playerPickService.handle({
-              policy: this.currentPickPolicy(),
+              policy: pickPolicy,
               context: this.playerPickContext(),
               execute: false
             });
@@ -6523,6 +6528,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
             } : null;
             return {
               pickIntent,
+              pickPolicy,
               decisionStatus: decision.status,
               decisionReason: decision.reason,
               reviewOnly: run.mode === WorkflowMode.REVIEW
@@ -6537,19 +6543,22 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
                 status: "paused",
                 code: intent?.decisionReason || "PLAYER_PICK_UNVERIFIED",
                 message: "Player-pick offers are unavailable, incomplete, or ambiguous. No selection was made.",
-                result: { policy: this.currentPickPolicy() }
+                result: { policy: intent?.pickPolicy ?? this.currentPickPolicy() }
               };
             }
             const decision = await this.playerPickService.handle({
               pickId: intent.pickIntent.pickIdentity,
-              policy: this.currentPickPolicy(),
+              policy: intent.pickPolicy ?? this.currentPickPolicy(),
               context: this.playerPickContext(),
               execute: run.mode !== WorkflowMode.REVIEW,
               approved: run.mode !== WorkflowMode.REVIEW,
               expectedIntent: intent.pickIntent
             });
             if (decision.status === "completed" || run.mode === WorkflowMode.REVIEW && decision.status === "selected") {
-              if (decision.status === "completed") this.state.picksCompleted = Number(this.state.picksCompleted || 0) + 1;
+              if (decision.status === "completed") {
+                this.state.picksCompleted = Number(this.state.picksCompleted || 0) + 1;
+                await this.refreshInventory();
+              }
               return outcome({ ...decision, reviewOnly: run.mode === WorkflowMode.REVIEW });
             }
             return {
@@ -6809,7 +6818,8 @@ ${summary}`)) return;
         tradableWhenStorageUnavailable: "SAFE_HOLD",
         untradeableWhenStorageUnavailable: "PAUSE"
       });
-      if (!plan.actions.length) {
+      const pendingUnassignedCount = this.inventory.getSnapshot().unassigned.items.length;
+      if (!plan.actions.length && pendingUnassignedCount === 0) {
         this.logger.info("Recycle Cards", "No unassigned cards need recycling", null);
         return { status: "completed", result: plan };
       }
@@ -6817,13 +6827,24 @@ ${summary}`)) return;
       const toStorage = plan.actions.filter(
         (action) => action.type === "MOVE_TO_SBC_STORAGE"
       ).length;
-      const organizerTarget = plan.requiresUserAction ? await this.getOrganizerTarget() : null;
+      const organizerTarget = null;
+      const configuredPickPolicy = this.currentPickPolicy();
+      const organizerPickPolicy = configuredPickPolicy.type === "PAUSE_FOR_USER" ? { type: "HIGHEST_VALUE" } : configuredPickPolicy;
+      const playerPickSteps = Array.from({ length: 11 }, (_, index) => ({
+        id: `organize-player-pick-${index + 1}`,
+        type: WorkflowStepType.HANDLE_PLAYER_PICK,
+        config: { policy: organizerPickPolicy },
+        timeoutMs: 3e4,
+        retryPolicy: { maxAttempts: 1 },
+        onFailure: "PAUSE"
+      }));
       const definition = {
         id: "recycle-cards",
         name: "Recycle Cards",
         version: 1,
         metadata: { source: "grindpilot-recycle-button", safetyModel: "fail-closed" },
         steps: [
+          ...playerPickSteps,
           {
             id: "recycle-unassigned-items",
             type: WorkflowStepType.RESOLVE_ITEMS,
