@@ -4418,6 +4418,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       this.state = runtime.getState();
       this.syncQueued = false;
       this.packRefreshToken = 0;
+      this.inventoryRefreshPromise = null;
       this.unsubscribe = runtime.subscribe((state) => {
         this.state = state;
         this.scheduleSync();
@@ -4446,6 +4447,13 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       this.mountQuickOpenButtons();
       this.mountOrganizeButton();
       void this.refreshPackBindings();
+    }
+    async refreshItemsInventory() {
+      if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
+      this.inventoryRefreshPromise = Promise.resolve().then(() => this.runtime.refreshInventory()).catch(() => null).finally(() => {
+        this.inventoryRefreshPromise = null;
+      });
+      return this.inventoryRefreshPromise;
     }
     mountQuickOpenButtons() {
       const openButtons = [...this.root.querySelectorAll("button")].filter(
@@ -4542,6 +4550,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       });
       menu.parentElement.insertBefore(organize, menu);
       this.updateOrganizeButton();
+      void this.refreshItemsInventory();
     }
     updateOrganizeButton() {
       const organize = this.root.querySelector(".grindpilot-organize-native");

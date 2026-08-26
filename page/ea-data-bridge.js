@@ -2791,28 +2791,135 @@
   // Eagerly initialize perf collector so console helpers are always available.
   ensureApplyPerfCollector();
 
+  const rawStorageItemSources = new WeakSet();
+  const markRawStorageItemSource = (item) => {
+    if (!item || (typeof item !== "object" && typeof item !== "function")) return;
+    try {
+      rawStorageItemSources.add(item);
+    } catch {}
+  };
+  const isRawStorageItem = (item, ItemPile = {}) => {
+    if (!item) return false;
+    const clubPile = ItemPile.CLUB ?? 7;
+    const storagePile = ItemPile.STORAGE ?? 10;
+    if (item?.pile === clubPile) return false;
+    return (
+      item?.pile === storagePile ||
+      item?.isStorage === true ||
+      rawStorageItemSources.has(item)
+    );
+  };
+
   const moveItemsToClub = async (items) => {
     if (!items?.length) return 0;
     const ItemPile =
       services?.Item?.UTItemPileEnum ?? window?.UTItemPileEnum ?? {};
     const clubPile = ItemPile.CLUB ?? 7;
-    const storagePile = ItemPile.STORAGE ?? 10;
     const unassignedPile = ItemPile.UNASSIGNED ?? null;
     const movable = items.filter((item) => {
       const pile = item?.pile ?? null;
       if (Boolean(item?.isUnassigned)) return true;
       if (pile == null || pile === clubPile) return false;
-      // SBC Storage items are valid SBC inputs in their current pile. Moving
-      // them to Club first fails when an untradeable Club copy already exists
-      // (including a protected active-squad copy).
-      if (pile === storagePile) return false;
+      // EA renders Storage items in a saved SBC squad, but the submit endpoint
+      // rejects that squad until those items have been moved to Club. Duplicate
+      // definitions are remapped to an eligible Club copy before this boundary,
+      // so every remaining Storage item is safe to move here.
+      if (isRawStorageItem(item, ItemPile)) return true;
       if (unassignedPile != null && pile === unassignedPile) return true;
       return false;
     });
     if (!movable.length) return 0;
-    await observableToPromise(services.Item.move(movable, clubPile));
-    await delay(0.5);
-    return movable.length;
+    const moveSingleItemToClub = async (initialItem) => {
+      const requestedId = String(initialItem?.id ?? "");
+      const definitionId = initialItem?.definitionId ?? null;
+      if (!requestedId || definitionId == null) {
+        const error = new Error(
+          "Storage move cannot be verified because item identity is incomplete",
+        );
+        error.code = "EA_STORAGE_MOVE_FAILED";
+        error.meta = { requestedCount: 1, identifiableCount: requestedId ? 1 : 0 };
+        throw error;
+      }
+      const includesUnassigned =
+        Boolean(initialItem?.isUnassigned) ||
+        (unassignedPile != null && initialItem?.pile === unassignedPile);
+      let currentItem = initialItem;
+      let lastMoveResult = null;
+      let missingClubIds = [requestedId];
+      let remainingSourceIds = [requestedId];
+
+      // EA's item endpoint may acknowledge a multi-item move but persist only
+      // its first entry. Move cards sequentially, and retry only the exact card
+      // that is still observable at its source.
+      for (let moveAttempt = 1; moveAttempt <= 3; moveAttempt += 1) {
+        const moveOperation = services.Item.move([currentItem], clubPile);
+        lastMoveResult =
+          moveOperation && typeof moveOperation.observe === "function"
+            ? await observableToPromise(moveOperation)
+            : moveOperation && typeof moveOperation.then === "function"
+              ? await moveOperation
+              : { success: true, data: moveOperation ?? null };
+        const moveStatus = parseStatusNumber(lastMoveResult?.status);
+        const hasImmediateFailure =
+          lastMoveResult?.success === false &&
+          (lastMoveResult?.error != null ||
+            (moveStatus != null && moveStatus !== 0));
+
+        // EA's move observable commonly emits only an initial status=0 event
+        // and never publishes a terminal response. Inventory identity is the
+        // authoritative postcondition, including after an error-like emission.
+        for (let verifyAttempt = 1; verifyAttempt <= 4; verifyAttempt += 1) {
+          await delayMs(verifyAttempt === 1 ? 900 : 650);
+          clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
+          const [clubAfter, storageAfter, unassignedAfter] = await Promise.all([
+            getClubItems({
+              ignoreLoaned: false,
+              excludeActiveSquad: false,
+              playerIds: [definitionId],
+              dedupe: false,
+              skipStats: true,
+            }),
+            getStorageItems({ playerIds: [definitionId] }),
+            includesUnassigned
+              ? getUnassignedItems({ refresh: true, failClosed: true })
+              : Promise.resolve([]),
+          ]);
+          const inClub = (clubAfter ?? []).some(
+            (item) => String(item?.id ?? "") === requestedId,
+          );
+          const sourceItems = [...(storageAfter ?? []), ...(unassignedAfter ?? [])];
+          const sourceItem = sourceItems.find(
+            (item) => String(item?.id ?? "") === requestedId,
+          );
+          missingClubIds = inClub ? [] : [requestedId];
+          remainingSourceIds = sourceItem ? [requestedId] : [];
+          if (inClub && !sourceItem) return 1;
+          if (sourceItem) currentItem = sourceItem;
+        }
+
+        if (!remainingSourceIds.length || hasImmediateFailure) break;
+        await delayMs(500 * moveAttempt);
+      }
+
+      const error = new Error(
+        `Storage move could not be verified (${missingClubIds.length} missing in Club, ${remainingSourceIds.length} still at source)`,
+      );
+      error.code = "EA_STORAGE_MOVE_FAILED";
+      error.meta = {
+        requestedCount: 1,
+        missingClubIds,
+        remainingSourceIds,
+        status: lastMoveResult?.status ?? null,
+        error: lastMoveResult?.error ?? null,
+      };
+      throw error;
+    };
+
+    let movedCount = 0;
+    for (const item of movable) {
+      movedCount += await moveSingleItemToClub(item);
+    }
+    return movedCount;
   };
 
   const getStoragePlayers = async (duplicateDefIds, options = {}) => {
@@ -2894,6 +3001,7 @@
     for (const player of storagePlayers) {
       if (!player) continue;
       if (player?.isEnrolledInAcademy?.()) continue;
+      if (raw) markRawStorageItemSource(player);
       const id = player[key] ?? player.id;
       addPlayerToLookup(lookup, id, player);
     }
@@ -2975,6 +3083,7 @@
     for (const player of storagePlayers) {
       if (!player) continue;
       if (player?.isEnrolledInAcademy?.()) continue;
+      if (raw) markRawStorageItemSource(player);
       const id = player[key] ?? player.id;
       addPlayerToLookup(lookup, id, player);
     }
@@ -3073,8 +3182,9 @@
         poolByDefinition.set(defId, { club: [], storage: [], other: [] });
       }
       const pool = poolByDefinition.get(defId);
-      if (item?.isStorage) pool.storage.push(item);
-      else if (item?.pile === storagePile) pool.storage.push(item);
+      if (isRawStorageItem(item, services?.Item?.UTItemPileEnum ?? {})) {
+        pool.storage.push(item);
+      }
       else if (item?.pile === (services?.Item?.UTItemPileEnum?.CLUB ?? 7))
         pool.club.push(item);
       else pool.other.push(item);
@@ -3092,8 +3202,18 @@
       const bClub =
         b?.pile === (services?.Item?.UTItemPileEnum?.CLUB ?? 7) ? 0 : 1;
       if (aClub !== bClub) return aClub - bClub;
-      const aStorage = a?.pile === storagePile ? 1 : 0;
-      const bStorage = b?.pile === storagePile ? 1 : 0;
+      const aStorage = isRawStorageItem(
+        a,
+        services?.Item?.UTItemPileEnum ?? {},
+      )
+        ? 1
+        : 0;
+      const bStorage = isRawStorageItem(
+        b,
+        services?.Item?.UTItemPileEnum ?? {},
+      )
+        ? 1
+        : 0;
       if (aStorage !== bStorage) return aStorage - bStorage;
       const aTradeable = isItemTradeable(a) ? 1 : 0;
       const bTradeable = isItemTradeable(b) ? 1 : 0;
@@ -3484,7 +3604,7 @@
       }
       const pool = poolByDefinition.get(defId);
       if (item.pile === clubPile) pool.club.push(item);
-      else if (item.pile === storagePile) pool.storage.push(item);
+      else if (isRawStorageItem(item, ItemPile)) pool.storage.push(item);
       else pool.other.push(item);
     }
     const usedIds = new Set();
@@ -3512,8 +3632,8 @@
       const aClub = a?.pile === clubPile ? 0 : 1;
       const bClub = b?.pile === clubPile ? 0 : 1;
       if (aClub !== bClub) return aClub - bClub;
-      const aStorage = a?.pile === storagePile ? 1 : 0;
-      const bStorage = b?.pile === storagePile ? 1 : 0;
+      const aStorage = isRawStorageItem(a, ItemPile) ? 1 : 0;
+      const bStorage = isRawStorageItem(b, ItemPile) ? 1 : 0;
       if (aStorage !== bStorage) return aStorage - bStorage;
       const aTradeable = isItemTradeable(a) ? 1 : 0;
       const bTradeable = isItemTradeable(b) ? 1 : 0;
@@ -3593,7 +3713,7 @@
         const preferred = pickFromPool(pool, true) ?? pickFromPool(pool);
         if (preferred) return preferred;
       }
-      if (match.pile === storagePile && pool?.club?.length) {
+      if (isRawStorageItem(match, ItemPile) && pool?.club?.length) {
         const preferred = pickFromPool(pool, true) ?? pickFromPool(pool);
         if (preferred) return preferred;
       }
@@ -3673,7 +3793,7 @@
         }
         const matchId = match?.id ?? id;
         const defId = match?.definitionId ?? null;
-        const isStorage = match?.pile === storagePile;
+        const isStorage = isRawStorageItem(match, ItemPile);
         const hasExistingDef =
           defId != null &&
           (existingDefIds.has(defId) || existingDefIds.has(String(defId)));
@@ -3912,11 +4032,7 @@
     const saveRes = await withPerf("saveMs", "saveCount", () =>
       saveChallenge(challenge),
     );
-    if (isSbcAutomationActive() && saveRes?.success !== true) {
-      throw new Error(
-        `saveChallenge failed (status ${saveRes?.status ?? "?"}, error ${saveRes?.error ?? "?"})`,
-      );
-    }
+    let lastSaveRes = saveRes;
 
     // Hydrate applied items from DAO load, then push them
     // into the original challenge squad instance to keep UI interactions intact.
@@ -3999,11 +4115,7 @@
       const saveRetryRes = await withPerf("saveMs", "saveCount", () =>
         saveChallenge(challenge),
       );
-      if (isSbcAutomationActive() && saveRetryRes?.success !== true) {
-        throw new Error(
-          `saveChallenge failed (status ${saveRetryRes?.status ?? "?"}, error ${saveRetryRes?.error ?? "?"})`,
-        );
-      }
+      lastSaveRes = saveRetryRes;
       const retryLoaded = await withPerf("loadMs", "loadCount", () =>
         loadChallenge(challenge, true, {
           force: true,
@@ -4034,8 +4146,19 @@
         appliedCount: finalAttemptSummary?.appliedCount ?? 0,
         conceptCount: finalAttemptSummary?.conceptCount ?? 0,
         missingIds: finalAttemptSummary?.missingAfterApply ?? applyIds,
+        saveStatus: lastSaveRes?.status ?? null,
+        saveError: lastSaveRes?.error ?? null,
       };
       throw error;
+    }
+
+    if (isSbcAutomationActive() && lastSaveRes?.success !== true) {
+      log("debug", "[EA Data] Save reported failure but EA persisted the squad", {
+        challengeId: challenge?.id ?? null,
+        status: lastSaveRes?.status ?? null,
+        error: lastSaveRes?.error ?? null,
+        appliedCount: finalAttemptSummary?.appliedCount ?? 0,
+      });
     }
 
     const finalItems = Array.isArray(attemptSlots)
@@ -4104,6 +4227,101 @@
     return Array.isArray(slots)
       ? slots.map((slot) => resolveSlotItem(slot) ?? slot ?? null)
       : [];
+  };
+
+  const isSolutionAlreadyAppliedToChallenge = (
+    challenge,
+    solutionIds,
+    { slotSolution = null, chemistryRequired = false, playerById = null } = {},
+  ) => {
+    const expectedIds = (solutionIds ?? [])
+      .map((id) => (id == null || id === 0 ? null : String(id)))
+      .filter(Boolean);
+    if (!expectedIds.length) return false;
+
+    const rawSlots = challenge?.squad?.getPlayers?.() ?? [];
+    if (!Array.isArray(rawSlots)) return false;
+    const readSlotId = (slot) => {
+      const item = resolveSlotItem(slot) ?? slot ?? null;
+      const id = item?.id ?? null;
+      return id == null || id === 0 ? null : String(id);
+    };
+
+    const readExpectedDefinitionId = (id) => {
+      const player =
+        playerById?.get?.(String(id)) ??
+        playerById?.get?.(id) ??
+        playerById?.[String(id)] ??
+        playerById?.[id] ??
+        null;
+      const definitionId = player?.definitionId ?? null;
+      return definitionId == null || definitionId === 0
+        ? null
+        : String(definitionId);
+    };
+    const readSlotDefinitionId = (slot) => {
+      const item = resolveSlotItem(slot) ?? slot ?? null;
+      const definitionId = item?.definitionId ?? null;
+      return definitionId == null || definitionId === 0
+        ? null
+        : String(definitionId);
+    };
+
+    if (chemistryRequired) {
+      const indices = slotSolution?.fieldSlotIndices ?? null;
+      const ids = slotSolution?.fieldSlotToPlayerId ?? null;
+      if (!Array.isArray(indices) || !Array.isArray(ids)) return false;
+      if (indices.length !== expectedIds.length || ids.length !== expectedIds.length) {
+        return false;
+      }
+      const exactIdsMatch = indices.every((slotIndex, index) => {
+        const desiredId = ids[index] == null ? null : String(ids[index]);
+        return desiredId != null && readSlotId(rawSlots[slotIndex]) === desiredId;
+      });
+      if (exactIdsMatch) return true;
+      return indices.every((slotIndex, index) => {
+        const desiredDefinitionId = readExpectedDefinitionId(ids[index]);
+        return (
+          desiredDefinitionId != null &&
+          readSlotDefinitionId(rawSlots[slotIndex]) === desiredDefinitionId
+        );
+      });
+    }
+
+    const appliedIds = rawSlots.map(readSlotId).filter(Boolean);
+    if (appliedIds.length !== expectedIds.length) return false;
+    const appliedCounts = buildValueCountMap(appliedIds);
+    const expectedCounts = buildValueCountMap(expectedIds);
+    let exactIdsMatch = appliedCounts.size === expectedCounts.size;
+    if (exactIdsMatch) {
+      for (const [id, count] of expectedCounts.entries()) {
+        if ((appliedCounts.get(id) ?? 0) !== count) {
+          exactIdsMatch = false;
+          break;
+        }
+      }
+    }
+    if (exactIdsMatch) return true;
+
+    const expectedDefinitionIds = expectedIds
+      .map(readExpectedDefinitionId)
+      .filter(Boolean);
+    const appliedDefinitionIds = rawSlots
+      .map(readSlotDefinitionId)
+      .filter(Boolean);
+    if (
+      expectedDefinitionIds.length !== expectedIds.length ||
+      appliedDefinitionIds.length !== expectedIds.length
+    ) {
+      return false;
+    }
+    const expectedDefinitionCounts = buildValueCountMap(expectedDefinitionIds);
+    const appliedDefinitionCounts = buildValueCountMap(appliedDefinitionIds);
+    if (expectedDefinitionCounts.size !== appliedDefinitionCounts.size) return false;
+    for (const [definitionId, count] of expectedDefinitionCounts.entries()) {
+      if ((appliedDefinitionCounts.get(definitionId) ?? 0) !== count) return false;
+    }
+    return true;
   };
 
   const experimentToArray = (value) => (Array.isArray(value) ? value : []);
@@ -11121,17 +11339,34 @@
           setProgress(i, solutions.length);
 
           const sol = solutions[i];
-          setStatus(`(${i + 1}/${solutions.length}) Applying players...`);
-          await applySolutionWithSelectedMode(
+          const alreadyApplied = isSolutionAlreadyAppliedToChallenge(
             challengeEntity,
             sol.solutionIds,
             {
-              lookupKey: "id",
               slotSolution: sol.slotSolution ?? null,
+              chemistryRequired: Boolean(sol?.stats?.chemistryTargets),
               playerById: multiSolveOverlayState?.playerById ?? null,
-              preserveExistingValid: false,
             },
           );
+          if (alreadyApplied) {
+            setStatus(`(${i + 1}/${solutions.length}) Squad already applied...`);
+            log("debug", "[EA Data] Multi solve skipped redundant apply", {
+              challengeId: challengeEntity?.id ?? null,
+              solutionSize: sol.solutionIds?.length ?? 0,
+            });
+          } else {
+            setStatus(`(${i + 1}/${solutions.length}) Applying players...`);
+            await applySolutionWithSelectedMode(
+              challengeEntity,
+              sol.solutionIds,
+              {
+                lookupKey: "id",
+                slotSolution: sol.slotSolution ?? null,
+                playerById: multiSolveOverlayState?.playerById ?? null,
+                preserveExistingValid: false,
+              },
+            );
+          }
           if (!(await delayAbortable(jitterMs(350, 0.35), shouldAbort))) {
             multiSolveOverlayState.abortRequested = true;
             break;
@@ -31073,9 +31308,52 @@
         { missingRequiredItemIds: missingRequired },
       );
     }
+    const payloadPlayers = Array.isArray(payload?.players) ? payload.players : [];
+    const playerByInventoryId = new Map(
+      payloadPlayers
+        .filter((player) => player?.id != null)
+        .map((player) => [String(player.id), player]),
+    );
+    const hardExcludedIds = new Set(
+      (payload?.filters?.excludedPlayerIds ?? []).map(String),
+    );
+    const solverRequiredIds = new Set(requiredIds);
+    const substitutedUnassignedIds = new Set();
+    const reservedClubSwapIds = new Set();
+    const duplicateSwapPairs = [];
+    for (const requiredId of requiredIds) {
+      const unassignedPlayer = playerByInventoryId.get(requiredId) ?? null;
+      const definitionId = unassignedPlayer?.definitionId ?? null;
+      if (!unassignedPlayer?.isUnassigned || definitionId == null) continue;
+      const clubCopy = filteredPlayers.find((candidate) => {
+        const candidateId = candidate?.id == null ? "" : String(candidate.id);
+        return (
+          candidateId &&
+          candidateId !== requiredId &&
+          !candidate?.isUnassigned &&
+          !candidate?.isStorage &&
+          String(candidate?.definitionId ?? "") === String(definitionId) &&
+          !protectedIds.has(candidateId) &&
+          !hardExcludedIds.has(candidateId) &&
+          !reservedClubSwapIds.has(candidateId)
+        );
+      });
+      if (!clubCopy?.id) continue;
+      const clubItemId = String(clubCopy.id);
+      solverRequiredIds.delete(requiredId);
+      solverRequiredIds.add(clubItemId);
+      substitutedUnassignedIds.add(requiredId);
+      reservedClubSwapIds.add(clubItemId);
+      duplicateSwapPairs.push({
+        unassignedItemId: requiredId,
+        clubItemId,
+        definitionId: String(definitionId),
+      });
+    }
     const safePlayers = filteredPlayers.filter((player) => {
       const id = player?.id == null ? "" : String(player.id);
-      return requiredIds.has(id) || !protectedIds.has(id);
+      if (substitutedUnassignedIds.has(id)) return false;
+      return solverRequiredIds.has(id) || !protectedIds.has(id);
     });
     const safeRequirements = (requirementsSnapshot?.requirements ?? []).map(
       serializeRequirementForSolver,
@@ -31088,8 +31366,9 @@
       ...(payload?.filters?.excludedPlayerIds ?? []).map(String),
       ...(poolFilters?.excludedPlayerIds ?? []).map(String),
       ...protectedIds,
+      ...substitutedUnassignedIds,
     ]);
-    for (const id of requiredIds) excludedPlayerIds.delete(id);
+    for (const id of solverRequiredIds) excludedPlayerIds.delete(id);
 
     const solveResult = await solveWithConceptFallback({
       payload: { _cacheRevision: payload?._cacheRevision ?? null },
@@ -31097,7 +31376,7 @@
       requirements: safeRequirements,
       requirementsNormalized: safeRequirementsNormalized,
       requiredPlayers: slotInfo?.requiredPlayers ?? null,
-      requiredItemIds: Array.from(requiredIds),
+      requiredItemIds: Array.from(solverRequiredIds),
       squadSlots: slotInfo?.squadSlots ?? [],
       prioritize: payload?.prioritize ?? null,
       filters: {
@@ -31107,17 +31386,13 @@
         excludedPlayerIds: Array.from(excludedPlayerIds),
       },
       debug: Boolean(debugEnabled),
-      playerById: new Map(
-        (payload?.players ?? [])
-          .filter((player) => player?.id != null)
-          .map((player) => [String(player.id), player]),
-      ),
+      playerById: playerByInventoryId,
       label: "grindpilot-organizer",
     });
     const solutionIds = Array.isArray(solveResult?.solutions?.[0])
       ? solveResult.solutions[0].map(String)
       : [];
-    const missingFromSolution = Array.from(requiredIds).filter(
+    const missingFromSolution = Array.from(solverRequiredIds).filter(
       (id) => !solutionIds.includes(id),
     );
     if (
@@ -31149,6 +31424,8 @@
         {
           solved: false,
           requiredItemIds: Array.from(requiredIds),
+          solverRequiredItemIds: Array.from(solverRequiredIds),
+          duplicateSwapPairs,
           missingFromSolution,
           failingRequirements: solveResult?.failingRequirements ?? [],
         },
@@ -31162,24 +31439,20 @@
       });
     }
 
-    const playerById = new Map(
-      (payload?.players ?? [])
-        .filter((player) => player?.id != null)
-        .map((player) => [String(player.id), player]),
-    );
+    const playerById = playerByInventoryId;
     await applySolutionWithSelectedMode(challengeEntity, solutionIds, {
       lookupKey: "id",
       slotSolution: solveResult?.solutionSlots?.[0] ?? null,
       playerById,
       forceDefaultApply: true,
       preserveExistingValid: false,
-      preserveExactItemIds: Array.from(requiredIds),
+      preserveExactItemIds: Array.from(solverRequiredIds),
     });
     const appliedIds = new Set(grindPilotReadSquadIds(challengeEntity));
     if (
       appliedIds.size !== solutionIds.length ||
       solutionIds.some((id) => !appliedIds.has(id)) ||
-      Array.from(requiredIds).some((id) => !appliedIds.has(id))
+      Array.from(solverRequiredIds).some((id) => !appliedIds.has(id))
     ) {
       const missingAppliedIds = solutionIds.filter((id) => !appliedIds.has(id));
       const unexpectedAppliedIds = Array.from(appliedIds).filter(
@@ -31200,6 +31473,25 @@
         submitResult,
         `Organizer target submit was not verified (${submitResult?.error ?? submitResult?.status ?? "unknown"})`,
       );
+    }
+    if (duplicateSwapPairs.length) {
+      // An untradeable duplicate cannot enter Club while its existing Club
+      // copy is present. Consume that eligible Club copy in the SBC, then move
+      // the exact unassigned item into the newly freed Club slot.
+      await delayMs(900);
+      const unassignedAfterSubmit = await getUnassignedItems({
+        refresh: true,
+        failClosed: true,
+      });
+      const pendingSwapIds = new Set(
+        duplicateSwapPairs.map((pair) => pair.unassignedItemId),
+      );
+      const pendingSwapItems = unassignedAfterSubmit.filter((item) =>
+        pendingSwapIds.has(String(item?.id ?? "")),
+      );
+      if (pendingSwapItems.length) {
+        await moveItemsToClub(pendingSwapItems);
+      }
     }
     clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
     const completionDeadline = Date.now() + 12_000;
@@ -31259,6 +31551,7 @@
       setId: String(setId),
       challengeId: resolvedChallengeId,
       requiredItemIds: Array.from(requiredIds),
+      duplicateSwapPairs,
       solutionIds,
       completionEvidence: completionObserved
         ? "challenge_completed"

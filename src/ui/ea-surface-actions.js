@@ -92,6 +92,7 @@ export class EaSurfaceActions {
     this.state = runtime.getState();
     this.syncQueued = false;
     this.packRefreshToken = 0;
+    this.inventoryRefreshPromise = null;
     this.unsubscribe = runtime.subscribe((state) => {
       this.state = state;
       this.scheduleSync();
@@ -123,6 +124,17 @@ export class EaSurfaceActions {
     this.mountQuickOpenButtons();
     this.mountOrganizeButton();
     void this.refreshPackBindings();
+  }
+
+  async refreshItemsInventory() {
+    if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
+    this.inventoryRefreshPromise = Promise.resolve()
+      .then(() => this.runtime.refreshInventory())
+      .catch(() => null)
+      .finally(() => {
+        this.inventoryRefreshPromise = null;
+      });
+    return this.inventoryRefreshPromise;
   }
 
   mountQuickOpenButtons() {
@@ -228,6 +240,7 @@ export class EaSurfaceActions {
     });
     menu.parentElement.insertBefore(organize, menu);
     this.updateOrganizeButton();
+    void this.refreshItemsInventory();
   }
 
   updateOrganizeButton() {

@@ -62,15 +62,31 @@ test("live solves fetch owned-player prices before optimizing conservation", () 
   assert.match(bridgeSource, /ownedPriceLookup,/);
 });
 
-test("SBC apply keeps Storage cards in place and rejects incomplete persistence", () => {
+test("SBC apply moves Storage cards to Club and rejects incomplete persistence", () => {
   assert.match(
     bridgeSource,
-    /if \(pile === storagePile\) return false;/,
+    /if \(isRawStorageItem\(item, ItemPile\)\) return true;/,
   );
+  assert.match(bridgeSource, /const rawStorageItemSources = new WeakSet\(\)/);
+  assert.match(
+    bridgeSource,
+    /EA's move observable commonly emits only an initial status=0 event/,
+  );
+  assert.match(
+    bridgeSource,
+    /getClubItems\(\{[\s\S]*playerIds: \[definitionId\],[\s\S]*dedupe: false/,
+  );
+  assert.match(bridgeSource, /getStorageItems\(\{ playerIds: \[definitionId\] \}\)/);
+  assert.match(bridgeSource, /missingClubIds[\s\S]*remainingSourceIds/);
+  assert.match(bridgeSource, /error\.code = "EA_STORAGE_MOVE_FAILED"/);
   assert.match(bridgeSource, /error\.code = "EA_APPLY_INCOMPLETE"/);
   assert.match(
     bridgeSource,
     /appliedItems\.length >= \(expectedIds\?\.length \?\? 0\)/,
+  );
+  assert.match(
+    bridgeSource,
+    /Save reported failure but EA persisted the squad/,
   );
 });
 
@@ -79,9 +95,47 @@ test("cold price enrichment coalesces the owned pool into bounded large batches"
   assert.match(backgroundSource, /const FUT_PRICE_BATCH_SIZE = 50;/);
 });
 
+test("Multi Solve skips a redundant save for an already-applied squad", () => {
+  assert.match(bridgeSource, /const isSolutionAlreadyAppliedToChallenge = \(/);
+  assert.match(
+    bridgeSource,
+    /if \(alreadyApplied\) \{[\s\S]*Multi solve skipped redundant apply/,
+  );
+  assert.match(bridgeSource, /expectedDefinitionCounts/);
+});
+
 test("Organizer accepts consumed required cards as submit completion evidence", () => {
   assert.match(bridgeSource, /requiredCardsConsumed = Array\.from\(requiredIds\)\.every/);
   assert.match(bridgeSource, /"required_cards_consumed"/);
+});
+
+test("Organizer swaps blocked unassigned duplicates through eligible Club copies", () => {
+  assert.match(bridgeSource, /const duplicateSwapPairs = \[\]/);
+  assert.match(
+    bridgeSource,
+    /solverRequiredIds\.delete\(requiredId\)[\s\S]*solverRequiredIds\.add\(clubItemId\)/,
+  );
+  assert.match(bridgeSource, /await moveItemsToClub\(pendingSwapItems\)/);
+  assert.match(bridgeSource, /An untradeable duplicate cannot enter Club/);
+});
+
+test("Club moves are sequential and verified by exact owned-item identity", () => {
+  assert.match(bridgeSource, /for \(const item of movable\)/);
+  assert.match(bridgeSource, /services\.Item\.move\(\[currentItem\], clubPile\)/);
+  assert.match(bridgeSource, /moveAttempt <= 3/);
+  assert.match(bridgeSource, /String\(item\?\.id \?\? ""\) === requestedId/);
+});
+
+test("native Organizer refreshes inventory when the items surface appears", () => {
+  const surfaceSource = readFileSync(
+    new URL("../src/ui/ea-surface-actions.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    surfaceSource,
+    /menu\.parentElement\.insertBefore\(organize, menu\);[\s\S]*void this\.refreshItemsInventory\(\)/,
+  );
+  assert.match(surfaceSource, /this\.runtime\.refreshInventory\(\)/);
 });
 
 test("organizer required cards reach every solver attempt", () => {
@@ -98,10 +152,10 @@ test("organizer required cards reach every solver attempt", () => {
   );
 });
 
-test("organizer apply preserves exact unassigned item IDs", () => {
+test("organizer apply preserves exact required IDs after safe duplicate swaps", () => {
   assert.match(
     bridgeSource,
-    /forceDefaultApply: true,\s*preserveExistingValid: false,\s*preserveExactItemIds: Array\.from\(requiredIds\)/,
+    /forceDefaultApply: true,\s*preserveExistingValid: false,\s*preserveExactItemIds: Array\.from\(solverRequiredIds\)/,
   );
   assert.match(bridgeSource, /preserveExactItemIds\.has\(String\(id\)\)/);
   assert.match(bridgeSource, /missingAppliedIds/);
