@@ -295,3 +295,124 @@ test("live solver never selects base and promo versions of the same footballer",
     false,
   );
 });
+
+test("policy optimization scales to a large club without touching protected cards", () => {
+  const players = Array.from({ length: 1600 }, (_, index) => ({
+    ...makePlayers(1)[0],
+    id: `large-${index}`,
+    definitionId: 10_000 + index,
+    resourceId: 10_000 + index,
+    assetId: 20_000 + index,
+    basePlayerId: 20_000 + index,
+    rating: 76 + (index % 19),
+    teamId: 100 + (index % 30),
+    leagueId: 200 + (index % 12),
+    nationId: 300 + (index % 24),
+    isDuplicate: index % 13 === 0,
+    isStorage: index % 7 === 0,
+    isUntradeable: index % 5 !== 0,
+    isTradable: index % 5 === 0,
+    marketPrice: Math.pow(76 + (index % 19), 3) + index,
+  }));
+  const protectedIds = [players[0].id, players[1].id, players[2].id];
+  const result = solveSquad(buildSolverContext({
+    players,
+    requirementsNormalized: [squadSizeRule(11), {
+      type: "team_rating",
+      keyName: "TEAM_RATING",
+      count: 88,
+      target: 88,
+      op: "min",
+      scopeName: "MIN",
+      value: [88],
+    }],
+    requiredPlayers: 11,
+    filters: { excludedPlayerIds: protectedIds },
+    conservationPolicy: {
+      enabled: true,
+      protectedItemIds: protectedIds,
+      preferDuplicates: true,
+      preferSbcStorage: true,
+      preferUntradeables: true,
+      preferredFodderRange: { min: 75, max: 91 },
+      minimumReserveByRating: { 94: 2 },
+      specialReserveByCardType: {},
+      projectRatingDemand: [],
+    },
+    optimize: {
+      restartTimeBudgetMs: 1200,
+      fallbackTimeBudgetMs: 200,
+      policyOptimizationTimeBudgetMs: 180,
+      policyOptimizationMaxEvaluations: 2200,
+    },
+  }));
+
+  assert.equal(result.stats.solved, true);
+  assert.equal(result.stats.policyOptimization.ran, true);
+  assert.ok(result.stats.policyOptimization.evaluations <= 2200);
+  assert.ok(protectedIds.every((id) => !result.solutions[0].includes(id)));
+  assert.equal(result.stats.conservationObjectiveTuple[1], 0);
+});
+
+test("policy optimization preserves full chemistry while consuming a duplicate", () => {
+  const players = makePlayers(12, {
+    rating: 84,
+    teamId: 50,
+    leagueId: 60,
+    nationId: 70,
+    preferredPositionName: "CM",
+    alternativePositionNames: ["CM"],
+  }).map((player, index) => ({
+    ...player,
+    id: `chem-${index}`,
+    definitionId: 30_000 + index,
+    assetId: 40_000 + index,
+    basePlayerId: 40_000 + index,
+    isDuplicate: index === 11,
+    isUntradeable: true,
+  }));
+  const result = solveSquad(buildSolverContext({
+    players,
+    requirementsNormalized: [
+      squadSizeRule(11),
+      {
+        type: "team_rating",
+        count: 84,
+        target: 84,
+        op: "min",
+        value: [84],
+      },
+      {
+        type: "chemistry_points",
+        count: 33,
+        target: 33,
+        op: "min",
+        value: [33],
+      },
+    ],
+    requiredPlayers: 11,
+    squadSlots: Array.from({ length: 11 }, (_, index) => ({
+      index,
+      positionName: "CM",
+      isLocked: false,
+      item: null,
+    })),
+    prioritize: { duplicates: false, storage: false },
+    conservationPolicy: {
+      enabled: true,
+      preferDuplicates: true,
+      preferSbcStorage: false,
+      preferUntradeables: true,
+      preferredFodderRange: { min: 75, max: 90 },
+      minimumReserveByRating: {},
+      specialReserveByCardType: {},
+      projectRatingDemand: [],
+    },
+    optimize: { restartTimeBudgetMs: 500, fallbackTimeBudgetMs: 100 },
+  }));
+
+  assert.equal(result.stats.solved, true);
+  assert.equal(result.stats.chemistry.totalChem, 33);
+  assert.equal(result.stats.policyOptimization.changed, true);
+  assert.ok(result.solutions[0].includes("chem-11"));
+});

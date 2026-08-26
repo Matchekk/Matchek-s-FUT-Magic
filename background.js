@@ -49,7 +49,7 @@ const FUT_PLAYERS_ALLOWED_FILTERS = new Set([
 import {
   buildSolverContext,
   solveSquad,
-} from "./solver/solver.js?v=2026-08-25a";
+} from "./solver/solver.js?v=2026-08-26a";
 import { normalizeProfile } from "./src/profiles/profile-service.js";
 import { normalizeWorkflowDefinition } from "./src/workflow/definitions.js";
 

@@ -8925,9 +8925,17 @@ const optimizeSolvedPolicySquad = (
     !Array.isArray(squad) ||
     squad.length < squadSize ||
     !Array.isArray(pool) ||
-    pool.length <= squadSize ||
-    options?.chemistryRequired
+    pool.length <= squadSize
   ) {
+    return unchanged();
+  }
+
+  const chemistryRequired = Boolean(options?.chemistryRequired);
+  const slotsForChemistry = Array.isArray(options?.slotsForChemistry)
+    ? options.slotsForChemistry
+    : [];
+  const chemistryTargets = options?.chemistryTargets || {};
+  if (chemistryRequired && slotsForChemistry.length < squadSize) {
     return unchanged();
   }
 
@@ -8985,6 +8993,28 @@ const optimizeSolvedPolicySquad = (
         .map(String),
     );
     const relevantRatings = new Set();
+    const chemistryIdentity = chemistryRequired
+      ? {
+          teams: new Set(
+            working
+              .map((player) => player?.teamId)
+              .filter((value) => value != null)
+              .map(String),
+          ),
+          leagues: new Set(
+            working
+              .map((player) => player?.leagueId)
+              .filter((value) => value != null)
+              .map(String),
+          ),
+          nations: new Set(
+            working
+              .map((player) => player?.nationId)
+              .filter((value) => value != null)
+              .map(String),
+          ),
+        }
+      : null;
     for (const player of working) {
       const rating = Math.max(0, toNumber(player?.rating) ?? 0);
       for (let delta = -4; delta <= 4; delta += 1) {
@@ -9002,6 +9032,14 @@ const optimizeSolvedPolicySquad = (
       if (!player || player.id == null || usedIds.has(String(player.id))) continue;
       const definition = getDefinitionKey(player);
       if (definition != null && usedDefinitions.has(String(definition))) continue;
+      if (
+        chemistryIdentity &&
+        !chemistryIdentity.teams.has(String(player?.teamId ?? "")) &&
+        !chemistryIdentity.leagues.has(String(player?.leagueId ?? "")) &&
+        !chemistryIdentity.nations.has(String(player?.nationId ?? ""))
+      ) {
+        continue;
+      }
       const rating = Math.max(0, toNumber(player?.rating) ?? 0);
       if (!relevantRatings.has(rating)) continue;
       if (!buckets.has(rating)) buckets.set(rating, []);
@@ -9038,6 +9076,14 @@ const optimizeSolvedPolicySquad = (
     }
     evaluations += 1;
     if (!isSquadValid(rules, candidateSquad, squadSize)) return null;
+    if (chemistryRequired) {
+      const chemistry = computeChemistryEval(
+        candidateSquad,
+        slotsForChemistry,
+        squadSize,
+      );
+      if (!isChemistrySatisfied(chemistry, chemistryTargets)) return null;
+    }
     const tuple = getConservationObjectiveTupleForSquad(
       candidateSquad,
       policy,
@@ -9051,6 +9097,24 @@ const optimizeSolvedPolicySquad = (
   for (let iteration = 0; iteration < maxIterations && !isExpired(); iteration += 1) {
     const candidates = buildCandidates();
     if (!candidates.length) break;
+    const unlockedCurrent = working
+      .filter((player) => !isLocked(player))
+      .slice()
+      .sort((a, b) =>
+        compareConservationObjectiveTuples(
+          getConservationCardTuple(b, policy),
+          getConservationCardTuple(a, policy),
+        ),
+      );
+    if (
+      !unlockedCurrent.length ||
+      compareConservationObjectiveTuples(
+        getConservationCardTuple(candidates[0], policy),
+        getConservationCardTuple(unlockedCurrent[0], policy),
+      ) >= 0
+    ) {
+      break;
+    }
     const usedIds = new Set(working.map((player) => String(player?.id ?? "")));
     let bestMove = null;
     for (let index = 0; index < working.length && !isExpired(); index += 1) {
@@ -12569,16 +12633,21 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       debugPush,
       {
         chemistryRequired,
+        slotsForChemistry,
+        chemistryTargets,
         timeBudgetMs:
           context?.optimize?.policyOptimizationTimeBudgetMs ?? 260,
         maxEvaluations:
-          context?.optimize?.policyOptimizationMaxEvaluations ?? 3600,
+          context?.optimize?.policyOptimizationMaxEvaluations ??
+          (chemistryRequired ? 1200 : 3600),
         maxIterations:
           context?.optimize?.policyOptimizationMaxIterations ?? 6,
         maxCandidates:
-          context?.optimize?.policyOptimizationMaxCandidates ?? 72,
+          context?.optimize?.policyOptimizationMaxCandidates ??
+          (chemistryRequired ? 44 : 72),
         pairCandidateLimit:
-          context?.optimize?.policyOptimizationPairCandidateLimit ?? 44,
+          context?.optimize?.policyOptimizationPairCandidateLimit ??
+          (chemistryRequired ? 24 : 44),
       },
     );
     timingsMs.policyOptimization = Date.now() - policyOptimizationStart;
@@ -12595,6 +12664,9 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     };
     if (policyResult?.changed) {
       squad = policyResult.squad;
+      chemistry = chemistryRequired
+        ? computeChemistryEval(squad, slotsForChemistry, squadSize)
+        : null;
       failingRequirements = buildFailingRequirements(squad, chemistry);
       solved = failingRequirements.length === 0;
     }

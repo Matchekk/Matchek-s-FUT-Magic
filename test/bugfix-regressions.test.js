@@ -50,7 +50,7 @@ test("solver preferences have concrete Chrome local-storage wrappers", () => {
 });
 
 test("background solver import cache key tracks the current live fix", () => {
-  assert.match(backgroundSource, /solver\/solver\.js\?v=2026-08-25a/);
+  assert.match(backgroundSource, /solver\/solver\.js\?v=2026-08-26a/);
   assert.match(solverSource, /constraint-compiler\.js\?v=2026-08-25a/);
 });
 
