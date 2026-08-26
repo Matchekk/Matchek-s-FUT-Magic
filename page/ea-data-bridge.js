@@ -31745,7 +31745,7 @@
       .sort()
       .join("|");
 
-  const grindPilotReadPlayerPick = async ({ pickId = null } = {}) => {
+  const grindPilotReadPlayerPick = async ({ pickId = null, targetWasObserved = false } = {}) => {
     const unassigned = await getUnassignedItems({ refresh: true, failClosed: true });
     const picks = unassigned.filter((item) => item?.isPlayerPickItem?.());
     if (!picks.length) {
@@ -31761,6 +31761,17 @@
     const matching = pickId == null
       ? picks
       : picks.filter((item) => String(item?.id ?? "") === String(pickId));
+    if (matching.length === 0 && pickId != null && targetWasObserved) {
+      return grindPilotResult("verified", {
+        pending: false,
+        resolved: true,
+        availability: "absent",
+        pickIdentity: String(pickId),
+        offerIdentity: null,
+        offers: [],
+        pickItemIds: picks.map((item) => String(item.id)),
+      });
+    }
     if (matching.length !== 1) {
       return grindPilotResult("verified", {
         pending: true,
@@ -31939,7 +31950,10 @@
     }
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
-      const current = await grindPilotReadPlayerPick({ pickId: pick.pickIdentity });
+      const current = await grindPilotReadPlayerPick({
+        pickId: pick.pickIdentity,
+        targetWasObserved: true,
+      });
       if (current?.value?.pending !== true) {
         const inventory = await grindPilotReadInventory();
         const all = [
@@ -31963,7 +31977,10 @@
       }
       await delayMs(250);
     }
-    const current = await grindPilotReadPlayerPick({ pickId: pick.pickIdentity });
+    const current = await grindPilotReadPlayerPick({
+      pickId: pick.pickIdentity,
+      targetWasObserved: true,
+    });
     if (
       current?.value?.pending === true &&
       current?.value?.offerIdentity === pick.offerIdentity
