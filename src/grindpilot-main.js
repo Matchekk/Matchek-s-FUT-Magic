@@ -2169,7 +2169,15 @@ class GrindPilotRuntime {
       this.state.error = this.state.error || `Inventory refresh failed: ${error?.message || error}`;
     }
     await this.refreshGameContext();
-    try { this.state.capabilityHealth = await this.adapter.getCapabilityHealth(); } catch {}
+    try { this.state.capabilityHealth = await this.adapter.getCapabilityHealth(); }
+    catch (error) {
+      this.state.capabilityHealth = (Array.isArray(this.state.capabilityHealth)
+        ? this.state.capabilityHealth
+        : [])
+        .filter((entry) => String(entry?.id || "").trim())
+        .map((entry) => ({ id: entry.id, status: "UNAVAILABLE", evidence: null }));
+      this.state.error = this.state.error || `Capability refresh failed: ${error?.message || error}`;
+    }
     this.emit(); return this.getState();
   }
 
