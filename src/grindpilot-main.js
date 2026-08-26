@@ -639,7 +639,7 @@ class GrindPilotRuntime {
         },
         execute: async ({ intent }) => {
           const opened = await this.packService.openPlan(intent.plan);
-          if (!opened.opened?.length) return { status: "paused", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack was not opened and verified", result: opened };
+          if (opened.status !== "completed" || !opened.opened?.length) return { status: "paused", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack opening requires attention", result: opened };
           const beforeIds = new Set((intent.inventoryItemIdsBefore ?? []).map(String));
           const receivedItems = this.inventory.getSnapshot().items
             .filter((item) => !beforeIds.has(String(item.itemId)))

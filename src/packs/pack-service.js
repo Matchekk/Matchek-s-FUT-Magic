@@ -59,7 +59,11 @@ export class PackService {
 
       let unresolved;
       try {
-        unresolved = getUnassignedCount(inventory);
+        unresolved = getUnassignedCount(
+          Array.isArray(inventory?.unassigned?.items)
+            ? { ...inventory, unassigned: inventory.unassigned.items }
+            : inventory,
+        );
       } catch (error) {
         return { status: "blocked", reason: error.code ?? "INVENTORY_STATE_UNVERIFIED", opened, inventory };
       }
