@@ -32,7 +32,7 @@ export class ControllerAdapter {
     return verifiedValue(await requireBridge().getHealth(), "Bridge health check");
   }
 
-  getContext() {
+  async getContext() {
     return requireBridge().getContext();
   }
 
@@ -62,9 +62,17 @@ export class ControllerAdapter {
     return packs.map((pack) => ({ ...pack, packId: String(pack.id), owned: true }));
   }
 
-  async claimReward(rewardRef = {}) {
+  async claimReward(rewardRef = {}, beforePacks = null) {
     const value = verifiedValue(
-      await requireBridge().claimCurrentReward(rewardRef),
+      await requireBridge().claimCurrentReward({
+        ...rewardRef,
+        beforePacks: Array.isArray(beforePacks)
+          ? beforePacks.map((pack) => ({
+              ...pack,
+              id: String(pack?.packId ?? pack?.id ?? ""),
+            }))
+          : null,
+      }),
       "Reward claim",
     );
     return {
@@ -94,20 +102,66 @@ export class ControllerAdapter {
     );
   }
 
-  async getPlayerPick() {
+  async getPlayerPick(pickId = null) {
     const value = verifiedValue(
-      await requireBridge().readPlayerPick(),
+      await requireBridge().readPlayerPick({ pickId }),
       "Player-pick inspection",
     );
-    return value.pending
-      ? { id: value.pickItemIds?.[0] ?? null, offers: [], resolved: false, requiresUser: true }
-      : { id: null, offers: [], resolved: true };
+    return {
+      ...value,
+      id: value.pickIdentity ?? null,
+      pickId: value.pickIdentity ?? null,
+      offers: Array.isArray(value.offers) ? value.offers : [],
+    };
   }
 
   async selectPlayerPick(intent) {
-    return verifiedValue(
+    const value = verifiedValue(
       await requireBridge().selectPlayerPick(intent),
       "Player-pick selection",
+    );
+    return { success: true, ...value };
+  }
+
+  async organizeIntoSbc(intent = {}) {
+    return verifiedValue(
+      await requireBridge().organizeIntoSbc(intent),
+      "Organizer SBC submission",
+    );
+  }
+
+  async readSbcChallengeState(query = {}) {
+    return verifiedValue(
+      await requireBridge().readSbcChallengeState(query),
+      "SBC challenge state read",
+    );
+  }
+
+  async getCapabilityHealth() {
+    return verifiedValue(
+      await requireBridge().getCapabilityHealth(),
+      "Capability health read",
+    );
+  }
+
+  async readCurrentSbcProject() {
+    return verifiedValue(
+      await requireBridge().readCurrentSbcProject(),
+      "Current SBC project read",
+    );
+  }
+
+  async findSbcTarget(query = {}) {
+    return verifiedValue(
+      await requireBridge().findSbcTarget(query),
+      "SBC target lookup",
+    );
+  }
+
+  async readLegacySequences() {
+    return verifiedValue(
+      await requireBridge().readLegacySequences(),
+      "Legacy Sequence read",
     );
   }
 }

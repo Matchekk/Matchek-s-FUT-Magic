@@ -35,15 +35,22 @@ test("hard protections are item-aware and allowed special types are configurable
   assert.equal(analysis.reasonsByItemId["3"], undefined);
 });
 
-test("minimum reserves preserve least expendable copies and leave duplicates available", () => {
+test("minimum reserves remain soft while duplicates receive the better objective", () => {
   const policy = new FodderPolicy({ minimumReserveByRating: { 89: 2 } });
   const analysis = policy.analyze([
     card(1, 89, { isTradable: true, isUntradeable: false, marketPrice: 30000 }),
     card(2, 89, { marketPrice: 20000 }),
     card(3, 89, { isDuplicate: true, isStorage: true, marketPrice: 10000 }),
   ]);
-  assert.deepEqual(analysis.protectedItemIds.sort(), ["1", "2"]);
-  assert.deepEqual(analysis.eligibleItems.map((item) => item.itemId), ["3"]);
+  assert.deepEqual(analysis.protectedItemIds, []);
+  assert.deepEqual(analysis.eligibleItems.map((item) => item.itemId), ["1", "2", "3"]);
+  const duplicateTuple = policy.getSquadObjectiveTuple([analysis.items[2]], {
+    allItems: analysis.items,
+  });
+  const scarceTradableTuple = policy.getSquadObjectiveTuple([analysis.items[0]], {
+    allItems: analysis.items,
+  });
+  assert.ok(compareObjectiveTuples(duplicateTuple, scarceTradableTuple) < 0);
 });
 
 test("objective tuples compare lexicographically and protected use dominates price", () => {

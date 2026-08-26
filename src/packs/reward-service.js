@@ -66,9 +66,11 @@ export class RewardService {
     this.logger = logger;
   }
 
-  async claimAndIdentify(rewardRef) {
-    const before = await this.adapter.listOwnedPacks();
-    const claim = await this.adapter.claimReward(rewardRef);
+  async claimAndIdentify(rewardRef, packsBefore = null) {
+    const before = Array.isArray(packsBefore)
+      ? packsBefore.map((pack) => ({ ...pack }))
+      : await this.adapter.listOwnedPacks();
+    const claim = await this.adapter.claimReward(rewardRef, before);
     if (claim?.claimed !== true && claim?.success !== true) {
       throw new PackPolicyError("REWARD_CLAIM_UNVERIFIED", "Reward claim was not verified", { rewardRef });
     }

@@ -2,7 +2,17 @@
 <html lang="en">
   <head><meta charset="utf-8"><title>GrindPilot browser harness</title></head>
   <body style="margin:0;background:#20251e;color:#eef5e8;font-family:system-ui">
-    <main style="padding:32px"><h1>EA Web App test surface</h1><p>Safe local browser harness; no EA account or network session is used.</p></main>
+    <main style="padding:32px">
+      <h1>EA Web App test surface</h1><p>Safe local browser harness; no EA account or network session is used.</p>
+      <section class="ut-store-pack-details-view" data-pack-id="owned-pack">
+        <h2>Prime Mixed Players Pack</h2>
+        <img alt="Prime Mixed Players Pack" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+        <div class="ea-pack-actions"><button class="call-to-action">Open</button></div>
+      </section>
+      <section class="ut-unassigned-view">
+        <header class="ut-unassigned-header"><h2>Items</h2><button class="ea-more-menu" aria-label="More options">⋮</button></header>
+      </section>
+    </main>
     <script>
       const state = { activeRun:null, activity:[], profiles:{}, projects:[], settings:{} };
       window.chrome = { runtime: {
@@ -37,10 +47,13 @@
       const verified = (value) => ({ status:"verified", value, at:Date.now() });
       window.eaData = { grindPilot: {
         getHealth: () => verified({ eaReady:true, bridgeReady:true, storeAvailable:true, itemMoveAvailable:true }),
-        getContext: () => ({ setName:"Test SBC", challengeName:"85+ Upgrade" }),
+        getCapabilityHealth: () => verified([{ id:"inventory", status:"AVAILABLE", evidence:{ harness:true } }]),
+        getContext: () => ({ setId:"test-set", setName:"Test SBC", challengeId:"test-85-plus", challengeName:"85+ Upgrade" }),
         readInventory: () => verified({ club:[], storage:[], unassigned:[] }),
+        readCurrentSbcProject: () => verified({ setId:"test-set", setName:"Test SBC", challenges:[{ id:"test-85-plus", name:"85+ Upgrade", completed:false, requiredSquadRating:85, specialCardRequirements:[], unknownRequirements:[] }] }),
+        readLegacySequences: () => verified([]),
         solveCurrentSbc: () => verified({ challengeId:"test-85-plus", submitReady:true, solutionIds:[] }),
-        listOwnedRewardPacks: () => verified([]),
+        listOwnedRewardPacks: () => verified([{ id:"owned-pack", packName:"Prime Mixed Players Pack", count:1, isReward:true }]),
         readPlayerPick: () => verified({ pending:false, pickItemIds:[] }),
       }};
     </script>

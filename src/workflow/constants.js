@@ -6,6 +6,7 @@ export const WorkflowStepType = Object.freeze({
   CLAIM_REWARD: "CLAIM_REWARD",
   OPEN_REWARD_PACK: "OPEN_REWARD_PACK",
   RESOLVE_ITEMS: "RESOLVE_ITEMS",
+  ORGANIZE_ITEMS: "ORGANIZE_ITEMS",
   HANDLE_PLAYER_PICK: "HANDLE_PLAYER_PICK",
   DELAY: "DELAY",
   CONDITIONAL: "CONDITIONAL",
@@ -59,6 +60,7 @@ export const DESTRUCTIVE_STEP_TYPES = new Set([
   WorkflowStepType.CLAIM_REWARD,
   WorkflowStepType.OPEN_REWARD_PACK,
   WorkflowStepType.RESOLVE_ITEMS,
+  WorkflowStepType.ORGANIZE_ITEMS,
   WorkflowStepType.HANDLE_PLAYER_PICK,
 ]);
 

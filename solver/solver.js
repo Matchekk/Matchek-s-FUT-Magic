@@ -1,4 +1,4 @@
-import { compileConstraintSet } from "./constraint-compiler.js";
+import { compileConstraintSet } from "./constraint-compiler.js?v=2026-08-25a";
 import {
   computeBestChemistryAssignment,
   normalizeSlotsForChemistry,
@@ -270,6 +270,11 @@ const extractValues = (value) => {
   }
   return [value];
 };
+
+const getPlayerRarityGroups = (player) =>
+  extractValues(player?.groups ?? player?.groupIds ?? [])
+    .map(toNumber)
+    .filter((value) => value != null);
 
 const normalizeValueItem = (value) => {
   const numeric = toNumber(value);
@@ -620,7 +625,17 @@ export const buildSolverContext = ({
   optimize = {},
   requiredPlayers = null,
   squadSlots = null,
+  conservationPolicy = null,
+  requiredItemIds = [],
 } = {}) => {
+  const normalizedRequiredItemIds = Array.from(
+    new Set(
+      (Array.isArray(requiredItemIds) ? requiredItemIds : [])
+        .map((value) => (value == null ? null : String(value)))
+        .filter(Boolean),
+    ),
+  );
+  const requiredItemIdSet = new Set(normalizedRequiredItemIds);
   const normalizedFilters = {
     ...(filters && typeof filters === "object" ? filters : {}),
     onlyStorage: toBooleanSetting(filters?.onlyStorage, false),
@@ -650,11 +665,35 @@ export const buildSolverContext = ({
   const excludedIds = new Set(
     (normalizedFilters?.excludedPlayerIds ?? [])
       .map((value) => (value == null ? null : String(value)))
-      .filter(Boolean),
+      .filter((value) => Boolean(value) && !requiredItemIdSet.has(value)),
   );
   const isUnassignedBypass = (player) =>
     normalizedFilters.useUnassigned &&
     Boolean(player?.isDuplicate || player?.isUnassigned);
+  const requiredSpecialPredicates = compileConstraintSet(
+    requirementsNormalized,
+    { fallbackSquadSize: requiredPlayers ?? DEFAULT_SQUAD_SIZE },
+  ).constraints
+    .filter((rule) => {
+      if (
+        ![
+          "player_inform",
+          "player_rarity",
+          "player_rarity_group",
+          "player_tots",
+          "player_totw_or_tots",
+        ].includes(rule?.type)
+      ) {
+        return false;
+      }
+      const count = toNumber(rule?.count) ?? toNumber(rule?.target) ?? null;
+      return rule?.op !== "max" && count != null && count > 0;
+    })
+    .map((rule) => buildPredicate(rule))
+    .filter((predicate) => typeof predicate === "function");
+  const isExplicitlyRequiredSpecial = (player) =>
+    Boolean(player?.isSpecial) &&
+    requiredSpecialPredicates.some((predicate) => predicate(player));
   if (excludedIds.size) {
     normalizedPlayers = normalizedPlayers.filter((player) => {
       if (player?.id == null) return true;
@@ -700,7 +739,13 @@ export const buildSolverContext = ({
   if (normalizedFilters.excludeSpecial) {
     normalizedPlayers = normalizedPlayers.filter((player) => {
       if (isUnassignedBypass(player)) return true;
-      if (!player?.isSpecial || player?.isTotwOrTots) return true;
+      if (
+        !player?.isSpecial ||
+        player?.isTotwOrTots ||
+        isExplicitlyRequiredSpecial(player)
+      ) {
+        return true;
+      }
       if (player?.id == null) return false;
       return lockedSlotPlayerIds.has(String(player.id));
     });
@@ -757,8 +802,13 @@ export const buildSolverContext = ({
     optimize,
     requiredPlayers: toNumber(requiredPlayers),
     squadSlots: Array.isArray(squadSlots) ? squadSlots : null,
+    requiredItemIds: normalizedRequiredItemIds,
     filters: normalizedFilters,
     prioritize: normalizedPrioritize,
+    conservationPolicy:
+      conservationPolicy && typeof conservationPolicy === "object"
+        ? JSON.parse(JSON.stringify(conservationPolicy))
+        : null,
   };
 };
 
@@ -1249,10 +1299,16 @@ const buildPredicate = (rule) => {
     return buildQualityGatePredicate(rule);
   }
   if (type === "player_totw_or_tots") {
-    return (player) => isTotwOrTotsPlayer(player);
+    const allowedGroups = new Set(values.map(toNumber).filter((v) => v != null));
+    return (player) =>
+      isTotwOrTotsPlayer(player) ||
+      getPlayerRarityGroups(player).some((group) => allowedGroups.has(group));
   }
   if (type === "player_tots") {
-    return (player) => isTotsPlayer(player);
+    const allowedGroups = new Set(values.map(toNumber).filter((v) => v != null));
+    return (player) =>
+      isTotsPlayer(player) ||
+      getPlayerRarityGroups(player).some((group) => allowedGroups.has(group));
   }
   if (
     type === "player_rarity" ||
@@ -1270,9 +1326,12 @@ const buildPredicate = (rule) => {
       }
       const name = normalizeString(player.rarityName);
       const numericMatch =
-        numericValues.length && player.rarityId != null
-          ? numericValues.includes(player.rarityId)
-          : false;
+        numericValues.length &&
+        ((player.rarityId != null && numericValues.includes(player.rarityId)) ||
+          (type === "player_rarity_group" &&
+            getPlayerRarityGroups(player).some((group) =>
+              numericValues.includes(group),
+            )));
       const textMatch =
         textValues.length && name
           ? textValues.some((value) => name.includes(value))
@@ -5614,6 +5673,11 @@ const enforceUniqueDefinitions = (
     : null;
   const chemistryTargets = options?.chemistryTargets ?? null;
   const currentChemistry = options?.currentChemistry ?? null;
+  const protectedItemIds = new Set(
+    (options?.protectedItemIds ?? [])
+      .map((value) => (value == null ? null : String(value)))
+      .filter(Boolean),
+  );
   const chemistryIsRelevant =
     chemistryRequired &&
     Array.isArray(slotsForChemistry) &&
@@ -5633,6 +5697,28 @@ const enforceUniqueDefinitions = (
       continue;
     }
 
+    let replacementIndex = index;
+    if (protectedItemIds.has(String(player?.id ?? ""))) {
+      const earlierUnprotectedDuplicate = squad.findIndex(
+        (entry, earlierIndex) =>
+          earlierIndex < index &&
+          getDefinitionKey(entry) === defKey &&
+          !protectedItemIds.has(String(entry?.id ?? "")),
+      );
+      if (earlierUnprotectedDuplicate >= 0) {
+        replacementIndex = earlierUnprotectedDuplicate;
+      } else {
+        debugPush?.({
+          stage: "dedupe",
+          action: "skip",
+          reason: "duplicate_is_protected",
+          id: player?.id ?? null,
+          definitionId: defKey,
+        });
+        continue;
+      }
+    }
+
     const candidates = (pool || [])
       .filter((candidate) => candidate && candidate.id != null)
       .filter((candidate) => !usedIds.has(candidate.id))
@@ -5646,8 +5732,8 @@ const enforceUniqueDefinitions = (
     let replacedThis = false;
     let bestReplacement = null;
     for (const candidate of candidates) {
-      const previous = squad[index];
-      squad[index] = candidate;
+      const previous = squad[replacementIndex];
+      squad[replacementIndex] = candidate;
       if (isSquadValid(rules, squad, squadSize)) {
         const nextChem = chemistryIsRelevant
           ? computeChemistryEval(squad, slotsForChemistry, squadSize)
@@ -5685,7 +5771,7 @@ const enforceUniqueDefinitions = (
           };
         }
       }
-      squad[index] = previous;
+      squad[replacementIndex] = previous;
     }
 
     if (
@@ -5694,7 +5780,7 @@ const enforceUniqueDefinitions = (
     ) {
       const { candidate, previous, chemistry: replacementChemistry } =
         bestReplacement;
-      squad[index] = candidate;
+      squad[replacementIndex] = candidate;
       const candidateDef = getDefinitionKey(candidate);
       usedIds.delete(previous?.id ?? null);
       usedIds.add(candidate.id);
@@ -8507,6 +8593,17 @@ const compareSolverResults = (a, b) => {
   const solvedB = Boolean(b?.stats?.solved);
   if (solvedA !== solvedB) return solvedA ? -1 : 1;
   if (solvedA && solvedB) {
+    const conservationA = a?.stats?.conservationObjectiveTuple;
+    const conservationB = b?.stats?.conservationObjectiveTuple;
+    if (Array.isArray(conservationA) && Array.isArray(conservationB)) {
+      const length = Math.max(conservationA.length, conservationB.length);
+      for (let index = 0; index < length; index += 1) {
+        const difference =
+          (toNumber(conservationA[index]) ?? 0) -
+          (toNumber(conservationB[index]) ?? 0);
+        if (difference) return difference;
+      }
+    }
     const valueA =
       a?.stats?.solvedValue ??
       a?.stats?.refinement?.after ??
@@ -8526,6 +8623,151 @@ const compareSolverResults = (a, b) => {
     summarizeFailure(a, a?.seed, a?.signature, a?.phaseConfig),
     summarizeFailure(b, b?.seed, b?.signature, b?.phaseConfig),
   );
+};
+
+const CONSERVATION_OBJECTIVE_FIELDS = Object.freeze([
+  "hardRequirementViolations",
+  "protectedCardViolations",
+  "scarceSpecialUsage",
+  "nonExpendableCardUsage",
+  "nonDuplicateUsage",
+  "nonStorageUsage",
+  "tradableUsage",
+  "targetProjectDemandPenalty",
+  "premiumFodderPenalty",
+  "replacementCost",
+  "ratingOvershoot",
+]);
+
+const readConservationCardType = (player) =>
+  String(
+    player?.cardType ??
+      player?.specialCardGroup ??
+      player?.rarityGroup ??
+      player?.rarityName ??
+      "base",
+  )
+    .trim()
+    .toLowerCase();
+
+const readConservationReplacementCost = (player) => {
+  for (const value of [
+    player?.estimatedReplacementCost,
+    player?.marketPrice,
+    player?.price,
+    player?.priceMeta?.price,
+    player?.futggPrice,
+  ]) {
+    const parsed = toNumber(value);
+    if (parsed != null && parsed >= 0) return parsed;
+  }
+  return Math.pow(Math.max(0, toNumber(player?.rating) ?? 0), 3);
+};
+
+const attachConservationObjective = (
+  result,
+  players,
+  policy,
+  targetRating,
+) => {
+  if (!result || typeof result !== "object" || policy?.enabled !== true) {
+    return result;
+  }
+  const byId = new Map(
+    players
+      .filter((player) => player?.id != null)
+      .map((player) => [String(player.id), player]),
+  );
+  const selectedIds = Array.isArray(result?.solutions?.[0])
+    ? result.solutions[0].map(String)
+    : [];
+  const squad = selectedIds.map((id) => byId.get(id)).filter(Boolean);
+  const protectedIds = new Set((policy.protectedItemIds || []).map(String));
+  const specialReserves = policy.specialReserveByCardType || {};
+  const ratingReserves = policy.minimumReserveByRating || {};
+  const demands = Array.isArray(policy.projectRatingDemand)
+    ? policy.projectRatingDemand
+    : [];
+  const preferredMax = Math.max(
+    1,
+    toNumber(policy?.preferredFodderRange?.max) ?? 99,
+  );
+  let protectedCardViolations = 0;
+  let scarceSpecialUsage = 0;
+  let nonExpendableCardUsage = 0;
+  let nonDuplicateUsage = 0;
+  let nonStorageUsage = 0;
+  let tradableUsage = 0;
+  let targetProjectDemandPenalty = 0;
+  let premiumFodderPenalty = 0;
+  let replacementCost = 0;
+  for (const player of squad) {
+    const id = String(player?.id ?? "");
+    const rating = Math.max(0, toNumber(player?.rating) ?? 0);
+    const cardType = readConservationCardType(player);
+    const special = Boolean(player?.isSpecial);
+    if (protectedIds.has(id)) protectedCardViolations += 1;
+    if (special && Number(specialReserves[cardType] || 0) > 0) {
+      scarceSpecialUsage += Number(specialReserves[cardType]);
+    }
+    if (special) nonExpendableCardUsage += 1;
+    if (policy.preferDuplicates !== false && !player?.isDuplicate) {
+      nonDuplicateUsage += 1;
+    }
+    if (policy.preferSbcStorage !== false && !player?.isStorage) {
+      nonStorageUsage += 1;
+    }
+    if (policy.preferUntradeables !== false && !player?.isUntradeable) {
+      tradableUsage += 1;
+    }
+    for (const demand of demands) {
+      const requiredRating = Math.max(0, toNumber(demand?.rating) ?? 0);
+      if (rating >= requiredRating) {
+        targetProjectDemandPenalty +=
+          (rating - requiredRating + 1) *
+          Math.max(0, toNumber(demand?.count) ?? 0) *
+          Math.max(1, toNumber(demand?.priority) ?? 1);
+      }
+    }
+    targetProjectDemandPenalty += Math.max(
+      0,
+      toNumber(ratingReserves[String(rating)]) ?? 0,
+    );
+    if (rating > preferredMax) {
+      premiumFodderPenalty += Math.pow(rating - preferredMax, 2);
+    }
+    replacementCost += readConservationReplacementCost(player);
+  }
+  const hardRequirementViolations = Array.isArray(result?.failingRequirements)
+    ? result.failingRequirements.length
+    : result?.stats?.solved
+      ? 0
+      : 1;
+  const ratingOvershoot =
+    targetRating == null
+      ? 0
+      : Math.max(0, (toNumber(result?.stats?.squadRating) ?? 0) - targetRating);
+  const tuple = [
+    hardRequirementViolations,
+    protectedCardViolations,
+    scarceSpecialUsage,
+    nonExpendableCardUsage,
+    nonDuplicateUsage,
+    nonStorageUsage,
+    tradableUsage,
+    targetProjectDemandPenalty,
+    premiumFodderPenalty,
+    replacementCost,
+    ratingOvershoot,
+  ];
+  return {
+    ...result,
+    stats: {
+      ...(result.stats || {}),
+      conservationObjectiveFields: [...CONSERVATION_OBJECTIVE_FIELDS],
+      conservationObjectiveTuple: tuple,
+    },
+  };
 };
 
 const isNoRatingSolvedResultWasteful = (result, profile) => {
@@ -10729,6 +10971,22 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       .map((p) => [String(p.id), p]),
   );
 
+  const requiredItemIds = new Set(
+    (context?.requiredItemIds ?? [])
+      .map((value) => (value == null ? null : String(value)))
+      .filter(Boolean),
+  );
+  for (const id of requiredItemIds) {
+    const player = playerById.get(id);
+    if (!player || squad.some((entry) => String(entry?.id ?? "") === id)) {
+      continue;
+    }
+    squad.push(player);
+    lockedIds.add(player.id);
+    lockedIds.add(String(player.id));
+    preservedSeedIds.add(player.id);
+  }
+
   // Pre-seed squad from occupied field slots so solve/apply stay consistent.
   // The page layer preserves valid slot items during apply (single-solve flow),
   // so treating valid occupied slots as pre-seeded avoids overfilling (11 + preserved).
@@ -11338,6 +11596,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     rules,
     squadSize,
     debugPush,
+    { protectedItemIds: Array.from(requiredItemIds) },
   );
   if (dedupeReplaced > 0) {
     debugPush?.({
@@ -11363,6 +11622,11 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       preserveOccupiedSlots,
       lockedCount: lockedIds.size,
     });
+  }
+  for (const id of requiredItemIds) {
+    lockedIds.add(id);
+    const requiredPlayer = playerById.get(String(id));
+    if (requiredPlayer?.id != null) lockedIds.add(requiredPlayer.id);
   }
 
   // Enforce unique-count constraints (e.g. "Clubs in Squad: Max. 5") before rating improvement.
@@ -11529,6 +11793,11 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     : [];
 
   const hardLockedIds = new Set();
+  for (const id of requiredItemIds) {
+    hardLockedIds.add(id);
+    const requiredPlayer = playerById.get(String(id));
+    if (requiredPlayer?.id != null) hardLockedIds.add(requiredPlayer.id);
+  }
 
   let chemistry = null;
   if (chemistryRequired) {
@@ -11733,6 +12002,23 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       chemistry: currentChemistry,
     };
     const failing = [];
+    const workingIds = new Set(
+      (workingSquad ?? [])
+        .map((player) => (player?.id == null ? null : String(player.id)))
+        .filter(Boolean),
+    );
+    for (const itemId of requiredItemIds) {
+      if (!workingIds.has(itemId)) {
+        failing.push({
+          type: "required_item",
+          op: "required",
+          itemId,
+          reason: playerById.has(itemId)
+            ? "required_item_not_selected"
+            : "required_item_unavailable",
+        });
+      }
+    }
     if ((workingSquad?.length ?? 0) < squadSize) {
       failing.push({
         type: "players_in_squad",
@@ -12437,6 +12723,12 @@ export const solveSquad = (context) => {
     null,
     compiledConstraints,
   );
+  const conservationPolicy =
+    baseContext?.conservationPolicy &&
+    typeof baseContext.conservationPolicy === "object"
+      ? baseContext.conservationPolicy
+      : null;
+  const conservationTargetRating = getTeamRatingTarget(rules);
   const normalizedPlayers = normalizePlayers(players);
   const squadSize = getSquadSize(rules, fallbackSquadSize);
   const signature = buildChallengeSignature(rules, squadSize);
@@ -12571,7 +12863,10 @@ export const solveSquad = (context) => {
   const shouldKeepSearchingSolved = (result) =>
     Boolean(
       result?.stats?.solved &&
-        ((noRatingConservation.enabled &&
+        (((conservationPolicy?.enabled === true &&
+          orchestration.perSeed.length < 4 &&
+          Date.now() < activeDeadlineAt)) ||
+          (noRatingConservation.enabled &&
           !baseContext?.optimize?.disableNoRatingConservationRetries &&
           isNoRatingSolvedResultWasteful(result, noRatingConservation)) ||
           (lowRatingConservation.enabled &&
@@ -12684,7 +12979,7 @@ export const solveSquad = (context) => {
         capSeed?.family === "low_rating_conservation"
           ? Math.min(2500, remainingBudgetRaw)
           : remainingBudgetRaw;
-      const capResult = solveSquad({
+      const capResult = attachConservationObjective(solveSquad({
         ...baseContext,
         players: cappedPlayers,
         optimize: {
@@ -12702,7 +12997,7 @@ export const solveSquad = (context) => {
                 ),
           ),
         },
-      });
+      }), normalizedPlayers, conservationPolicy, conservationTargetRating);
       const failureSummary = summarizeFailure(
         capResult,
         capSeed,
@@ -12767,7 +13062,7 @@ export const solveSquad = (context) => {
         solverDeadlineAt: activeDeadlineAt,
       },
     };
-    const result = runPipeline(
+    const result = attachConservationObjective(runPipeline(
       {
         ...baseContext,
         requirementFlags,
@@ -12775,7 +13070,7 @@ export const solveSquad = (context) => {
       },
       seed,
       phaseConfigWithDeadline,
-    );
+    ), normalizedPlayers, conservationPolicy, conservationTargetRating);
     const failureSummary = summarizeFailure(
       result,
       seed,

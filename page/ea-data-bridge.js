@@ -1894,12 +1894,12 @@
   let activeSquadDefIdsCache = null; // { at: number, defIds: number[] }
   let activeSquadDefIdsInFlight = null;
 
-  const getActiveSquadPlayerIds = async () => {
+  const getActiveSquadPlayerIds = async ({ force = false } = {}) => {
     const cached = activeSquadDefIdsCache;
-    if (cached && Date.now() - cached.at < ACTIVE_SQUAD_TTL_MS) {
+    if (!force && cached && Date.now() - cached.at < ACTIVE_SQUAD_TTL_MS) {
       return cached.defIds;
     }
-    if (activeSquadDefIdsInFlight) return activeSquadDefIdsInFlight;
+    if (!force && activeSquadDefIdsInFlight) return activeSquadDefIdsInFlight;
 
     activeSquadDefIdsInFlight = (async () => {
       const vm = new UTBucketedItemSearchViewModel();
@@ -2396,6 +2396,7 @@
     ignoreLoaned: options?.ignoreLoaned !== false,
     onlyFemales: options?.onlyFemales === true,
     excludeActiveSquad: options?.excludeActiveSquad !== false,
+    strictExcludeActiveSquad: options?.strictExcludeActiveSquad === true,
     includeUnassigned: options?.includeUnassigned === true,
     allowedActiveSquadDefIds: normalizeDefinitionIdKeyList(
       options?.allowedActiveSquadDefIds,
@@ -2556,6 +2557,11 @@
       })
       .filter((player) => {
         if (!player?.isActiveSquadDef) return true;
+        // GrindPilot's hard protection deliberately blocks every owned copy
+        // of a definition used by the active squad. EA exposes definition IDs,
+        // not stable owned-item IDs, so allowing a duplicate copy here could
+        // accidentally leave the active owned instance eligible.
+        if (normalized?.strictExcludeActiveSquad === true) return false;
         const defId = player?.definitionId ?? null;
         const defKey = defId == null ? null : String(defId);
         if (!defKey || !(activeSquadExcludeBudget instanceof Map)) return true;
@@ -3273,6 +3279,11 @@
     const lookupKey = options.lookupKey ?? "id";
     const playerById = options?.playerById ?? null;
     const preHydratedChallenge = options?.preHydratedChallenge === true;
+    const preserveExactItemIds = new Set(
+      (options?.preserveExactItemIds ?? [])
+        .map((value) => (value == null ? null : String(value)))
+        .filter(Boolean),
+    );
     const perfStartedAt = Date.now();
     const perf = {
       lookupMs: 0,
@@ -3560,6 +3571,14 @@
         }
         return null;
       }
+      if (
+        preserveExactItemIds.has(String(id)) &&
+        match.id != null &&
+        !usedIds.has(match.id) &&
+        !usedIds.has(String(match.id))
+      ) {
+        return match;
+      }
       const defId = match?.definitionId ?? null;
       const pool = defId != null ? poolByDefinition.get(defId) : null;
       if (match.pile === clubPile) {
@@ -3636,6 +3655,15 @@
           continue;
         }
         const match = lookupMap?.get(id) ?? lookupMap?.get(String(id)) ?? null;
+        if (preserveExactItemIds.has(String(id))) {
+          const exactId = match?.id ?? id;
+          remapped.push(exactId);
+          if (exactId != null) {
+            used.add(exactId);
+            used.add(String(exactId));
+          }
+          continue;
+        }
         if (!match) {
           remapped.push(id);
           continue;
@@ -4370,7 +4398,9 @@
     solutionIds,
     options = {},
   ) => {
-    const mode = normalizeApplyMode(solverApplyMode) ?? APPLY_MODE_DEFAULT;
+    const mode = options?.forceDefaultApply === true
+      ? APPLY_MODE_DEFAULT
+      : normalizeApplyMode(solverApplyMode) ?? APPLY_MODE_DEFAULT;
     if (mode === APPLY_MODE_EXPERIMENTAL_HYBRID) {
       try {
         const experimentalResult = await applySolutionWithExperimentalHybrid(
@@ -4649,7 +4679,12 @@
       () => observableToPromise(services.SBC.requestSets()),
       { minGapMs: SBC_AUTOMATION_MIN_GAP_MS, maxAttempts: 2 },
     );
-    const sets = (data?.sets ?? []).filter((s) => s.id === setId);
+    // Controller intents deliberately serialize stable IDs. EA's entities may
+    // expose the same identifier as a number, so compare on the canonical
+    // string boundary instead of dropping the entire set on a type mismatch.
+    const sets = (data?.sets ?? []).filter(
+      (s) => String(s?.id ?? "") === String(setId ?? ""),
+    );
     for (const set of sets) {
       await sbcApiCall(
         "requestChallengesForSet",
@@ -6422,7 +6457,7 @@
         showToast({
           type: "error",
           title: "Settings Error",
-          message: "Failed to save settings.",
+          message: error?.message || "Failed to save settings.",
           timeoutMs: 9000,
         });
       }
@@ -9576,6 +9611,26 @@
       error.conceptCount = conceptItems.length;
       throw error;
     }
+    // Fail closed at the destructive boundary. The active squad can change
+    // after solving, so bypass the TTL cache and reject any overlapping player
+    // definition immediately before EA receives the submit request.
+    const activeSquadDefIds = new Set(
+      (await getActiveSquadPlayerIds({ force: true })).map(String),
+    );
+    const activeSquadViolation = squadItems.find((item) => {
+      const definitionId = item?.definitionId ?? item?.resourceId ?? null;
+      return definitionId != null && activeSquadDefIds.has(String(definitionId));
+    });
+    if (activeSquadViolation) {
+      const error = new Error(
+        "Cannot submit squad: a player definition from the active squad is protected.",
+      );
+      error.code = "EA_SUBMIT_ACTIVE_SQUAD_PROTECTED";
+      error.itemId = activeSquadViolation?.id ?? null;
+      error.definitionId =
+        activeSquadViolation?.definitionId ?? activeSquadViolation?.resourceId ?? null;
+      throw error;
+    }
     const setEntity = await ensureSbcSetById(challenge.setId);
     if (!setEntity) throw new Error("SBC set not found");
     if (!services?.SBC?.submitChallenge) {
@@ -10743,6 +10798,8 @@
       const { filteredPlayers, poolFilters } =
         filterPlayersBySolverPoolSettings(allPlayers, effectiveSettings, {
           requiredIds,
+          requirementsNormalized:
+            payload?.openChallenge?.requirementsNormalized ?? [],
         });
       const baseFilters =
         payload?.filters && typeof payload.filters === "object"
@@ -10985,7 +11042,7 @@
         showToast({
           type: "error",
           title: "Solver Error",
-          message: "Check console for details.",
+          message: error?.message || "Check console for details.",
           timeoutMs: 9000,
         });
       } finally {
@@ -14089,7 +14146,10 @@
           ? payload.players
           : [];
         const { filteredPlayers, poolFilters } =
-          filterPlayersBySolverPoolSettings(allPlayers, effectiveSettings);
+          filterPlayersBySolverPoolSettings(allPlayers, effectiveSettings, {
+            requirementsNormalized:
+              payload?.openChallenge?.requirementsNormalized ?? [],
+          });
         const playerById = new Map(
           filteredPlayers
             .map((player) => [
@@ -15168,6 +15228,10 @@
                   } = filterPlayersBySolverPoolSettings(
                     freshPlayers,
                     reSolveEffective,
+                    {
+                      requirementsNormalized:
+                        freshPayload?.openChallenge?.requirementsNormalized ?? [],
+                    },
                   );
                   const reSolveFilters = {
                     ...(freshPayload?.filters &&
@@ -19497,6 +19561,7 @@
         filterPlayersBySolverPoolSettings(
           runContext?.allPlayers ?? [],
           step?.settingsSnapshot,
+          { requirementsNormalized: safeRequirementsNormalized },
         );
       if (!Array.isArray(filteredPlayers) || !filteredPlayers.length) {
         markRunProgressPhase(
@@ -21346,6 +21411,7 @@
     wrapper.classList.add("ea-data-solve-wrapper");
 
     const button = document.createElement("button");
+    button.type = "button";
     button.className = "ea-data-solve-button";
     button.textContent = "Solve Squad";
     button.addEventListener("click", async () => {
@@ -21486,6 +21552,7 @@
         const { filteredPlayers, poolFilters } =
           filterPlayersBySolverPoolSettings(allPlayers, solverSettings, {
             requiredIds,
+            requirementsNormalized: safeRequirementsNormalized,
           });
         console.log("[EA Data] Player pool filter", {
           ...poolFilters,
@@ -21891,6 +21958,7 @@
             solverSettings,
             {
               requiredIds: retryRequiredIds,
+              requirementsNormalized: retryRequirementsNormalized,
             },
           );
           const retryMergedFilters = {
@@ -22354,7 +22422,21 @@
           showToast({
             type: "error",
             title: "No Feasible Squad",
-            message: "Not possible with current player pool.",
+            message: (() => {
+              const failures = Array.isArray(result?.failingRequirements)
+                ? result.failingRequirements
+                : [];
+              if (!failures.length) return "Not possible with current player pool.";
+              const details = failures.slice(0, 3).map((failure) => {
+                const type = failure?.type ?? failure?.reason ?? "constraint";
+                const current =
+                  failure?.current ?? failure?.actual ?? failure?.rating ?? null;
+                const target =
+                  failure?.count ?? failure?.value ?? failure?.target ?? null;
+                return `${type}${current == null ? "" : ` ${current}`}${target == null ? "" : `/${target}`}`;
+              });
+              return `Not possible with current player pool (${details.join(", ")}).`;
+            })(),
             timeoutMs: 9000,
           });
         }
@@ -22384,6 +22466,12 @@
     } else {
       button.className = "btn-standard call-to-action ea-data-solve-button";
     }
+    // The nearest EA action button can be disabled while the squad is empty.
+    // Reusing that visual class must not make our independent solver control
+    // non-interactive (the EA stylesheet applies pointer-events: none).
+    button.classList.remove("disabled");
+    button.disabled = false;
+    button.removeAttribute("aria-disabled");
 
     const settingsButton = document.createElement("button");
     settingsButton.type = "button";
@@ -22906,7 +22994,9 @@
       useUnassigned: true,
       onlyStorage: false,
       excludeTradable: false,
-      excludeSpecial: true,
+      // Specials are eligible by default. Protecting all special cards is an
+      // explicit opt-in because many repeatable upgrades require one.
+      excludeSpecial: false,
       useTotwPlayers: true,
       useEvolutionPlayers: false,
       allowConceptPlayers: false,
@@ -24871,6 +24961,36 @@
   const isTotwOrTotsPlayer = (player) =>
     isTotwPlayer(player) || isTotsPlayer(player);
 
+  const hasExplicitRequiredSpecialPoolRule = (requirementsNormalized = []) =>
+    (Array.isArray(requirementsNormalized) ? requirementsNormalized : []).some(
+      (rule) => {
+        const type = normalizeKeyName(
+          rule?.type ?? rule?.keyNameNormalized ?? rule?.keyName ?? null,
+        );
+        const op = String(rule?.op ?? "").trim().toLowerCase();
+        const count =
+          readNumeric(rule?.count) ?? readNumeric(rule?.derivedCount) ?? null;
+        if (op === "max" || count == null || count < 1) return false;
+        if (
+          type === "player_inform" ||
+          type === "player_tots" ||
+          type === "player_totw_or_tots"
+        ) {
+          return true;
+        }
+        if (type !== "player_rarity" && type !== "player_rarity_group") {
+          return false;
+        }
+        const label = String(rule?.label ?? "").trim().toLowerCase();
+        if (/totw|tots|team of the|inform|fof|festival|futties|special/.test(label)) {
+          return true;
+        }
+        return (Array.isArray(rule?.value) ? rule.value : [rule?.value])
+          .map((value) => readNumeric(value))
+          .some((value) => value != null && value >= 40);
+      },
+    );
+
   const getPlayerQualityBucket = (player) => {
     const rating = readNumeric(player?.rating) ?? 0;
     if (rating >= 75) return "gold";
@@ -24896,7 +25016,7 @@
   const filterPlayersBySolverPoolSettings = (
     players,
     settings,
-    { requiredIds = null } = {},
+    { requiredIds = null, requirementsNormalized = [] } = {},
   ) => {
     const normalized = normalizeSolverSettingsInput(settings);
     const range = normalizeRatingRange(normalized?.ratingRange);
@@ -24912,6 +25032,9 @@
     const excludeSpecial = Boolean(poolSettings?.excludeSpecial);
     const useTotwPlayers = Boolean(poolSettings?.useTotwPlayers);
     const useEvolutionPlayers = Boolean(poolSettings?.useEvolutionPlayers);
+    const allowRequiredSpecials = hasExplicitRequiredSpecialPoolRule(
+      requirementsNormalized,
+    );
     const allowedCardBuckets = normalizeAllowedCardBuckets(
       normalized?.allowedCardBuckets,
       getSettingDefault(SETTINGS_PATHS.SOLVER_ALLOWED_CARD_BUCKETS),
@@ -24977,7 +25100,12 @@
       }
       if (onlyStorage && !isOnlyStorageEligible(player)) return false;
       if (excludeTradable && Boolean(player?.isTradeable)) return false;
-      if (excludeSpecial && Boolean(player?.isSpecial) && !isTotwOrTots)
+      if (
+        excludeSpecial &&
+        Boolean(player?.isSpecial) &&
+        !isTotwOrTots &&
+        !allowRequiredSpecials
+      )
         return false;
       const bucket = getBaseCardBucket(player);
       if (bucket && !allowedCardBucketSet.has(bucket)) return false;
@@ -26623,6 +26751,7 @@
     requirements,
     requirementsNormalized,
     requiredPlayers,
+    requiredItemIds = [],
     squadSlots,
     prioritize,
     filters,
@@ -26639,6 +26768,7 @@
         requirements,
         requirementsNormalized,
         requiredPlayers,
+        requiredItemIds,
         squadSlots,
         prioritize,
         filters,
@@ -26706,6 +26836,7 @@
         requirements,
         requirementsNormalized,
         requiredPlayers,
+        requiredItemIds,
         squadSlots,
         prioritize,
         filters: {
@@ -30305,6 +30436,8 @@
       isUntradeable,
       isStorage,
       isUnassigned,
+      isMovable: readItemBoolean("isMovable"),
+      isStorable: readItemBoolean("isStorable"),
       isLocked: readItemBoolean("isLocked", "locked"),
       isFavorite: readItemBoolean("isFavorite", "isFavourite", "favorite"),
       isInStartingSquad: readItemBoolean("isInStartingSquad", "isInActive11"),
@@ -30323,6 +30456,7 @@
       isEnrolledInAcademy: item.isEnrolledInAcademy?.(),
       rarityId,
       rarityName,
+      groups: Array.isArray(item.groups) ? item.groups.slice() : [],
       cardType: rarityName,
       isSpecial,
       isTotw,
@@ -30612,7 +30746,7 @@
       .map((slot) => resolveSlotItem(slot) ?? slot ?? null)
       .filter(Boolean)
       .map((item) => (item?.id == null ? null : String(item.id)))
-      .filter(Boolean);
+      .filter((id) => Boolean(id) && id !== "0");
   };
 
   const grindPilotSolveCurrent = async (options = {}) => {
@@ -30635,6 +30769,7 @@
     });
     const payload = await window.eaData.getSolverPayload({
       ignoreLoaned: true,
+      strictExcludeActiveSquad: true,
       forcePlayersFetch: options?.forcePlayersFetch !== false,
       includeUnassigned: Boolean(solverSettings?.useUnassigned),
     });
@@ -30654,7 +30789,11 @@
     const { filteredPlayers, poolFilters } = filterPlayersBySolverPoolSettings(
       payload?.players ?? [],
       solverSettings,
-      { requiredIds },
+      {
+        requiredIds,
+        requirementsNormalized:
+          payload?.openChallenge?.requirementsNormalized ?? [],
+      },
     );
     const safePlayers = filteredPlayers.filter((player) => {
       const id = player?.id == null ? "" : String(player.id);
@@ -30680,6 +30819,11 @@
             ? options.prioritize
             : {}),
         },
+        conservationPolicy:
+          options?.conservationPolicy &&
+          typeof options.conservationPolicy === "object"
+            ? options.conservationPolicy
+            : null,
         filters: {
           ...(payload?.filters ?? {}),
           ...poolFilters,
@@ -30724,6 +30868,7 @@
       solved: true,
       submitReady: true,
       challengeId,
+      setId: challenge?.setId == null ? null : String(challenge.setId),
       solutionIds,
       solutionSlots: result?.solutionSlots?.[0] ?? null,
       stats: result?.stats ?? null,
@@ -30757,6 +30902,346 @@
     return grindPilotResult("verified", solveValue, null, {
       applied: true,
       observedItemIds: Array.from(appliedIds),
+    });
+  };
+
+  const grindPilotOrganizeIntoSbc = async ({
+    setId,
+    challengeId = null,
+    requiredItemIds = [],
+    protectedItemIds = [],
+    solverSettings: requestedSolverSettings = {},
+  } = {}) => {
+    if (setId == null || String(setId).trim() === "") {
+      return grindPilotResult("unavailable", null, "Organizer SBC set ID is missing");
+    }
+    const requiredIds = new Set(
+      (Array.isArray(requiredItemIds) ? requiredItemIds : [])
+        .map((id) => (id == null ? null : String(id)))
+        .filter(Boolean),
+    );
+    if (!requiredIds.size) {
+      return grindPilotResult("not_applied", null, "No remaining unassigned cards were supplied");
+    }
+    if (requiredIds.size > 11) {
+      return grindPilotResult(
+        "not_applied",
+        null,
+        "More than one squad of unassigned cards remains; Organizer will not submit a partial batch",
+        { requiredItemIds: Array.from(requiredIds) },
+      );
+    }
+    const protectedIds = new Set(
+      (Array.isArray(protectedItemIds) ? protectedItemIds : [])
+        .map((id) => (id == null ? null : String(id)))
+        .filter(Boolean),
+    );
+    const protectedRequired = Array.from(requiredIds).filter((id) =>
+      protectedIds.has(id),
+    );
+    if (protectedRequired.length) {
+      return grindPilotResult(
+        "not_applied",
+        null,
+        "Organizer refused to consume a protected unassigned card",
+        { protectedRequiredItemIds: protectedRequired },
+      );
+    }
+
+    const ready = await initSolverBridge();
+    if (!ready) {
+      return grindPilotResult("unavailable", null, "Solver bridge unavailable");
+    }
+
+    let resolvedChallengeId = challengeId == null ? null : String(challengeId);
+    if (!resolvedChallengeId) {
+      const setEntity = await ensureSbcSetById(setId);
+      const snapshot = await refreshSbcSetChallengesSnapshot(setId, setEntity);
+      const challenges = Array.isArray(snapshot?.setEntity?.getChallenges?.())
+        ? snapshot.setEntity.getChallenges()
+        : Array.isArray(setEntity?.getChallenges?.())
+          ? setEntity.getChallenges()
+          : [];
+      const candidate = challenges.find((entry) => entry?.completed !== true) ?? challenges[0];
+      resolvedChallengeId = candidate?.id == null ? null : String(candidate.id);
+    }
+    if (!resolvedChallengeId) {
+      return grindPilotResult("unavailable", null, "Organizer target exposes no open challenge");
+    }
+
+    const challengeEntity = await getChallengeEntityForSubmission(
+      setId,
+      resolvedChallengeId,
+      "Organizer target",
+    );
+    if (!challengeEntity) {
+      return grindPilotResult("unavailable", null, "Organizer target challenge is unavailable");
+    }
+    const loaded = await loadChallenge(challengeEntity, true, { force: true });
+    const requirementsSnapshot = buildRequirementsSnapshot(
+      challengeEntity,
+      loaded?.data ?? loaded,
+    );
+    const slotInfo = buildChallengeSlotsForSolver(
+      challengeEntity,
+      loaded?.data ?? loaded,
+      { preferLoaded: true },
+    );
+    if (!Array.isArray(slotInfo?.squadSlots) || !slotInfo.squadSlots.length) {
+      return grindPilotResult("unavailable", null, "Organizer target has no usable squad slots");
+    }
+
+    const solverSettings = normalizeSolverSettingsInput({
+      ...getDefaultSolverSettings(),
+      ...(requestedSolverSettings && typeof requestedSolverSettings === "object"
+        ? requestedSolverSettings
+        : {}),
+      useUnassigned: true,
+    });
+    const payload = await window.eaData.getSolverPayload(
+      {
+        ignoreLoaned: true,
+        strictExcludeActiveSquad: true,
+        forcePlayersFetch: true,
+        preferWarmSnapshot: false,
+        includeUnassigned: true,
+      },
+      [setId],
+    );
+    const { filteredPlayers, poolFilters } = filterPlayersBySolverPoolSettings(
+      payload?.players ?? [],
+      solverSettings,
+      {
+        requiredIds,
+        requirementsNormalized:
+          payload?.openChallenge?.requirementsNormalized ?? [],
+      },
+    );
+    const availableIds = new Set(
+      filteredPlayers
+        .map((player) => (player?.id == null ? null : String(player.id)))
+        .filter(Boolean),
+    );
+    const missingRequired = Array.from(requiredIds).filter(
+      (id) => !availableIds.has(id),
+    );
+    if (missingRequired.length) {
+      return grindPilotResult(
+        "not_applied",
+        null,
+        "A required unassigned card is no longer available to the solver",
+        { missingRequiredItemIds: missingRequired },
+      );
+    }
+    const safePlayers = filteredPlayers.filter((player) => {
+      const id = player?.id == null ? "" : String(player.id);
+      return requiredIds.has(id) || !protectedIds.has(id);
+    });
+    const safeRequirements = (requirementsSnapshot?.requirements ?? []).map(
+      serializeRequirementForSolver,
+    );
+    const safeRequirementsNormalized = buildSafeNormalizedRequirementsForSolver(
+      requirementsSnapshot?.requirementsNormalized ?? [],
+      safeRequirements,
+    );
+    const excludedPlayerIds = new Set([
+      ...(payload?.filters?.excludedPlayerIds ?? []).map(String),
+      ...(poolFilters?.excludedPlayerIds ?? []).map(String),
+      ...protectedIds,
+    ]);
+    for (const id of requiredIds) excludedPlayerIds.delete(id);
+
+    const solveResult = await solveWithConceptFallback({
+      payload: { _cacheRevision: payload?._cacheRevision ?? null },
+      players: safePlayers,
+      requirements: safeRequirements,
+      requirementsNormalized: safeRequirementsNormalized,
+      requiredPlayers: slotInfo?.requiredPlayers ?? null,
+      requiredItemIds: Array.from(requiredIds),
+      squadSlots: slotInfo?.squadSlots ?? [],
+      prioritize: payload?.prioritize ?? null,
+      filters: {
+        ...(payload?.filters ?? {}),
+        ...poolFilters,
+        useUnassigned: true,
+        excludedPlayerIds: Array.from(excludedPlayerIds),
+      },
+      debug: Boolean(debugEnabled),
+      playerById: new Map(
+        (payload?.players ?? [])
+          .filter((player) => player?.id != null)
+          .map((player) => [String(player.id), player]),
+      ),
+      label: "grindpilot-organizer",
+    });
+    const solutionIds = Array.isArray(solveResult?.solutions?.[0])
+      ? solveResult.solutions[0].map(String)
+      : [];
+    const missingFromSolution = Array.from(requiredIds).filter(
+      (id) => !solutionIds.includes(id),
+    );
+    if (
+      !solutionIds.length ||
+      missingFromSolution.length ||
+      solveResult?.requiresConcepts ||
+      solveResult?.stats?.requiresConcepts
+    ) {
+      const failureSummary = (solveResult?.failingRequirements ?? [])
+        .slice(0, 4)
+        .map((failure) => {
+          const type = String(failure?.type ?? failure?.key ?? "requirement");
+          const reason = String(failure?.reason ?? failure?.op ?? "failed");
+          const current = failure?.current == null ? "" : ` ${failure.current}`;
+          const target = failure?.count == null && failure?.target == null
+            ? ""
+            : `/${failure.count ?? failure.target}`;
+          return `${type}:${reason}${current}${target}`;
+        })
+        .join(", ");
+      const missingSummary = missingFromSolution.length
+        ? `missing required item ${missingFromSolution.join(", ")}`
+        : "";
+      const diagnosticSummary = [missingSummary, failureSummary]
+        .filter(Boolean)
+        .join("; ");
+      return grindPilotResult(
+        "not_applied",
+        {
+          solved: false,
+          requiredItemIds: Array.from(requiredIds),
+          missingFromSolution,
+          failingRequirements: solveResult?.failingRequirements ?? [],
+        },
+        `Target SBC cannot be solved while consuming every remaining card${diagnosticSummary ? ` (${diagnosticSummary})` : ""}`,
+      );
+    }
+    const protectedViolation = solutionIds.find((id) => protectedIds.has(id));
+    if (protectedViolation) {
+      return grindPilotResult("not_applied", null, "Solver selected a protected item", {
+        itemId: protectedViolation,
+      });
+    }
+
+    const playerById = new Map(
+      (payload?.players ?? [])
+        .filter((player) => player?.id != null)
+        .map((player) => [String(player.id), player]),
+    );
+    await applySolutionWithSelectedMode(challengeEntity, solutionIds, {
+      lookupKey: "id",
+      slotSolution: solveResult?.solutionSlots?.[0] ?? null,
+      playerById,
+      forceDefaultApply: true,
+      preserveExistingValid: false,
+      preserveExactItemIds: Array.from(requiredIds),
+    });
+    const appliedIds = new Set(grindPilotReadSquadIds(challengeEntity));
+    if (
+      appliedIds.size !== solutionIds.length ||
+      solutionIds.some((id) => !appliedIds.has(id)) ||
+      Array.from(requiredIds).some((id) => !appliedIds.has(id))
+    ) {
+      const missingAppliedIds = solutionIds.filter((id) => !appliedIds.has(id));
+      const unexpectedAppliedIds = Array.from(appliedIds).filter(
+        (id) => !solutionIds.includes(id),
+      );
+      return grindPilotResult("ambiguous", null, `Organizer squad application could not be verified (missing ${missingAppliedIds.join(", ") || "none"}; unexpected ${unexpectedAppliedIds.join(", ") || "none"})`, {
+        expectedItemIds: solutionIds,
+        observedItemIds: Array.from(appliedIds),
+        missingAppliedIds,
+        unexpectedAppliedIds,
+      });
+    }
+
+    const submitResult = await submitSbcChallenge(challengeEntity);
+    if (!submitResult?.success) {
+      return grindPilotResult(
+        "ambiguous",
+        submitResult,
+        `Organizer target submit was not verified (${submitResult?.error ?? submitResult?.status ?? "unknown"})`,
+      );
+    }
+    const completionDeadline = Date.now() + 8000;
+    let completionObserved = false;
+    while (Date.now() < completionDeadline) {
+      const setSnapshot = await refreshSbcSetChallengesSnapshot(
+        setId,
+        await ensureSbcSetById(setId),
+      );
+      const challenges = Array.isArray(setSnapshot?.setEntity?.getChallenges?.())
+        ? setSnapshot.setEntity.getChallenges()
+        : [];
+      const match = challenges.find(
+        (entry) => String(entry?.id ?? "") === resolvedChallengeId,
+      );
+      if (match?.isCompleted?.() || match?.status === "COMPLETED") {
+        completionObserved = true;
+        break;
+      }
+      await delayMs(250);
+    }
+    if (!completionObserved) {
+      return grindPilotResult(
+        "ambiguous",
+        submitResult,
+        "Organizer submit response succeeded but challenge completion was not observed",
+        { setId: String(setId), challengeId: resolvedChallengeId },
+      );
+    }
+    clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
+    await delayMs(500);
+    const remaining = await getUnassignedItems({ refresh: true, failClosed: true });
+    const remainingIds = new Set(
+      remaining.map((item) => String(item?.id ?? "")).filter(Boolean),
+    );
+    const stillUnassigned = Array.from(requiredIds).filter((id) => remainingIds.has(id));
+    if (stillUnassigned.length) {
+      return grindPilotResult(
+        "ambiguous",
+        null,
+        "SBC was submitted but required-card removal could not be verified",
+        { stillUnassignedItemIds: stillUnassigned },
+      );
+    }
+    return grindPilotResult("verified", {
+      success: true,
+      completed: true,
+      setId: String(setId),
+      challengeId: resolvedChallengeId,
+      requiredItemIds: Array.from(requiredIds),
+      solutionIds,
+      unresolvedItemIds: remaining.map((item) => String(item?.id ?? "")).filter(Boolean),
+    });
+  };
+
+  const grindPilotReadSbcChallengeState = async ({ setId, challengeId } = {}) => {
+    if (setId == null || challengeId == null) {
+      return grindPilotResult("unavailable", null, "Stable set and challenge IDs are required");
+    }
+    const snapshot = await refreshSbcSetChallengesSnapshot(
+      setId,
+      await ensureSbcSetById(setId),
+    );
+    const challenges = Array.isArray(snapshot?.setEntity?.getChallenges?.())
+      ? snapshot.setEntity.getChallenges()
+      : [];
+    const match = challenges.find(
+      (entry) => String(entry?.id ?? "") === String(challengeId),
+    );
+    if (!match) {
+      return grindPilotResult("verified", {
+        setId: String(setId),
+        challengeId: String(challengeId),
+        available: false,
+        completed: null,
+      });
+    }
+    return grindPilotResult("verified", {
+      setId: String(setId),
+      challengeId: String(challengeId),
+      available: true,
+      completed: Boolean(match?.isCompleted?.() || match?.status === "COMPLETED"),
+      status: match?.status ?? null,
     });
   };
 
@@ -30949,18 +31434,23 @@
     });
   };
 
-  const grindPilotResolveUnassigned = async ({ storageCapacity = 100 } = {}) => {
+  const grindPilotResolveUnassigned = async ({
+    storageCapacity = 100,
+    expectedActions = null,
+    allowPartial = false,
+  } = {}) => {
     const items = await getUnassignedItems({ refresh: true, failClosed: true });
     const storage = await getStorageItems();
-    const freeStorage = Math.max(0, Number(storageCapacity) - storage.length);
+    const effectiveStorageCapacity = Math.min(100, Math.max(0, Math.trunc(Number(storageCapacity) || 0)));
+    const freeStorage = Math.max(0, effectiveStorageCapacity - storage.length);
     const readFlag = (item, key) =>
       typeof item?.[key] === "function"
         ? Boolean(item[key]())
         : Boolean(item?.[key]);
     const isDuplicate = (item) =>
       readFlag(item, "isDuplicate") || Number(item?.duplicateId ?? 0) > 0;
-    const toClub = items.filter((item) => readFlag(item, "isMovable"));
-    const toStorage = items
+    let toClub = items.filter((item) => readFlag(item, "isMovable"));
+    let toStorage = items
       .filter(
         (item) =>
           !readFlag(item, "isMovable") &&
@@ -30969,6 +31459,61 @@
           !readFlag(item, "isTradeable"),
       )
       .slice(0, freeStorage);
+    if (Array.isArray(expectedActions)) {
+      const observedActions = [
+        ...toClub.map((item) => ({
+          itemId: String(item?.id ?? ""),
+          type: "SEND_TO_CLUB",
+        })),
+        ...toStorage.map((item) => ({
+          itemId: String(item?.id ?? ""),
+          type: "MOVE_TO_SBC_STORAGE",
+        })),
+      ].sort((left, right) =>
+        `${left.itemId}:${left.type}`.localeCompare(`${right.itemId}:${right.type}`),
+      );
+      const approvedActions = expectedActions
+        .filter((action) =>
+          ["SEND_TO_CLUB", "MOVE_TO_SBC_STORAGE"].includes(action?.type),
+        )
+        .map((action) => ({
+          itemId: String(action?.itemId ?? ""),
+          type: String(action?.type ?? ""),
+        }))
+        .sort((left, right) =>
+          `${left.itemId}:${left.type}`.localeCompare(`${right.itemId}:${right.type}`),
+        );
+      if (
+        !allowPartial &&
+        (observedActions.length !== approvedActions.length ||
+          observedActions.some(
+            (action, index) =>
+              action.itemId !== approvedActions[index]?.itemId ||
+              action.type !== approvedActions[index]?.type,
+          ))
+      ) {
+        return grindPilotResult(
+          "not_applied",
+          null,
+          "Unassigned state no longer matches the persisted resolution intent",
+          { expectedActions: approvedActions, observedActions },
+        );
+      }
+      if (allowPartial) {
+        // EA can change per-item move capability between planning and
+        // execution. Execute only the still-valid approved intersection and
+        // leave everything else for the following Organizer SBC step.
+        const approvedKeys = new Set(
+          approvedActions.map((action) => `${action.itemId}:${action.type}`),
+        );
+        toClub = toClub.filter((item) =>
+          approvedKeys.has(`${String(item?.id ?? "")}:SEND_TO_CLUB`),
+        );
+        toStorage = toStorage.filter((item) =>
+          approvedKeys.has(`${String(item?.id ?? "")}:MOVE_TO_SBC_STORAGE`),
+        );
+      }
+    }
     await grindPilotMoveItems(toClub, GRINDPILOT_CLUB_PILE);
     await grindPilotMoveItems(toStorage, GRINDPILOT_STORAGE_PILE);
     clearPlayersSnapshotCache({ clearWarmLookup: true, bumpRevision: true });
@@ -31001,7 +31546,7 @@
       unresolvedItemIds: remaining.map((item) => String(item.id)),
       unresolvedUnassigned: remaining.length,
       storageUsed: storageAfter.length,
-      storageCapacity: Number(storageCapacity),
+      storageCapacity: effectiveStorageCapacity,
     }, remaining.length ? "Unresolved items require a policy decision" : null);
   };
 
@@ -31018,6 +31563,439 @@
     });
   };
 
+  const grindPilotReadCurrentSbcProject = async () => {
+    const setId = currentSbcSet?.id ?? currentChallenge?.setId ?? null;
+    if (setId == null) {
+      return grindPilotResult("unavailable", null, "No SBC set is open");
+    }
+    const setEntity = await ensureSbcSetById(setId);
+    const snapshot = await refreshSbcSetChallengesSnapshot(setId, setEntity);
+    const challenges = Array.isArray(snapshot?.setEntity?.getChallenges?.())
+      ? snapshot.setEntity.getChallenges()
+      : Array.isArray(setEntity?.getChallenges?.())
+        ? setEntity.getChallenges()
+        : [];
+    if (!challenges.length) {
+      return grindPilotResult("unavailable", null, "The open SBC set exposes no challenges");
+    }
+    const specialTypes = new Map([
+      ["totw", "totw"],
+      ["inform", "totw"],
+      ["player_inform", "totw"],
+      ["tots", "tots"],
+      ["player_tots", "tots"],
+      ["totw_or_tots", "totw_or_tots"],
+      ["player_totw_or_tots", "totw_or_tots"],
+      ["special", "special"],
+      ["special_card", "special"],
+      ["special_cards", "special"],
+    ]);
+    const normalizedChallenges = [];
+    for (const challenge of challenges) {
+      let loaded = null;
+      try { loaded = await loadChallenge(challenge, true); } catch {}
+      const requirements = buildRequirementsSnapshot(
+        challenge,
+        loaded?.data ?? loaded,
+      ).requirementsNormalized;
+      const ratingRules = requirements.filter((rule) => rule?.type === "team_rating");
+      const ratingValues = ratingRules
+        .map((rule) => readNumeric(rule?.count) ?? readNumeric(rule?.value))
+        .filter((value) => value != null && value >= 1 && value <= 99);
+      const requiredSquadRating = ratingValues.length === 1
+        ? Math.trunc(ratingValues[0])
+        : null;
+      const specialCardRequirements = requirements
+        .map((rule) => {
+          const cardType = specialTypes.get(String(rule?.type ?? "").toLowerCase());
+          const count = readNumeric(rule?.count) ?? readNumeric(rule?.derivedCount);
+          if (!cardType || count == null || count < 1) return null;
+          return {
+            cardType,
+            count: Math.trunc(count),
+            completed: 0,
+            perRemainingSquad: false,
+          };
+        })
+        .filter(Boolean);
+      const knownTypes = new Set([
+        "squad_size",
+        "players_in_squad",
+        "team_rating",
+        ...specialTypes.keys(),
+      ]);
+      normalizedChallenges.push({
+        id: String(challenge.id),
+        name: challenge?.name ?? challenge?.title ?? null,
+        completed: Boolean(
+          challenge?.isCompleted?.() || challenge?.status === "COMPLETED",
+        ),
+        requiredSquadRating,
+        specialCardRequirements,
+        unknownRequirements: requirements
+          .map((rule) => String(rule?.type ?? "unknown"))
+          .filter((type) => !knownTypes.has(type)),
+      });
+    }
+    return grindPilotResult("verified", {
+      setId: String(setId),
+      setName:
+        snapshot?.setEntity?.name ??
+        snapshot?.setEntity?.title ??
+        setEntity?.name ??
+        setEntity?.title ??
+        currentSbcSet?.name ??
+        currentSbcSet?.title ??
+        null,
+      challenges: normalizedChallenges,
+    }, null, {
+      challengeCount: normalizedChallenges.length,
+      unknownRequirementCount: normalizedChallenges.reduce(
+        (sum, challenge) => sum + challenge.unknownRequirements.length,
+        0,
+      ),
+    });
+  };
+
+  const grindPilotFindSbcTarget = async ({ preferredNames = [] } = {}) => {
+    const normalizeName = (value) => String(value ?? "")
+      .toLocaleLowerCase()
+      .replace(/[×]/g, "x")
+      .replace(/[^a-z0-9+]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const requested = (Array.isArray(preferredNames) ? preferredNames : [])
+      .map(normalizeName)
+      .filter(Boolean);
+    const defaults = ["10x 85+ upgrade", "85x10"];
+    const queries = requested.length ? requested : defaults;
+    const sets = await getSbcSets();
+    const ranked = (Array.isArray(sets) ? sets : [])
+      .map((entry) => {
+        const name = String(entry?.name ?? entry?.title ?? "").trim();
+        const normalized = normalizeName(name);
+        let score = 0;
+        for (const query of queries) {
+          if (normalized === query) score = Math.max(score, 100);
+          else if (normalized.includes(query) || query.includes(normalized)) score = Math.max(score, 80);
+        }
+        const compact = normalized.replace(/\s+/g, "");
+        if (/10x85\+/.test(compact) || /85\+x10/.test(compact)) score = Math.max(score, 70);
+        return { entry, name, score };
+      })
+      .filter((candidate) => candidate.score > 0 && candidate.entry?.id != null)
+      .sort((a, b) => b.score - a.score);
+    const selected = ranked[0] ?? null;
+    if (!selected) {
+      return grindPilotResult("unavailable", null, "10x 85+ Upgrade could not be found");
+    }
+    const setId = selected.entry.id;
+    const setEntity = await ensureSbcSetById(setId);
+    const snapshot = await refreshSbcSetChallengesSnapshot(setId, setEntity);
+    const challenges = Array.isArray(snapshot?.setEntity?.getChallenges?.())
+      ? snapshot.setEntity.getChallenges()
+      : Array.isArray(setEntity?.getChallenges?.())
+        ? setEntity.getChallenges()
+        : [];
+    const challenge = challenges.find((entry) =>
+      !Boolean(entry?.isCompleted?.() || entry?.status === "COMPLETED"),
+    ) ?? challenges[0] ?? null;
+    if (challenge?.id == null) {
+      return grindPilotResult("unavailable", null, "10x 85+ exposes no open challenge");
+    }
+    return grindPilotResult("verified", {
+      setId: String(setId),
+      challengeId: String(challenge.id),
+      name: selected.name || "10x 85+ Upgrade",
+    });
+  };
+
+  const grindPilotKnownPickOfferArrays = (pick) => {
+    const candidates = [];
+    for (const method of ["getItems", "getPlayerItems", "getOptions", "getChoices"]) {
+      if (typeof pick?.[method] !== "function") continue;
+      try {
+        const value = pick[method]();
+        if (Array.isArray(value)) candidates.push(value);
+      } catch {}
+    }
+    for (const field of ["items", "playerItems", "options", "offers", "choices"]) {
+      if (Array.isArray(pick?.[field])) candidates.push(pick[field]);
+    }
+    return candidates;
+  };
+
+  const grindPilotNormalizePickOffer = (item, duplicateResourceIds) => {
+    if (!item || typeof item !== "object") return null;
+    const itemId = item.id ?? item.itemId ?? null;
+    if (itemId == null) return null;
+    const resourceId = item.resourceId ?? item.resourceID ?? null;
+    const rating = Number(item.rating);
+    const rarityId = item.rareflag ?? item.rarityId ?? item.rarity ?? null;
+    const rarityName = rarityId == null ? null : getRarityName(rarityId);
+    const estimatedRaw =
+      item.estimatedValue ?? item.marketPrice ?? item.price ?? item.priceMeta?.price ?? null;
+    const estimatedValue = Number(estimatedRaw);
+    const special =
+      typeof item.isSpecial === "function"
+        ? Boolean(item.isSpecial())
+        : typeof item.isSpecial === "boolean"
+          ? item.isSpecial
+          : null;
+    return {
+      itemId: String(itemId),
+      resourceId: resourceId == null ? null : String(resourceId),
+      basePlayerId:
+        item.basePlayerId ?? item.baseId ?? item.assetId ?? item._staticData?.baseId ?? null,
+      name: resolvePlayerName(item),
+      rating: Number.isFinite(rating) ? rating : null,
+      cardType: item.cardType == null ? null : String(item.cardType),
+      rarityName: rarityName == null ? null : String(rarityName),
+      isSpecial: special,
+      isDuplicate:
+        item.isDuplicate === true ||
+        (resourceId != null && duplicateResourceIds.has(String(resourceId))),
+      estimatedValue:
+        estimatedRaw != null && Number.isFinite(estimatedValue) && estimatedValue >= 0
+          ? estimatedValue
+          : null,
+    };
+  };
+
+  const grindPilotPickOfferIdentity = (offers) =>
+    offers
+      .map((offer) => `${offer.itemId}:${offer.resourceId ?? ""}`)
+      .sort()
+      .join("|");
+
+  const grindPilotReadPlayerPick = async ({ pickId = null } = {}) => {
+    const unassigned = await getUnassignedItems({ refresh: true, failClosed: true });
+    const picks = unassigned.filter((item) => item?.isPlayerPickItem?.());
+    if (!picks.length) {
+      return grindPilotResult("verified", {
+        pending: false,
+        resolved: true,
+        availability: "available",
+        pickIdentity: null,
+        offerIdentity: null,
+        offers: [],
+      });
+    }
+    const matching = pickId == null
+      ? picks
+      : picks.filter((item) => String(item?.id ?? "") === String(pickId));
+    if (matching.length !== 1) {
+      return grindPilotResult("verified", {
+        pending: true,
+        resolved: false,
+        availability: "ambiguous",
+        pickIdentity: null,
+        offerIdentity: null,
+        offers: [],
+        pickItemIds: picks.map((item) => String(item.id)),
+      }, "Player-pick identity is ambiguous");
+    }
+    const pick = matching[0];
+    const pickIdentity = String(pick.id);
+    const offerArrays = grindPilotKnownPickOfferArrays(pick)
+      .filter((items) => items.length > 0);
+    if (!offerArrays.length) {
+      return grindPilotResult("verified", {
+        pending: true,
+        resolved: false,
+        availability: "unavailable",
+        pickIdentity,
+        offerIdentity: null,
+        offers: [],
+      }, "EA did not expose reliable player-pick offers");
+    }
+    const signatures = new Set(
+      offerArrays.map((items) => items.map((item) => String(item?.id ?? item?.itemId ?? "")).join("|")),
+    );
+    if (signatures.size !== 1) {
+      return grindPilotResult("verified", {
+        pending: true,
+        resolved: false,
+        availability: "ambiguous",
+        pickIdentity,
+        offerIdentity: null,
+        offers: [],
+      }, "EA exposed conflicting player-pick offer collections");
+    }
+    const [club, storage] = await Promise.all([
+      getClubPlayers({ ignoreLoaned: false, excludeActiveSquad: false }),
+      getStorageItems(),
+    ]);
+    const duplicateResourceIds = new Set(
+      [...club, ...storage]
+        .map((item) => item?.resourceId ?? item?.resourceID ?? null)
+        .filter((value) => value != null)
+        .map(String),
+    );
+    const rawOffers = offerArrays[0];
+    const offers = rawOffers
+      .map((item) => grindPilotNormalizePickOffer(item, duplicateResourceIds))
+      .filter(Boolean);
+    if (
+      offers.length !== rawOffers.length ||
+      !offers.length ||
+      new Set(offers.map((offer) => offer.itemId)).size !== offers.length
+    ) {
+      return grindPilotResult("verified", {
+        pending: true,
+        resolved: false,
+        availability: "ambiguous",
+        pickIdentity,
+        offerIdentity: null,
+        offers: [],
+      }, "Player-pick offers could not be normalized uniquely");
+    }
+    return grindPilotResult("verified", {
+      pending: true,
+      resolved: false,
+      availability: "available",
+      pickIdentity,
+      offerIdentity: grindPilotPickOfferIdentity(offers),
+      offers,
+    }, null, { source: "controller-item", offerCount: offers.length });
+  };
+
+  const grindPilotCapabilityHealth = async () => {
+    const make = (id, status, evidence = {}) => ({ id, status, evidence });
+    let pickRead = "UNVERIFIED";
+    let pickSelection = "UNVERIFIED";
+    let pickEvidence = { pending: false };
+    try {
+      const items = await getUnassignedItems({ refresh: false, failClosed: true });
+      const picks = items.filter((item) => item?.isPlayerPickItem?.());
+      const methods = picks.length === 1
+        ? ["selectItem", "select", "chooseItem", "choose"].filter(
+            (method) => typeof picks[0]?.[method] === "function",
+          )
+        : [];
+      const offerCollections = picks.length === 1
+        ? grindPilotKnownPickOfferArrays(picks[0]).filter((offers) => offers.length > 0)
+        : [];
+      const offerSignatures = new Set(
+        offerCollections.map((offers) =>
+          offers.map((offer) => String(offer?.id ?? offer?.itemId ?? "")).join("|"),
+        ),
+      );
+      pickEvidence = {
+        pending: picks.length > 0,
+        controllerMethods: methods,
+        offerCollections: offerCollections.length,
+        offerCollectionsAgree: offerSignatures.size === 1,
+      };
+      if (
+        picks.length === 1 &&
+        offerCollections.length > 0 &&
+        offerSignatures.size === 1
+      ) pickRead = "AVAILABLE";
+      else if (picks.length > 0) pickRead = "DEGRADED";
+      if (picks.length === 1 && methods.length > 0) pickSelection = "AVAILABLE";
+      else if (picks.length > 0) pickSelection = "DEGRADED";
+    } catch {
+      pickRead = "UNAVAILABLE";
+      pickEvidence = { pending: null };
+    }
+    const openSet = currentSbcSet?.id ?? currentChallenge?.setId ?? null;
+    return grindPilotResult("verified", [
+      make("Inventory read", isReady() ? "AVAILABLE" : "DEGRADED", { eaReady: isReady() }),
+      make("Current SBC read", currentChallenge?.id ? "AVAILABLE" : "DEGRADED", { challengeOpen: Boolean(currentChallenge?.id) }),
+      make("Solve", solverBridgeReady && currentChallenge?.id ? "AVAILABLE" : "DEGRADED", { solverBridgeReady: Boolean(solverBridgeReady), challengeOpen: Boolean(currentChallenge?.id) }),
+      make("Submit", currentChallenge?.id ? "UNVERIFIED" : "UNAVAILABLE", { challengeOpen: Boolean(currentChallenge?.id) }),
+      make("Reward claim", gameRewardsHooked ? "UNVERIFIED" : "DEGRADED", { rewardViewHooked: Boolean(gameRewardsHooked) }),
+      make("Pack listing", typeof services?.Store?.getPacks === "function" ? "AVAILABLE" : "UNAVAILABLE", { storeService: typeof services?.Store?.getPacks === "function" }),
+      make("Pack opening", typeof services?.Store?.getPacks === "function" ? "UNVERIFIED" : "UNAVAILABLE", { purchasesAllowed: false }),
+      make("Unassigned", typeof services?.Item !== "undefined" ? "AVAILABLE" : "UNAVAILABLE", { itemService: Boolean(services?.Item) }),
+      make("SBC Storage move", typeof services?.Item?.move === "function" ? "AVAILABLE" : "UNAVAILABLE", { moveService: typeof services?.Item?.move === "function" }),
+      make("Player Pick read", pickRead, pickEvidence),
+      make("Player Pick select", pickSelection, pickEvidence),
+      make("SBC project import", openSet != null ? "AVAILABLE" : "DEGRADED", { openSet: openSet == null ? null : String(openSet) }),
+    ]);
+  };
+
+  const grindPilotSelectPlayerPick = async (intent = {}) => {
+    const before = await grindPilotReadPlayerPick({ pickId: intent.pickIdentity ?? intent.pickId });
+    const pick = before?.value;
+    if (before.status !== "verified" || pick?.availability !== "available") {
+      return grindPilotResult("not_applied", null, "Player-pick offers are not reliably observable");
+    }
+    if (
+      String(pick.pickIdentity) !== String(intent.pickIdentity ?? intent.pickId ?? "") ||
+      String(pick.offerIdentity) !== String(intent.offerIdentity ?? "")
+    ) {
+      return grindPilotResult("not_applied", null, "Player-pick identity changed before selection");
+    }
+    const unassigned = await getUnassignedItems({ refresh: false, failClosed: true });
+    const pickItem = unassigned.find((item) => String(item?.id ?? "") === String(pick.pickIdentity));
+    const rawOffers = grindPilotKnownPickOfferArrays(pickItem)[0] ?? [];
+    const rawOffer = rawOffers.find(
+      (item) => String(item?.id ?? item?.itemId ?? "") === String(intent.itemId ?? ""),
+    );
+    if (!pickItem || !rawOffer) {
+      return grindPilotResult("not_applied", null, "Approved player-pick offer is no longer present");
+    }
+    const dispatchMethod = ["selectItem", "select", "chooseItem", "choose"].find(
+      (method) => typeof pickItem?.[method] === "function",
+    );
+    if (!dispatchMethod) {
+      return grindPilotResult("unavailable", null, "EA player-pick selection controller is unavailable");
+    }
+    let dispatched = false;
+    let response;
+    try {
+      dispatched = true;
+      const operation = pickItem[dispatchMethod](rawOffer);
+      response = operation && typeof operation.observe === "function"
+        ? await observableToPromise(operation)
+        : operation && typeof operation.then === "function"
+          ? await operation
+          : operation;
+    } catch (error) {
+      return grindPilotResult(
+        dispatched ? "ambiguous" : "not_applied",
+        null,
+        error?.message || "EA player-pick selection failed",
+      );
+    }
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const current = await grindPilotReadPlayerPick({ pickId: pick.pickIdentity });
+      if (current?.value?.pending !== true) {
+        const inventory = await grindPilotReadInventory();
+        const all = [
+          ...(inventory?.value?.club ?? []),
+          ...(inventory?.value?.storage ?? []),
+          ...(inventory?.value?.unassigned ?? []),
+        ];
+        const selectedObserved = all.some((item) =>
+          String(item?.id ?? item?.itemId ?? "") === String(intent.itemId) ||
+          (intent.resourceId != null &&
+            String(item?.resourceId ?? "") === String(intent.resourceId)),
+        );
+        if (selectedObserved) {
+          return grindPilotResult("verified", {
+            success: true,
+            selectedItemId: String(intent.itemId),
+            pickIdentity: pick.pickIdentity,
+          }, null, { dispatchMethod, selectedObserved: true });
+        }
+        return grindPilotResult("ambiguous", response, "Player pick was consumed but the selected item was not observed");
+      }
+      await delayMs(250);
+    }
+    const current = await grindPilotReadPlayerPick({ pickId: pick.pickIdentity });
+    if (
+      current?.value?.pending === true &&
+      current?.value?.offerIdentity === pick.offerIdentity
+    ) {
+      return grindPilotResult("not_applied", response, "Player pick remained pending after selection dispatch");
+    }
+    return grindPilotResult("ambiguous", response, "Player-pick post-state is ambiguous");
+  };
+
   window.eaData = {
     grindPilot: Object.freeze({
       getHealth: () =>
@@ -31027,25 +32005,23 @@
           storeAvailable: typeof services?.Store?.getPacks === "function",
           itemMoveAvailable: typeof services?.Item?.move === "function",
         }),
+      getCapabilityHealth: () => grindPilotCapabilityHealth(),
       getContext: () => grindPilotContext(),
       readInventory: () => grindPilotReadInventory(),
+      readCurrentSbcProject: () => grindPilotReadCurrentSbcProject(),
+      findSbcTarget: (query) => grindPilotFindSbcTarget(query),
+      readLegacySequences: async () =>
+        grindPilotResult("verified", await getSequencePlans()),
       solveCurrentSbc: (options) => grindPilotSolveCurrent(options),
+      organizeIntoSbc: (intent) => grindPilotOrganizeIntoSbc(intent),
+      readSbcChallengeState: (query) => grindPilotReadSbcChallengeState(query),
       submitCurrentSbc: (intent) => grindPilotSubmitCurrent(intent),
       listOwnedRewardPacks: () => grindPilotListOwnedPacks(),
       claimCurrentReward: (intent) => grindPilotClaimReward(intent),
       openOwnedRewardPack: (intent) => grindPilotOpenRewardPack(intent),
       resolveUnassigned: (policy) => grindPilotResolveUnassigned(policy),
-      readPlayerPick: async () => {
-        const items = await getUnassignedItems({ refresh: true, failClosed: true });
-        const picks = items.filter((item) => item?.isPlayerPickItem?.());
-        return grindPilotResult("verified", {
-          pending: picks.length > 0,
-          pickItemIds: picks.map((item) => String(item.id)),
-          requiresUser: picks.length > 0,
-        });
-      },
-      selectPlayerPick: () =>
-        grindPilotResult("unavailable", null, "Automatic player-pick controller is not verified; pause for user"),
+      readPlayerPick: (query) => grindPilotReadPlayerPick(query),
+      selectPlayerPick: (intent) => grindPilotSelectPlayerPick(intent),
     }),
     openSequenceSolver: () => openSequenceSolveOverlay(),
     openSequencePlanner: () => openSequenceSolveOverlay(),
@@ -31225,8 +32201,11 @@
       const solverOptions = {
         ...options,
         excludeActiveSquad: options?.excludeActiveSquad ?? true,
+        strictExcludeActiveSquad: options?.strictExcludeActiveSquad ?? true,
         allowedActiveSquadDefIds:
-          options?.allowedActiveSquadDefIds ?? currentChallengeDefIds,
+          options?.strictExcludeActiveSquad === false
+            ? options?.allowedActiveSquadDefIds ?? currentChallengeDefIds
+            : [],
       };
       const preferWarmSnapshot = options?.preferWarmSnapshot === true;
       const forcePlayersFetch =
@@ -31389,7 +32368,11 @@
       const { filteredPlayers, poolFilters } = filterPlayersBySolverPoolSettings(
         allPlayers,
         solverSettings,
-        { requiredIds },
+        {
+          requiredIds,
+          requirementsNormalized:
+            payload?.openChallenge?.requirementsNormalized ?? [],
+        },
       );
 
       return {

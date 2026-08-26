@@ -59,7 +59,9 @@ export const planUnassignedResolution = (snapshot, policy = {}) => {
     "untradeableWhenStorageUnavailable",
   );
 
-  const capacity = snapshot.storageCapacity;
+  const capacity = snapshot.storageCapacity == null
+    ? null
+    : Math.min(100, Math.max(0, Math.trunc(Number(snapshot.storageCapacity) || 0)));
   let storageFreeSlots =
     capacity == null
       ? 0
@@ -82,6 +84,17 @@ export const planUnassignedResolution = (snapshot, policy = {}) => {
     );
 
     if (!duplicate) {
+      if (item.isMovable === false) {
+        actions.push(
+          createAction(
+            item,
+            INVENTORY_RESOLUTION_ACTIONS.PAUSE,
+            "unassigned_item_not_movable",
+          ),
+        );
+        paused = true;
+        continue;
+      }
       actions.push(
         createAction(
           item,
@@ -102,10 +115,14 @@ export const planUnassignedResolution = (snapshot, policy = {}) => {
         ),
       );
       paused = true;
-      break;
+      continue;
     }
 
-    if (effectivePolicy.preferSbcStorage && storageFreeSlots > 0) {
+    if (
+      effectivePolicy.preferSbcStorage &&
+      storageFreeSlots > 0 &&
+      item.isStorable !== false
+    ) {
       actions.push(
         createAction(
           item,
@@ -132,7 +149,7 @@ export const planUnassignedResolution = (snapshot, policy = {}) => {
     );
     if (fallback === INVENTORY_RESOLUTION_ACTIONS.PAUSE) {
       paused = true;
-      break;
+      continue;
     }
   }
 

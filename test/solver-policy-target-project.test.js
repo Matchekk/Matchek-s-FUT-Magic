@@ -55,7 +55,11 @@ test("active arbitrary target projects contribute rating and special reserves", 
       isSpecial: true,
     },
   ]);
-  assert.deepEqual(new Set(analysis.protectedItemIds), new Set(["89", "94", "t1", "t2"]));
+  assert.deepEqual(new Set(analysis.protectedItemIds), new Set(["94"]));
+  const softPolicy = policy.toSolverConservationPolicy();
+  assert.equal(softPolicy.minimumReserveByRating[89], 1);
+  assert.equal(softPolicy.specialReserveByCardType.totw, 2);
+  assert.ok(softPolicy.projectRatingDemand.some((entry) => entry.rating === 90));
 });
 
 test("project CRUD is immutable to callers", () => {

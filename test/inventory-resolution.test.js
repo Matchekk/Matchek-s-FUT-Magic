@@ -107,6 +107,43 @@ test("a server-marked duplicate without version identity pauses instead of guess
   assert.equal(plan.actions[0].reason, "duplicate_identity_ambiguous");
 });
 
+test("EA-unstorable duplicate goes to organizer policy even with a free slot", () => {
+  const inventory = new InventoryService();
+  inventory.synchronize({
+    club: [item("club-copy", "version-1")],
+    storage: [],
+    unassigned: [item("new-copy", "version-1", { isStorable: false })],
+    storageCapacity: 1,
+  });
+
+  const plan = inventory.planUnassignedResolution();
+  assert.equal(plan.actions[0].type, ACTION.PAUSE);
+  assert.equal(plan.actions[0].reason, "untradeable_duplicate_storage_unavailable");
+  assert.equal(plan.requiresUserAction, true);
+});
+
+test("a paused duplicate does not prevent later safe cards from being planned", () => {
+  const inventory = new InventoryService();
+  inventory.synchronize({
+    club: [item("club-copy", "version-1")], storage: [item("stored", "version-2")],
+    unassigned: [item("blocked", "version-1"), item("safe-a", "version-3"), item("safe-b", "version-4")], storageCapacity: 1,
+  });
+  const plan = inventory.planUnassignedResolution();
+  assert.deepEqual(plan.actions.map(({ itemId, type }) => [itemId, type]), [
+    ["blocked", ACTION.PAUSE], ["safe-a", ACTION.SEND_TO_CLUB], ["safe-b", ACTION.SEND_TO_CLUB],
+  ]);
+});
+
+test("FC 26 SBC Storage never plans beyond its authoritative 100 slots", () => {
+  const inventory = new InventoryService();
+  inventory.synchronize({
+    club: [item("club-copy", "version-1")],
+    storage: Array.from({ length: 100 }, (_, index) => item(`stored-${index}`, `stored-version-${index}`)),
+    unassigned: [item("blocked", "version-1")], storageCapacity: 120,
+  });
+  assert.equal(inventory.planUnassignedResolution().actions[0].type, ACTION.PAUSE);
+});
+
 test("resolution policy rejects any implicit quicksell fallback", () => {
   const inventory = new InventoryService();
   inventory.synchronize({ club: [], storage: [], unassigned: [] });
