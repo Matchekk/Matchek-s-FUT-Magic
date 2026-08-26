@@ -76,7 +76,7 @@ const normalizeRetryPolicy = (value) => {
 const normalizeNestedSteps = (value, context, path) => {
   if (!Array.isArray(value)) return [];
   return value.map((step, index) =>
-    normalizeStep(step, context, `${path}[${index}]`, context.depth + 1),
+    normalizeStep(step, context, `${path}[${index}]`, context.depth),
   );
 };
 
