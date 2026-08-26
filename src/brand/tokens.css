@@ -1,0 +1,110 @@
+:root {
+  color-scheme: dark;
+
+  /* Color roles. Components consume roles, never board swatches directly. */
+  --fm-bg-primary: #0b1020;
+  --fm-bg-secondary: #121a2e;
+  --fm-bg-elevated: #1e2b4d;
+  --fm-bg-overlay: rgb(11 16 32 / 92%);
+  --fm-bg-scrim: rgb(3 7 18 / 64%);
+
+  --fm-text-primary: #e6edf5;
+  --fm-text-secondary: #a7b2c9;
+  --fm-text-muted: #7f8ba4;
+  --fm-text-on-accent: #07121b;
+  --fm-text-pro: #b8adff;
+
+  --fm-accent-primary: #00e6ff;
+  --fm-accent-secondary: #26ffc2;
+  --fm-accent-violet: #7b61ff;
+  --fm-positive: #26ffc2;
+  --fm-warning: #ffca67;
+  --fm-destructive: #ff7185;
+
+  --fm-border-subtle: rgb(167 178 201 / 16%);
+  --fm-border-strong: rgb(0 230 255 / 42%);
+  --fm-focus-ring: #6aeeff;
+
+  /* Spacing follows a 4 px base with a compact extension-panel rhythm. */
+  --fm-space-0: 0;
+  --fm-space-1: 0.25rem;
+  --fm-space-2: 0.5rem;
+  --fm-space-3: 0.75rem;
+  --fm-space-4: 1rem;
+  --fm-space-5: 1.25rem;
+  --fm-space-6: 1.5rem;
+  --fm-space-8: 2rem;
+  --fm-space-10: 2.5rem;
+  --fm-space-12: 3rem;
+
+  --fm-radius-sm: 0.5rem;
+  --fm-radius-md: 0.75rem;
+  --fm-radius-lg: 1rem;
+  --fm-radius-pill: 999px;
+
+  --fm-font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  --fm-type-display-size: 2rem;
+  --fm-type-display-line: 1.08;
+  --fm-type-display-tracking: -0.025em;
+  --fm-type-title-size: 1.375rem;
+  --fm-type-title-line: 1.18;
+  --fm-type-title-tracking: -0.015em;
+  --fm-type-section-size: 1rem;
+  --fm-type-section-line: 1.3;
+  --fm-type-body-size: 0.9375rem;
+  --fm-type-body-line: 1.5;
+  --fm-type-label-size: 0.8125rem;
+  --fm-type-label-line: 1.35;
+  --fm-type-caption-size: 0.75rem;
+  --fm-type-caption-line: 1.4;
+  --fm-type-caption-tracking: 0.012em;
+  --fm-type-metric-size: 1.5rem;
+  --fm-type-metric-line: 1.1;
+  --fm-weight-regular: 400;
+  --fm-weight-medium: 500;
+  --fm-weight-semibold: 600;
+  --fm-weight-bold: 700;
+
+  --fm-shadow-low: 0 0.25rem 0.75rem rgb(2 6 18 / 24%);
+  --fm-shadow-high: 0 1rem 2.5rem rgb(2 6 18 / 42%);
+
+  /* Critically damped-feeling defaults; no decorative bounce. */
+  --fm-motion-instant: 90ms;
+  --fm-motion-fast: 160ms;
+  --fm-motion-standard: 240ms;
+  --fm-motion-deliberate: 360ms;
+  --fm-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --fm-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --fm-layer-base: 0;
+  --fm-layer-content: 10;
+  --fm-layer-sticky: 20;
+  --fm-layer-hud: 40;
+  --fm-layer-sheet: 60;
+  --fm-layer-modal: 80;
+  --fm-layer-toast: 100;
+
+  --fm-control-min-size: 2.75rem;
+  --fm-panel-inline: clamp(0.875rem, 4vw, 1.25rem);
+  --fm-material-blur: 18px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --fm-motion-instant: 0ms;
+    --fm-motion-fast: 80ms;
+    --fm-motion-standard: 120ms;
+    --fm-motion-deliberate: 160ms;
+    --fm-ease-out: linear;
+    --fm-ease-in-out: linear;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root {
+    --fm-bg-overlay: #121a2e;
+    --fm-border-subtle: rgb(230 237 245 / 32%);
+    --fm-material-blur: 0px;
+  }
+}

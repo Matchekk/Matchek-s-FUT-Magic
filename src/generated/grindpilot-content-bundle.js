@@ -1,3 +1,4 @@
+"use strict";
 (() => {
   // src/core/activity-logger.js
   var REDACTED = "[REDACTED]";
@@ -31,12 +32,15 @@
     return SECRET_KEYS.has(normalized) || normalized.endsWith("accesstoken") || normalized.endsWith("refreshtoken") || normalized.endsWith("sessiontoken") || normalized.endsWith("token") || normalized.endsWith("apikey") || normalized.endsWith("apisecret");
   };
   var redactString = (value, maxLength = 4096) => {
-    const redacted = value.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`).replace(
+    const redacted = value.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`).replace(/\bBasic\s+[A-Za-z0-9+/=]+/gi, `Basic ${REDACTED}`).replace(
       /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g,
       REDACTED
     ).replace(
-      /([?&](?:access_token|refresh_token|token|session_id|sid|api_key)=)[^&#\s]*/gi,
+      /([?&](?:access_token|refresh_token|id_token|token|session|session_id|sid|x-ut-sid|api_key|code|password|secret)=)[^&#\s]*/gi,
       `$1${encodeURIComponent(REDACTED)}`
+    ).replace(
+      /\b((?:access_token|refresh_token|id_token|token|session|session_id|sid|x-ut-sid|api_key|password|secret|cookie)\s*[:=]\s*)[^\s,;]+/gi,
+      `$1${REDACTED}`
     );
     return redacted.length > maxLength ? `${redacted.slice(0, maxLength)}…${TRUNCATED}` : redacted;
   };
@@ -287,1384 +291,79 @@
     return JSON.stringify(summarizeRunAnalytics(run, options), null, 2);
   }
 
-  // src/dev/limits.js
-  var DEV_LIMITS = Object.freeze({
-    maxClasses: 500,
-    maxMethodsPerClass: 192,
-    maxCapabilities: 128,
-    maxSnapshots: 5,
-    maxSnapshotBytes: 256 * 1024,
-    maxSnapshotHistoryBytes: 768 * 1024,
-    maxDiffItems: 750,
-    maxRoutes: 100,
-    maxNetworkRecords: 200,
-    maxLogs: 250,
-    maxCollectionItems: 250,
-    maxObjectKeys: 100,
-    maxDepth: 6,
-    maxStringLength: 1e3,
-    maxExportBytes: 512 * 1024
+  // src/application/immutable.js
+  var cloneAndFreeze = (value) => {
+    const clone4 = value == null ? value : structuredClone(value);
+    const freeze = (entry) => {
+      if (!entry || typeof entry !== "object" || Object.isFrozen(entry)) return entry;
+      Object.values(entry).forEach(freeze);
+      return Object.freeze(entry);
+    };
+    return freeze(clone4);
+  };
+  var stableStringify = (value) => JSON.stringify(value, (_key, entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+    return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]));
   });
-  var MIN_LIMIT = 1;
-  var MAX_LIMIT = 1e7;
-  var BYTE_LIMIT_KEYS = /* @__PURE__ */ new Set([
-    "maxSnapshotBytes",
-    "maxSnapshotHistoryBytes",
-    "maxExportBytes"
-  ]);
-  function clampLimit(value, fallback, minimum = MIN_LIMIT) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) return fallback;
-    return Math.min(MAX_LIMIT, Math.max(minimum, Math.floor(numeric)));
-  }
-  function resolveDevLimits(overrides = {}) {
-    const resolved = {};
-    for (const [key, fallback] of Object.entries(DEV_LIMITS)) {
-      resolved[key] = clampLimit(
-        overrides?.[key],
-        fallback,
-        BYTE_LIMIT_KEYS.has(key) ? 1024 : MIN_LIMIT
-      );
+  var stableFingerprint = (value) => {
+    const text = stableStringify(value);
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
     }
-    return Object.freeze(resolved);
-  }
-  function utf8ByteLength(value) {
-    return new TextEncoder().encode(String(value)).byteLength;
-  }
-  function jsonByteLength(value) {
-    try {
-      return utf8ByteLength(JSON.stringify(value));
-    } catch {
-      return Number.POSITIVE_INFINITY;
-    }
-  }
+    return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  };
 
-  // src/dev/redaction.js
-  var REDACTED2 = "[REDACTED]";
-  var OMITTED_ACCESSOR = "[Accessor omitted]";
-  var SECRET_KEY_PARTS = Object.freeze([
-    "authorization",
-    "accesstoken",
-    "refreshtoken",
-    "idtoken",
-    "authtoken",
-    "sessiontoken",
-    "sessionid",
-    "password",
-    "passwd",
-    "clientsecret",
-    "apikey",
-    "apiSecret",
-    "cookie",
-    "setcookie",
-    "csrf",
-    "xsrf"
-  ]);
-  function normalizeKey(key) {
-    return String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
-  }
-  function isSensitiveKey(key) {
-    const normalized = normalizeKey(key);
-    if ([
-      "auth",
-      "credential",
-      "credentials",
-      "session",
-      "sid",
-      "token",
-      "secret",
-      "xutsid"
-    ].includes(normalized) || normalized.endsWith("token") || normalized.endsWith("secret") || normalized.endsWith("password") || normalized.endsWith("cookie") || normalized.endsWith("sid")) {
-      return true;
-    }
-    return SECRET_KEY_PARTS.some((part) => normalized.includes(part.toLowerCase()));
-  }
-  function truncateDiagnosticString(value, maxLength = DEV_LIMITS.maxStringLength) {
-    const text = String(value);
-    const limit = clampLimit(maxLength, DEV_LIMITS.maxStringLength);
-    if (text.length <= limit) return text;
-    return `${text.slice(0, Math.max(0, limit - 1))}…`;
-  }
-  function redactSecretText(value, maxLength = DEV_LIMITS.maxStringLength) {
-    let text = String(value);
-    text = text.replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, REDACTED2);
-    text = text.replace(
-      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
-      REDACTED2
-    );
-    text = text.replace(
-      /([?&](?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|code|password|secret)=)[^&#\s]*/gi,
-      `$1${REDACTED2}`
-    );
-    text = text.replace(
-      /\b(?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|password|secret)\s*[:=]\s*[^\s,;]+/gi,
-      (match) => `${match.slice(0, Math.max(match.indexOf(":"), match.indexOf("=")) + 1)}${REDACTED2}`
-    );
-    return truncateDiagnosticString(text, maxLength);
-  }
-  function normalizeOptions(options = {}) {
-    return {
-      maxDepth: clampLimit(options.maxDepth, DEV_LIMITS.maxDepth),
-      maxItems: clampLimit(options.maxItems, DEV_LIMITS.maxCollectionItems),
-      maxKeys: clampLimit(options.maxKeys, DEV_LIMITS.maxObjectKeys),
-      maxStringLength: clampLimit(
-        options.maxStringLength,
-        DEV_LIMITS.maxStringLength
-      )
-    };
-  }
-  function sanitizeInternal(value, options, depth, seen) {
-    if (value === null || typeof value === "boolean") return value;
-    if (typeof value === "number") return Number.isFinite(value) ? value : null;
-    if (typeof value === "string") {
-      return redactSecretText(value, options.maxStringLength);
-    }
-    if (typeof value === "bigint") return truncateDiagnosticString(value, options.maxStringLength);
-    if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
-      return void 0;
-    }
-    if (depth >= options.maxDepth) return "[Maximum depth reached]";
-    if (seen.has(value)) return "[Circular]";
-    if (value instanceof Date) {
-      return Number.isNaN(value.getTime()) ? null : value.toISOString();
-    }
-    if (value instanceof Error) {
-      return {
-        name: truncateDiagnosticString(value.name || "Error", 100),
-        message: redactSecretText(value.message || "", options.maxStringLength)
-      };
-    }
-    seen.add(value);
-    try {
-      if (Array.isArray(value)) {
-        const result2 = [];
-        for (const entry of value.slice(0, options.maxItems)) {
-          const sanitized = sanitizeInternal(entry, options, depth + 1, seen);
-          if (sanitized !== void 0) result2.push(sanitized);
-        }
-        return result2;
-      }
-      let descriptors;
-      try {
-        descriptors = Object.getOwnPropertyDescriptors(value);
-      } catch {
-        return "[Unreadable object]";
-      }
-      const result = {};
-      const keys = Object.keys(descriptors).sort().slice(0, options.maxKeys);
-      for (const key of keys) {
-        const safeKey = truncateDiagnosticString(key, 200);
-        if (isSensitiveKey(key)) {
-          result[safeKey] = REDACTED2;
-          continue;
-        }
-        const descriptor = descriptors[key];
-        if (!("value" in descriptor)) {
-          result[safeKey] = OMITTED_ACCESSOR;
-          continue;
-        }
-        const sanitized = sanitizeInternal(
-          descriptor.value,
-          options,
-          depth + 1,
-          seen
-        );
-        if (sanitized !== void 0) result[safeKey] = sanitized;
-      }
-      return result;
-    } finally {
-      seen.delete(value);
-    }
-  }
-  function sanitizeDiagnosticValue(value, options = {}) {
-    return sanitizeInternal(value, normalizeOptions(options), 0, /* @__PURE__ */ new WeakSet());
-  }
-
-  // src/dev/class-discovery.js
-  var UT_CLASS_PATTERN = /^UT[A-Z][A-Za-z0-9_$]*$/;
-  var STATIC_IGNORES = /* @__PURE__ */ new Set([
-    "arguments",
-    "caller",
-    "length",
-    "name",
-    "prototype"
-  ]);
-  function safeOwnPropertyNames(value) {
-    try {
-      return Object.getOwnPropertyNames(value);
-    } catch {
-      return [];
-    }
-  }
-  function safeDescriptor(value, key) {
-    try {
-      return Object.getOwnPropertyDescriptor(value, key);
-    } catch {
-      return void 0;
-    }
-  }
-  function describeMembers(target, ignoredNames, maxItems) {
-    if (!target || typeof target !== "object" && typeof target !== "function") {
-      return [];
-    }
-    const members = [];
-    for (const name of safeOwnPropertyNames(target).sort()) {
-      if (ignoredNames.has(name)) continue;
-      const descriptor = safeDescriptor(target, name);
-      if (!descriptor) continue;
-      if (typeof descriptor.value === "function") {
-        members.push({
-          name: truncateDiagnosticString(name, 160),
-          kind: "method",
-          arity: Math.max(0, Math.floor(descriptor.value.length || 0))
-        });
-      } else if (typeof descriptor.get === "function" || typeof descriptor.set === "function") {
-        members.push({
-          name: truncateDiagnosticString(name, 160),
-          kind: "accessor",
-          getter: typeof descriptor.get === "function",
-          setter: typeof descriptor.set === "function"
-        });
-      }
-      if (members.length >= maxItems) break;
-    }
-    return members;
-  }
-  function getDataDescriptorValue(target, key) {
-    const descriptor = safeDescriptor(target, key);
-    if (!descriptor || !("value" in descriptor)) {
-      return { ok: false, accessor: !!descriptor };
-    }
-    return { ok: true, value: descriptor.value };
-  }
-  function discoverUTClasses(root = globalThis, options = {}) {
-    const limits = resolveDevLimits(options);
-    const matchingNames = safeOwnPropertyNames(root).filter((name) => UT_CLASS_PATTERN.test(name)).sort();
-    const classes = [];
-    for (const name of matchingNames.slice(0, limits.maxClasses)) {
-      const rootValue = getDataDescriptorValue(root, name);
-      if (!rootValue.ok || typeof rootValue.value !== "function") continue;
-      const constructor = rootValue.value;
-      const prototypeValue = getDataDescriptorValue(constructor, "prototype");
-      classes.push({
-        name,
-        prototypeMembers: prototypeValue.ok ? describeMembers(
-          prototypeValue.value,
-          /* @__PURE__ */ new Set(["constructor"]),
-          limits.maxMethodsPerClass
-        ) : [],
-        staticMembers: describeMembers(
-          constructor,
-          STATIC_IGNORES,
-          limits.maxMethodsPerClass
-        )
-      });
-    }
-    return {
-      classes,
-      totalMatchingGlobals: matchingNames.length,
-      truncated: matchingNames.length > limits.maxClasses
-    };
-  }
-  function normalizeCapabilityPath(path) {
-    const parts = Array.isArray(path) ? path : String(path || "").split(".");
-    return parts.map((part) => String(part).trim()).filter(Boolean).slice(0, 16);
-  }
-  function inspectPath(root, path) {
-    let current = root;
-    for (const segment of path) {
-      if (current === null || typeof current !== "object" && typeof current !== "function") {
-        return { available: false, reason: "parent_missing", valueType: "undefined" };
-      }
-      const descriptor = safeDescriptor(current, segment);
-      if (!descriptor) {
-        return { available: false, reason: "missing", valueType: "undefined" };
-      }
-      if (!("value" in descriptor)) {
-        return { available: false, reason: "accessor_blocked", valueType: "accessor" };
-      }
-      current = descriptor.value;
-    }
-    return { available: true, reason: null, valueType: typeof current };
-  }
-  function discoverCapabilities(root = globalThis, definitions = [], options = {}) {
-    const limits = resolveDevLimits(options);
-    const normalizedDefinitions = Array.isArray(definitions) ? definitions.slice(0, limits.maxCapabilities) : [];
-    return normalizedDefinitions.map((definition, index) => {
-      const path = normalizeCapabilityPath(definition?.path);
-      const id = truncateDiagnosticString(
-        definition?.id || path.join(".") || `capability-${index + 1}`,
-        160
-      );
-      if (path.length === 0) {
-        return { id, path: [], available: false, reason: "invalid_path", valueType: "undefined" };
-      }
-      const inspected = inspectPath(root, path);
-      const expectedType = definition?.expectedType ? truncateDiagnosticString(definition.expectedType, 40) : null;
-      const matchesExpectedType = !expectedType || inspected.available && inspected.valueType === expectedType;
-      return {
-        id,
-        path,
-        available: inspected.available && matchesExpectedType,
-        reason: matchesExpectedType ? inspected.reason : "type_mismatch",
-        valueType: inspected.valueType,
-        expectedType
-      };
-    }).sort((a, b) => a.id.localeCompare(b.id));
-  }
-  var DEFAULT_DISCOVERY_LIMITS = Object.freeze({
-    maxClasses: DEV_LIMITS.maxClasses,
-    maxMethodsPerClass: DEV_LIMITS.maxMethodsPerClass,
-    maxCapabilities: DEV_LIMITS.maxCapabilities
+  // src/application/capability-registry.js
+  var CapabilityState = Object.freeze({
+    AVAILABLE: "available",
+    DEGRADED: "degraded",
+    UNAVAILABLE: "unavailable",
+    UNVERIFIED: "unverified"
   });
-
-  // src/dev/metadata.js
-  var ROUTE_TYPES = /* @__PURE__ */ new Set([
-    "adapter",
-    "hashchange",
-    "navigation",
-    "popstate",
-    "pushState",
-    "replaceState"
-  ]);
-  function parseHttpUrl(value, baseUrl) {
-    try {
-      const raw = String(value || "");
-      const isAbsolute = /^[a-z][a-z0-9+.-]*:/i.test(raw);
-      if (!isAbsolute && !baseUrl) return null;
-      const url = new URL(raw, baseUrl);
-      if (!/^https?:$/.test(url.protocol) || url.username || url.password) return null;
-      return url;
-    } catch {
-      return null;
+  var validateId = (id) => {
+    const value = String(id || "").trim();
+    if (!/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/.test(value)) {
+      throw new TypeError(`Invalid capability id: ${value || "missing"}`);
     }
-  }
-  function safePathname(url) {
-    const decoded = (() => {
-      try {
-        return decodeURIComponent(url.pathname);
-      } catch {
-        return url.pathname;
-      }
-    })();
-    return redactSecretText(decoded || "/", 500);
-  }
-  function sanitizeUrl(value, options = {}) {
-    let url;
-    if (value && typeof value === "object" && typeof value.origin === "string" && typeof value.pathname === "string") {
-      url = parseHttpUrl(value.origin);
-      if (url) url.pathname = value.pathname;
-    } else {
-      url = parseHttpUrl(value, options.baseUrl);
-    }
-    if (!url) return null;
-    return {
-      origin: url.origin,
-      pathname: safePathname(url)
-    };
-  }
-  function sanitizeRouteMetadata(input = {}, options = {}) {
-    const from = sanitizeUrl(input.from, options);
-    const to = sanitizeUrl(input.to, options);
-    if (!from && !to) return null;
-    const rawType = String(input.type || "navigation");
-    return {
-      timestamp: Number.isFinite(Number(input.timestamp)) ? Math.max(0, Math.floor(Number(input.timestamp))) : null,
-      type: ROUTE_TYPES.has(rawType) ? rawType : "navigation",
-      from,
-      to,
-      source: redactSecretText(input.source || "webapp", 80)
-    };
-  }
-  function normalizeAllowedOrigins(values) {
-    const origins = /* @__PURE__ */ new Set();
-    for (const value of Array.isArray(values) ? values : []) {
-      const parsed = parseHttpUrl(value);
-      if (parsed) origins.add(parsed.origin);
-    }
-    return origins;
-  }
-  function finiteInteger(value, minimum, maximum, fallback = null) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) return fallback;
-    return Math.min(maximum, Math.max(minimum, Math.floor(numeric)));
-  }
-  function sanitizeNetworkMetadata(input = {}, options = {}) {
-    const allowedOrigins = normalizeAllowedOrigins(options.allowedOrigins);
-    if (allowedOrigins.size === 0) return null;
-    let url;
-    if (typeof input.origin === "string" && typeof input.pathname === "string") {
-      url = parseHttpUrl(input.origin);
-      if (url) url.pathname = input.pathname;
-    } else {
-      url = parseHttpUrl(input.url || input.endpoint, options.baseUrl);
-    }
-    if (!url || !allowedOrigins.has(url.origin)) return null;
-    const rawMethod = String(input.method || "GET").toUpperCase();
-    const method = /^[A-Z]{1,12}$/.test(rawMethod) ? rawMethod : "OTHER";
-    const status = finiteInteger(input.status, 0, 599, 0);
-    const durationMs = Number(input.durationMs);
-    const sizeBytes = Number(input.sizeBytes ?? input.size);
-    return {
-      timestamp: finiteInteger(input.timestamp ?? input.ts, 0, Number.MAX_SAFE_INTEGER),
-      requestId: redactSecretText(input.requestId ?? input.id ?? "", 100),
-      origin: url.origin,
-      pathname: safePathname(url),
-      method,
-      status,
-      ok: typeof input.ok === "boolean" ? input.ok : status >= 200 && status < 400,
-      durationMs: Number.isFinite(durationMs) ? Math.min(6e5, Math.max(0, Math.round(durationMs * 100) / 100)) : null,
-      sizeBytes: Number.isFinite(sizeBytes) ? Math.min(1e8, Math.max(0, Math.floor(sizeBytes))) : null,
-      transport: ["adapter", "fetch", "xhr"].includes(input.transport) ? input.transport : "adapter",
-      errorCode: input.errorCode ? redactSecretText(input.errorCode, 100) : null
-    };
-  }
-  function sanitizeRouteBatch(records, options = {}) {
-    const limit = clampLimit(options.maxItems, DEV_LIMITS.maxRoutes);
-    return (Array.isArray(records) ? records : []).slice(-limit).map((record) => sanitizeRouteMetadata(record, options)).filter(Boolean);
-  }
-  function sanitizeNetworkBatch(records, options = {}) {
-    const limit = clampLimit(options.maxItems, DEV_LIMITS.maxNetworkRecords);
-    return (Array.isArray(records) ? records : []).slice(-limit).map((record) => sanitizeNetworkMetadata(record, options)).filter(Boolean);
-  }
-
-  // src/dev/diagnostics-export.js
-  function sanitizeLogs(logs, limits) {
-    return (Array.isArray(logs) ? logs : []).slice(-limits.maxLogs).map(
-      (entry) => sanitizeDiagnosticValue(entry, {
-        maxDepth: 5,
-        maxItems: 50,
-        maxKeys: 50,
-        maxStringLength: 750
-      })
-    );
-  }
-  function trimExportToLimit(bundle, maxBytes) {
-    const trimOrder = [
-      bundle.network,
-      bundle.navigation,
-      bundle.logs,
-      bundle.healthChecks
-    ];
-    let changed = false;
-    for (const collection of trimOrder) {
-      while (jsonByteLength(bundle) > maxBytes && collection.length > 0) {
-        collection.shift();
-        changed = true;
-      }
-    }
-    while (jsonByteLength(bundle) > maxBytes && Array.isArray(bundle.latestSnapshot?.classes) && bundle.latestSnapshot.classes.length > 0) {
-      bundle.latestSnapshot.classes.pop();
-      changed = true;
-    }
-    while (jsonByteLength(bundle) > maxBytes && Array.isArray(bundle.latestSnapshot?.capabilities) && bundle.latestSnapshot.capabilities.length > 0) {
-      bundle.latestSnapshot.capabilities.pop();
-      changed = true;
-    }
-    if (jsonByteLength(bundle) > maxBytes) {
-      bundle.latestSnapshot = null;
-      bundle.snapshotDiff = null;
-      changed = true;
-    }
-    if (jsonByteLength(bundle) > maxBytes) {
-      bundle.developerMode = { enabled: !!bundle.developerMode?.enabled };
-      changed = true;
-    }
-    bundle.truncated = bundle.truncated || changed;
-    return bundle;
-  }
-  function createDiagnosticsExport(input = {}, options = {}) {
-    const limits = resolveDevLimits(options);
-    const bundle = {
-      schemaVersion: 1,
-      product: truncateDiagnosticString(input.product || "GrindPilot FC26", 100),
-      extensionVersion: truncateDiagnosticString(input.extensionVersion || "unknown", 80),
-      generatedAt: Number.isFinite(Number(input.generatedAt)) ? Math.max(0, Math.floor(Number(input.generatedAt))) : 0,
-      developerMode: sanitizeDiagnosticValue(input.developerMode ?? { enabled: false }, {
-        maxDepth: 3,
-        maxItems: 20,
-        maxKeys: 20,
-        maxStringLength: 200
-      }),
-      latestSnapshot: sanitizeDiagnosticValue(input.latestSnapshot ?? null, {
-        maxDepth: limits.maxDepth,
-        maxItems: Math.max(limits.maxClasses, limits.maxMethodsPerClass),
-        maxKeys: limits.maxObjectKeys,
-        maxStringLength: limits.maxStringLength
-      }),
-      snapshotDiff: sanitizeDiagnosticValue(input.snapshotDiff ?? null, {
-        maxDepth: limits.maxDepth,
-        maxItems: limits.maxDiffItems,
-        maxKeys: limits.maxObjectKeys,
-        maxStringLength: limits.maxStringLength
-      }),
-      navigation: sanitizeRouteBatch(input.navigation, {
-        ...options,
-        maxItems: limits.maxRoutes
-      }),
-      network: sanitizeNetworkBatch(input.network, {
-        ...options,
-        maxItems: limits.maxNetworkRecords
-      }),
-      logs: sanitizeLogs(input.logs, limits),
-      healthChecks: sanitizeDiagnosticValue(input.healthChecks ?? [], {
-        maxDepth: 5,
-        maxItems: 100,
-        maxKeys: 50,
-        maxStringLength: 500
-      }),
-      truncated: false
-    };
-    return trimExportToLimit(bundle, limits.maxExportBytes);
-  }
-
-  // src/dev/snapshot.js
-  function finiteTimestamp(value) {
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : 0;
-  }
-  function normalizeMember(member) {
-    if (!member || typeof member !== "object") return null;
-    const kind = member.kind === "accessor" ? "accessor" : "method";
-    const normalized = {
-      name: truncateDiagnosticString(member.name || "unknown", 160),
-      kind
-    };
-    if (kind === "method") {
-      normalized.arity = Number.isFinite(Number(member.arity)) ? Math.max(0, Math.floor(Number(member.arity))) : 0;
-    } else {
-      normalized.getter = !!member.getter;
-      normalized.setter = !!member.setter;
-    }
-    return normalized;
-  }
-  function normalizeMembers(members, limit) {
-    return (Array.isArray(members) ? members : []).slice(0, limit).map(normalizeMember).filter(Boolean).sort((a, b) => `${a.name}:${a.kind}`.localeCompare(`${b.name}:${b.kind}`));
-  }
-  function normalizeClasses(classes, limits) {
-    return (Array.isArray(classes) ? classes : []).slice(0, limits.maxClasses).map((entry) => ({
-      name: truncateDiagnosticString(entry?.name || "unknown", 160),
-      prototypeMembers: normalizeMembers(
-        entry?.prototypeMembers,
-        limits.maxMethodsPerClass
-      ),
-      staticMembers: normalizeMembers(entry?.staticMembers, limits.maxMethodsPerClass)
-    })).sort((a, b) => a.name.localeCompare(b.name));
-  }
-  function normalizeCapabilities(capabilities, limits) {
-    return (Array.isArray(capabilities) ? capabilities : []).slice(0, limits.maxCapabilities).map((entry, index) => ({
-      id: truncateDiagnosticString(entry?.id || `capability-${index + 1}`, 160),
-      path: (Array.isArray(entry?.path) ? entry.path : []).slice(0, 16).map((part) => truncateDiagnosticString(part, 100)),
-      available: !!entry?.available,
-      reason: entry?.reason ? truncateDiagnosticString(entry.reason, 80) : null,
-      valueType: truncateDiagnosticString(entry?.valueType || "undefined", 40),
-      expectedType: entry?.expectedType ? truncateDiagnosticString(entry.expectedType, 40) : null
-    })).sort((a, b) => a.id.localeCompare(b.id));
-  }
-  function trimSnapshotToByteLimit(snapshot, maxBytes) {
-    const result = snapshot;
-    while (jsonByteLength(result) > maxBytes && result.classes.length > 0) {
-      result.classes.pop();
-      result.truncated.classes = true;
-      result.truncated.bytes = true;
-    }
-    while (jsonByteLength(result) > maxBytes && result.capabilities.length > 0) {
-      result.capabilities.pop();
-      result.truncated.capabilities = true;
-      result.truncated.bytes = true;
-    }
-    if (jsonByteLength(result) > maxBytes) {
-      result.bridgeHealth = null;
-      result.selectors = null;
-      result.route = null;
-      result.truncated.bytes = true;
-    }
-    return result;
-  }
-  function createWebAppSnapshot(input = {}, options = {}) {
-    const limits = resolveDevLimits(options);
-    const sourceClasses = Array.isArray(input.classes) ? input.classes : [];
-    const sourceCapabilities = Array.isArray(input.capabilities) ? input.capabilities : [];
-    const snapshot = {
-      schemaVersion: 1,
-      capturedAt: finiteTimestamp(input.capturedAt),
-      extensionVersion: truncateDiagnosticString(input.extensionVersion || "unknown", 80),
-      webAppVersion: truncateDiagnosticString(input.webAppVersion || "unknown", 120),
-      classes: normalizeClasses(sourceClasses, limits),
-      capabilities: normalizeCapabilities(sourceCapabilities, limits),
-      bridgeHealth: sanitizeDiagnosticValue(input.bridgeHealth ?? null, {
-        maxDepth: 4,
-        maxItems: 50,
-        maxKeys: 50,
-        maxStringLength: 500
-      }),
-      selectors: sanitizeDiagnosticValue(input.selectors ?? null, {
-        maxDepth: 3,
-        maxItems: 50,
-        maxKeys: 50,
-        maxStringLength: 300
-      }),
-      route: sanitizeDiagnosticValue(input.route ?? null, {
-        maxDepth: 3,
-        maxItems: 20,
-        maxKeys: 20,
-        maxStringLength: 500
-      }),
-      truncated: {
-        classes: sourceClasses.length > limits.maxClasses,
-        capabilities: sourceCapabilities.length > limits.maxCapabilities,
-        bytes: false
-      }
-    };
-    return trimSnapshotToByteLimit(snapshot, limits.maxSnapshotBytes);
-  }
-  function memberIdentity(member) {
-    if (!member || typeof member !== "object") return null;
-    return member.kind === "accessor" ? `${member.name}:accessor:${member.getter ? 1 : 0}:${member.setter ? 1 : 0}` : `${member.name}:method:${member.arity}`;
-  }
-  function difference(left, right) {
-    const filteredLeft = left.filter(Boolean);
-    const rightSet = new Set(right.filter(Boolean));
-    return filteredLeft.filter((value) => !rightSet.has(value));
-  }
-  function classMap(snapshot) {
-    return new Map(
-      (Array.isArray(snapshot?.classes) ? snapshot.classes : []).map((entry) => [
-        String(entry.name),
-        entry
-      ])
-    );
-  }
-  function capabilityMap(snapshot) {
-    return new Map(
-      (Array.isArray(snapshot?.capabilities) ? snapshot.capabilities : []).map((entry) => [
-        String(entry.id),
-        entry
-      ])
-    );
-  }
-  function comparableCapability(entry) {
-    return JSON.stringify({
-      available: !!entry?.available,
-      reason: entry?.reason ?? null,
-      valueType: entry?.valueType ?? "undefined",
-      expectedType: entry?.expectedType ?? null
-    });
-  }
-  function diffWebAppSnapshots(previous = {}, current = {}, options = {}) {
-    const limits = resolveDevLimits(options);
-    const beforeClasses = classMap(previous);
-    const afterClasses = classMap(current);
-    const allClassNames = [.../* @__PURE__ */ new Set([...beforeClasses.keys(), ...afterClasses.keys()])].sort();
-    const addedClasses = [];
-    const removedClasses = [];
-    const changedClasses = [];
-    for (const name of allClassNames) {
-      const before = beforeClasses.get(name);
-      const after = afterClasses.get(name);
-      if (!before) {
-        addedClasses.push(name);
-        continue;
-      }
-      if (!after) {
-        removedClasses.push(name);
-        continue;
-      }
-      const beforePrototype = (before.prototypeMembers || []).map(memberIdentity);
-      const afterPrototype = (after.prototypeMembers || []).map(memberIdentity);
-      const beforeStatic = (before.staticMembers || []).map(memberIdentity);
-      const afterStatic = (after.staticMembers || []).map(memberIdentity);
-      const changes = {
-        name,
-        prototypeAdded: difference(afterPrototype, beforePrototype),
-        prototypeRemoved: difference(beforePrototype, afterPrototype),
-        staticAdded: difference(afterStatic, beforeStatic),
-        staticRemoved: difference(beforeStatic, afterStatic)
-      };
-      if (changes.prototypeAdded.length || changes.prototypeRemoved.length || changes.staticAdded.length || changes.staticRemoved.length) {
-        changedClasses.push(changes);
-      }
-    }
-    const beforeCapabilities = capabilityMap(previous);
-    const afterCapabilities = capabilityMap(current);
-    const capabilityChanges = [];
-    for (const id of [.../* @__PURE__ */ new Set([...beforeCapabilities.keys(), ...afterCapabilities.keys()])].sort()) {
-      const before = beforeCapabilities.get(id) ?? null;
-      const after = afterCapabilities.get(id) ?? null;
-      if (!before || !after || comparableCapability(before) !== comparableCapability(after)) {
-        capabilityChanges.push({
-          id,
-          before: before ? { available: !!before.available, reason: before.reason ?? null, valueType: before.valueType } : null,
-          after: after ? { available: !!after.available, reason: after.reason ?? null, valueType: after.valueType } : null
-        });
-      }
-    }
-    const totals = {
-      addedClasses: addedClasses.length,
-      removedClasses: removedClasses.length,
-      changedClasses: changedClasses.length,
-      capabilityChanges: capabilityChanges.length
-    };
-    let remaining = limits.maxDiffItems;
-    const take = (values) => {
-      const result2 = values.slice(0, remaining);
-      remaining -= result2.length;
-      return result2;
-    };
-    const result = {
-      schemaVersion: 1,
-      previousCapturedAt: finiteTimestamp(previous?.capturedAt),
-      currentCapturedAt: finiteTimestamp(current?.capturedAt),
-      addedClasses: take(addedClasses),
-      removedClasses: take(removedClasses),
-      changedClasses: take(changedClasses),
-      capabilityChanges: take(capabilityChanges),
-      totals,
-      truncated: totals.addedClasses + totals.removedClasses + totals.changedClasses + totals.capabilityChanges > limits.maxDiffItems
-    };
-    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.changedClasses.length) {
-      result.changedClasses.pop();
-      result.truncated = true;
-    }
-    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.capabilityChanges.length) {
-      result.capabilityChanges.pop();
-      result.truncated = true;
-    }
-    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.addedClasses.length) {
-      result.addedClasses.pop();
-      result.truncated = true;
-    }
-    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.removedClasses.length) {
-      result.removedClasses.pop();
-      result.truncated = true;
-    }
-    return result;
-  }
-  function appendBoundedSnapshot(history, snapshot, options = {}) {
-    const limits = resolveDevLimits(options);
-    const next = [...Array.isArray(history) ? history : [], snapshot].slice(
-      -limits.maxSnapshots
-    );
-    while (next.length > 0 && next.reduce((total, entry) => total + jsonByteLength(entry), 0) > limits.maxSnapshotHistoryBytes) {
-      next.shift();
-    }
-    return next;
-  }
-  var DEFAULT_SNAPSHOT_LIMITS = Object.freeze({
-    maxSnapshots: DEV_LIMITS.maxSnapshots,
-    maxSnapshotBytes: DEV_LIMITS.maxSnapshotBytes,
-    maxSnapshotHistoryBytes: DEV_LIMITS.maxSnapshotHistoryBytes
-  });
-
-  // src/dev/debug-mode.js
-  var DeveloperModeDisabledError = class extends Error {
-    constructor() {
-      super("Developer Mode is disabled");
-      this.name = "DeveloperModeDisabledError";
-      this.code = "DEVELOPER_MODE_DISABLED";
-    }
+    return value;
   };
-  function assertEnabled(enabled) {
-    if (!enabled) throw new DeveloperModeDisabledError();
-  }
-  function createDeveloperMode(options = {}) {
-    const root = options.root ?? globalThis;
-    const limits = resolveDevLimits(options.limits);
-    const capabilityDefinitions = Array.isArray(options.capabilityDefinitions) ? options.capabilityDefinitions : [];
-    const allowedNetworkOrigins = Array.isArray(options.allowedNetworkOrigins) ? [...options.allowedNetworkOrigins] : [];
-    const now = typeof options.now === "function" ? options.now : Date.now;
-    let enabled = false;
-    let snapshots = [];
-    let navigation = [];
-    let network = [];
-    let logs = [];
-    function enable() {
-      enabled = true;
-      return getStatus();
+  var CapabilityRegistry = class {
+    #records = /* @__PURE__ */ new Map();
+    #revision = 0;
+    declare(id, { state = CapabilityState.UNVERIFIED, reason = null, evidence = null, observedAt = Date.now() } = {}) {
+      const capabilityId = validateId(id);
+      if (!Object.values(CapabilityState).includes(state)) throw new TypeError(`Invalid capability state: ${state}`);
+      this.#revision += 1;
+      const record = cloneAndFreeze({ id: capabilityId, state, reason, evidence, observedAt, revision: this.#revision });
+      this.#records.set(capabilityId, record);
+      return record;
     }
-    function disable({ clearEphemeral = true } = {}) {
-      enabled = false;
-      if (clearEphemeral) {
-        navigation = [];
-        network = [];
-        logs = [];
-      }
-      return getStatus();
-    }
-    function getStatus() {
-      return {
-        enabled,
-        instrumentation: "read-only-on-demand",
-        hooksInstalled: false,
-        snapshotCount: snapshots.length,
-        routeCount: navigation.length,
-        networkCount: network.length,
-        logCount: logs.length
-      };
-    }
-    function discover() {
-      assertEnabled(enabled);
-      const classDiscovery = discoverUTClasses(root, limits);
-      return {
-        ...classDiscovery,
-        capabilities: discoverCapabilities(root, capabilityDefinitions, limits)
-      };
-    }
-    function captureSnapshot(details = {}) {
-      assertEnabled(enabled);
-      const discovery = discover();
-      const snapshot = createWebAppSnapshot(
-        {
-          capturedAt: details.capturedAt ?? now(),
-          extensionVersion: options.extensionVersion,
-          webAppVersion: details.webAppVersion ?? options.webAppVersion,
-          classes: discovery.classes,
-          capabilities: discovery.capabilities,
-          bridgeHealth: details.bridgeHealth,
-          selectors: details.selectors,
-          route: details.route
-        },
-        limits
-      );
-      snapshots = appendBoundedSnapshot(snapshots, snapshot, limits);
-      return sanitizeDiagnosticValue(snapshot, {
-        maxDepth: limits.maxDepth,
-        maxItems: Math.max(limits.maxClasses, limits.maxMethodsPerClass),
-        maxKeys: limits.maxObjectKeys,
-        maxStringLength: limits.maxStringLength
+    get(id) {
+      return this.#records.get(validateId(id)) || cloneAndFreeze({
+        id: String(id),
+        state: CapabilityState.UNVERIFIED,
+        reason: "Capability has not been observed",
+        evidence: null,
+        observedAt: null,
+        revision: this.#revision
       });
     }
-    function compareLatestSnapshots() {
-      if (snapshots.length < 2) return null;
-      return diffWebAppSnapshots(
-        snapshots[snapshots.length - 2],
-        snapshots[snapshots.length - 1],
-        limits
-      );
+    isAvailable(id) {
+      return this.get(id).state === CapabilityState.AVAILABLE;
     }
-    function recordRoute(input) {
-      if (!enabled) return false;
-      const sanitized = sanitizeRouteMetadata(input);
-      if (!sanitized) return false;
-      navigation = [...navigation, sanitized].slice(-limits.maxRoutes);
-      return true;
-    }
-    function recordNetwork(input) {
-      if (!enabled) return false;
-      const sanitized = sanitizeNetworkMetadata(input, {
-        allowedOrigins: allowedNetworkOrigins
-      });
-      if (!sanitized) return false;
-      network = [...network, sanitized].slice(-limits.maxNetworkRecords);
-      return true;
-    }
-    function recordLog(input) {
-      if (!enabled) return false;
-      const sanitized = sanitizeDiagnosticValue(input, {
-        maxDepth: 5,
-        maxItems: 50,
-        maxKeys: 50,
-        maxStringLength: 750
-      });
-      logs = [...logs, sanitized].slice(-limits.maxLogs);
-      return true;
-    }
-    function exportDiagnostics(details = {}) {
-      return createDiagnosticsExport(
-        {
-          ...details,
-          generatedAt: details.generatedAt ?? now(),
-          extensionVersion: options.extensionVersion,
-          developerMode: getStatus(),
-          latestSnapshot: snapshots.at(-1) ?? null,
-          snapshotDiff: compareLatestSnapshots(),
-          navigation,
-          network,
-          logs
-        },
-        { ...limits, allowedOrigins: allowedNetworkOrigins }
-      );
-    }
-    function clearSnapshots() {
-      snapshots = [];
-    }
-    return Object.freeze({
-      enable,
-      disable,
-      isEnabled: () => enabled,
-      getStatus,
-      discover,
-      captureSnapshot,
-      compareLatestSnapshots,
-      recordRoute,
-      recordNetwork,
-      recordLog,
-      exportDiagnostics,
-      clearSnapshots
-    });
-  }
-
-  // src/ea/controller-adapter.js
-  var requireBridge = () => {
-    const bridge = globalThis.window?.eaData?.grindPilot;
-    if (!bridge) {
-      const error = new Error("GrindPilot EA controller bridge is unavailable");
-      error.code = "EA_BRIDGE_UNAVAILABLE";
-      throw error;
-    }
-    return bridge;
-  };
-  var verifiedValue = (result, operation) => {
-    if (result?.status === "verified") return result.value;
-    const error = new Error(result?.reason || `${operation} was not verified`);
-    error.code = result?.status === "ambiguous" ? "EA_STATE_AMBIGUOUS" : result?.status === "not_applied" ? "EA_OPERATION_NOT_APPLIED" : "EA_OPERATION_UNAVAILABLE";
-    error.evidence = result?.evidence ?? null;
-    error.result = result ?? null;
-    if (result?.status === "not_applied") {
-      error.notApplied = true;
-      error.safeToRetry = true;
-    }
-    throw error;
-  };
-  var ControllerAdapter = class {
-    async health() {
-      return verifiedValue(await requireBridge().getHealth(), "Bridge health check");
-    }
-    async getContext() {
-      return requireBridge().getContext();
-    }
-    async readInventory() {
-      return verifiedValue(await requireBridge().readInventory(), "Inventory refresh");
-    }
-    async solveCurrentSbc(options = {}) {
-      return verifiedValue(
-        await requireBridge().solveCurrentSbc(options),
-        "SBC solve"
-      );
-    }
-    async submitCurrentSbc(intent = {}) {
-      return verifiedValue(
-        await requireBridge().submitCurrentSbc(intent),
-        "SBC submission"
-      );
-    }
-    async listOwnedPacks() {
-      const packs = verifiedValue(
-        await requireBridge().listOwnedRewardPacks(),
-        "Owned-pack listing"
-      );
-      return packs.map((pack) => ({ ...pack, packId: String(pack.id), owned: true }));
-    }
-    async claimReward(rewardRef = {}, beforePacks = null) {
-      const value = verifiedValue(
-        await requireBridge().claimCurrentReward({
-          ...rewardRef,
-          beforePacks: Array.isArray(beforePacks) ? beforePacks.map((pack) => ({
-            ...pack,
-            id: String(pack?.packId ?? pack?.id ?? "")
-          })) : null
-        }),
-        "Reward claim"
-      );
-      return {
-        claimed: true,
-        success: true,
-        packId: String(value?.pack?.id ?? ""),
-        rewardRef
-      };
-    }
-    async openOwnedPack({ packId: packId2 }) {
-      const value = verifiedValue(
-        await requireBridge().openOwnedRewardPack({ packId: packId2 }),
-        "Reward-pack opening"
-      );
-      return {
-        opened: true,
-        packId: String(value.packId),
-        items: (value.itemIds ?? []).map((itemId) => ({ itemId }))
-      };
-    }
-    async resolveUnassigned(policy = {}) {
-      return verifiedValue(
-        await requireBridge().resolveUnassigned(policy),
-        "Unassigned resolution"
-      );
-    }
-    async getPlayerPick(pickId = null) {
-      const value = verifiedValue(
-        await requireBridge().readPlayerPick({ pickId }),
-        "Player-pick inspection"
-      );
-      return {
-        ...value,
-        id: value.pickIdentity ?? null,
-        pickId: value.pickIdentity ?? null,
-        offers: Array.isArray(value.offers) ? value.offers : []
-      };
-    }
-    async selectPlayerPick(intent) {
-      const value = verifiedValue(
-        await requireBridge().selectPlayerPick(intent),
-        "Player-pick selection"
-      );
-      return { success: true, ...value };
-    }
-    async organizeIntoSbc(intent = {}) {
-      return verifiedValue(
-        await requireBridge().organizeIntoSbc(intent),
-        "Organizer SBC submission"
-      );
-    }
-    async readSbcChallengeState(query = {}) {
-      return verifiedValue(
-        await requireBridge().readSbcChallengeState(query),
-        "SBC challenge state read"
-      );
-    }
-    async getCapabilityHealth() {
-      return verifiedValue(
-        await requireBridge().getCapabilityHealth(),
-        "Capability health read"
-      );
-    }
-    async readCurrentSbcProject() {
-      return verifiedValue(
-        await requireBridge().readCurrentSbcProject(),
-        "Current SBC project read"
-      );
-    }
-    async findSbcTarget(query = {}) {
-      return verifiedValue(
-        await requireBridge().findSbcTarget(query),
-        "SBC target lookup"
-      );
-    }
-    async readLegacySequences() {
-      return verifiedValue(
-        await requireBridge().readLegacySequences(),
-        "Legacy Sequence read"
-      );
-    }
-  };
-
-  // src/ea/page-storage-area.js
-  var COMMAND_TYPE = "GRINDPILOT_STATE_COMMAND_V2";
-  var DEFAULT_TIMEOUT_MS = 5e3;
-  var STORAGE_KEYS = Object.freeze({
-    activity: "grindpilot.activity.v1",
-    profiles: "grindpilot.profiles.v1",
-    projects: "grindpilot.projects.v1",
-    settings: "grindpilot.settings.v1"
-  });
-  var DIRECT_STORAGE_ACTIONS = /* @__PURE__ */ new Set([
-    "BOOTSTRAP_LOAD",
-    "SETTINGS_SAVE",
-    "ACTIVITY_SAVE",
-    "PROJECTS_SAVE",
-    "PROFILE_LIST",
-    "PROFILE_GET",
-    "PROFILE_PUT",
-    "PROFILE_DELETE"
-  ]);
-  var requestId = () => globalThis.crypto?.randomUUID?.() ?? `gp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  var PageStorageArea = class {
-    constructor({
-      runtime = globalThis.chrome?.runtime,
-      storage = globalThis.chrome?.storage?.local,
-      timeoutMs = DEFAULT_TIMEOUT_MS
-    } = {}) {
-      if (!runtime?.sendMessage) {
-        throw new TypeError("PageStorageArea requires the extension runtime API");
-      }
-      this.runtime = runtime;
-      this.storage = storage?.get && storage?.set && storage?.remove ? storage : null;
-      this.timeoutMs = timeoutMs;
-      this.disposed = false;
-    }
-    command(action, payload = null) {
-      if (this.disposed) return Promise.reject(new Error("GrindPilot state adapter disposed"));
-      if (this.storage && DIRECT_STORAGE_ACTIONS.has(action)) {
-        return this.directCommand(action, payload);
-      }
-      const id = requestId();
-      return new Promise((resolve, reject) => {
-        let settled = false;
-        const finish = (callback) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timeoutId);
-          callback();
-        };
-        const timeoutId = setTimeout(() => finish(() => {
-          const error = new Error(`GrindPilot state command ${action} timed out`);
-          error.code = "GP_STATE_TIMEOUT";
-          reject(error);
-        }), this.timeoutMs);
-        this.runtime.sendMessage(
-          { type: COMMAND_TYPE, requestId: id, action, payload },
-          (response) => finish(() => {
-            const runtimeError = this.runtime?.lastError;
-            if (runtimeError || !response?.ok) {
-              const error = new Error(runtimeError?.message || response?.error?.message || "GrindPilot state command failed");
-              error.code = response?.error?.code || "GP_STATE_FAILED";
-              error.details = response?.error?.details ?? null;
-              reject(error);
-            } else resolve(response.data);
-          })
-        );
+    require(ids) {
+      const records = [...new Set(ids || [])].map((id) => this.get(id));
+      return cloneAndFreeze({
+        ok: records.every((record) => record.state === CapabilityState.AVAILABLE),
+        records,
+        missing: records.filter((record) => record.state !== CapabilityState.AVAILABLE).map((record) => record.id),
+        revision: this.#revision
       });
     }
-    storageCall(method, ...args) {
-      return new Promise((resolve, reject) => {
-        let settled = false;
-        const finish = (callback) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timeoutId);
-          callback();
-        };
-        const timeoutId = setTimeout(() => finish(() => {
-          const error = new Error(`GrindPilot storage ${method} timed out`);
-          error.code = "GP_STATE_TIMEOUT";
-          reject(error);
-        }), this.timeoutMs);
-        try {
-          this.storage[method](...args, (result) => finish(() => {
-            const runtimeError = this.runtime?.lastError;
-            if (runtimeError) {
-              const error = new Error(runtimeError.message || `GrindPilot storage ${method} failed`);
-              error.code = "GP_STATE_STORAGE_FAILED";
-              reject(error);
-            } else resolve(result);
-          }));
-        } catch (cause) {
-          finish(() => {
-            const error = new Error(cause?.message || `GrindPilot storage ${method} failed`);
-            error.code = "GP_STATE_STORAGE_FAILED";
-            error.cause = cause;
-            reject(error);
-          });
-        }
-      });
-    }
-    async directCommand(action, payload = null) {
-      const input = payload && typeof payload === "object" ? payload : {};
-      if (action === "BOOTSTRAP_LOAD") {
-        const stored2 = await this.storageCall("get", [
-          STORAGE_KEYS.activity,
-          STORAGE_KEYS.projects,
-          STORAGE_KEYS.settings
-        ]);
-        return {
-          activity: Array.isArray(stored2?.[STORAGE_KEYS.activity]) ? stored2[STORAGE_KEYS.activity] : [],
-          projects: Array.isArray(stored2?.[STORAGE_KEYS.projects]) ? stored2[STORAGE_KEYS.projects] : [],
-          settings: stored2?.[STORAGE_KEYS.settings] && typeof stored2[STORAGE_KEYS.settings] === "object" && !Array.isArray(stored2[STORAGE_KEYS.settings]) ? stored2[STORAGE_KEYS.settings] : {}
-        };
-      }
-      if (action === "SETTINGS_SAVE") {
-        await this.storageCall("set", { [STORAGE_KEYS.settings]: input.value });
-        return true;
-      }
-      if (action === "ACTIVITY_SAVE") {
-        await this.storageCall("set", { [STORAGE_KEYS.activity]: input.value });
-        return true;
-      }
-      if (action === "PROJECTS_SAVE") {
-        await this.storageCall("set", { [STORAGE_KEYS.projects]: input.value });
-        return true;
-      }
-      const stored = await this.storageCall("get", [STORAGE_KEYS.profiles]);
-      const profiles = stored?.[STORAGE_KEYS.profiles] && typeof stored[STORAGE_KEYS.profiles] === "object" && !Array.isArray(stored[STORAGE_KEYS.profiles]) ? structuredClone(stored[STORAGE_KEYS.profiles]) : {};
-      if (action === "PROFILE_LIST") return Object.values(profiles);
-      const id = String(input.id ?? input.profile?.id ?? "").trim();
-      if (action === "PROFILE_GET") return profiles[id] ?? null;
-      if (action === "PROFILE_PUT") {
-        profiles[id] = structuredClone(input.profile);
-        await this.storageCall("set", { [STORAGE_KEYS.profiles]: profiles });
-        return profiles[id];
-      }
-      if (!Object.hasOwn(profiles, id)) return false;
-      delete profiles[id];
-      if (Object.keys(profiles).length) {
-        await this.storageCall("set", { [STORAGE_KEYS.profiles]: profiles });
-      } else {
-        await this.storageCall("remove", [STORAGE_KEYS.profiles]);
-      }
-      return true;
-    }
-    loadBootstrap() {
-      return this.command("BOOTSTRAP_LOAD");
-    }
-    saveSettings(value) {
-      return this.command("SETTINGS_SAVE", { value });
-    }
-    saveActivity(value) {
-      return this.command("ACTIVITY_SAVE", { value });
-    }
-    saveProjects(value) {
-      return this.command("PROJECTS_SAVE", { value });
-    }
-    listProfiles() {
-      return this.command("PROFILE_LIST");
-    }
-    getProfile(id) {
-      return this.command("PROFILE_GET", { id });
-    }
-    putProfile(profile) {
-      return this.command("PROFILE_PUT", { profile });
-    }
-    deleteProfile(id) {
-      return this.command("PROFILE_DELETE", { id });
-    }
-    loadActiveRun(ownerId) {
-      return this.command("RUN_LOAD_ACTIVE", { ownerId });
-    }
-    loadRun(runId, ownerId) {
-      return this.command("RUN_LOAD", { runId, ownerId });
-    }
-    createRun(run, ownerId) {
-      return this.command("RUN_CREATE", { run, ownerId });
-    }
-    saveRun(run, expectedRevision, ownerId) {
-      return this.command("RUN_SAVE", { run, expectedRevision, ownerId });
-    }
-    assertRunOwnership(runId, ownerId) {
-      return this.command("RUN_ASSERT_OWNER", { runId, ownerId });
-    }
-    clearActiveRun(runId, ownerId) {
-      return this.command("RUN_CLEAR", { runId, ownerId });
-    }
-    dispose() {
-      this.disposed = true;
-    }
-  };
-
-  // src/workflow/errors.js
-  var WorkflowError = class extends Error {
-    constructor(message, { code = "WORKFLOW_ERROR", details = null } = {}) {
-      super(message);
-      this.name = "WorkflowError";
-      this.code = code;
-      this.details = details;
-    }
-  };
-  var WorkflowValidationError = class extends WorkflowError {
-    constructor(issues) {
-      const list = Array.isArray(issues) ? issues : [];
-      super(
-        list.length ? `Workflow validation failed: ${list[0].message}` : "Workflow validation failed",
-        { code: "WORKFLOW_VALIDATION_FAILED", details: { issues: list } }
-      );
-      this.name = "WorkflowValidationError";
-      this.issues = list;
-    }
-  };
-  var WorkflowPersistenceError = class extends WorkflowError {
-    constructor(message, details = null) {
-      super(message, { code: "WORKFLOW_PERSISTENCE_FAILED", details });
-      this.name = "WorkflowPersistenceError";
-    }
-  };
-  var WorkflowConflictError = class extends WorkflowError {
-    constructor(message = "Workflow revision conflict", details = null) {
-      super(message, { code: "WORKFLOW_REVISION_CONFLICT", details });
-      this.name = "WorkflowConflictError";
-    }
-  };
-  var WorkflowTimeoutError = class extends WorkflowError {
-    constructor(timeoutMs) {
-      super(`Workflow step timed out after ${timeoutMs} ms`, {
-        code: "STEP_TIMEOUT",
-        details: { timeoutMs }
-      });
-      this.name = "WorkflowTimeoutError";
-      this.timeoutMs = timeoutMs;
-    }
-  };
-
-  // src/ea/workflow-storage-repository.js
-  var STORAGE_KEY = "grindpilot.activeRun.v1";
-  var clone = (value) => value == null ? value : structuredClone(value);
-  var PageWorkflowRepository = class {
-    constructor(storageArea, storageKey = STORAGE_KEY) {
-      const domainApi = storageArea?.loadActiveRun && storageArea?.saveRun;
-      const legacyApi = storageArea?.get && storageArea?.set && storageArea?.remove;
-      if (!domainApi && !legacyApi) {
-        throw new TypeError("PageWorkflowRepository requires a GrindPilot state area");
-      }
-      this.storageArea = storageArea;
-      this.storageKey = storageKey;
-      this.domainApi = Boolean(domainApi);
-      this.ownerId = globalThis.crypto?.randomUUID?.() ?? `workflow-owner-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    }
-    async loadActiveRun() {
-      if (this.domainApi) {
-        return clone(await this.storageArea.loadActiveRun(this.ownerId));
-      }
-      const stored = await this.storageArea.get(this.storageKey);
-      return clone(stored?.[this.storageKey] ?? null);
-    }
-    async loadRun(runId) {
-      if (this.domainApi) {
-        return clone(await this.storageArea.loadRun(runId, this.ownerId));
-      }
-      const run = await this.loadActiveRun();
-      return run && String(run.runId) === String(runId) ? run : null;
-    }
-    async createRun(run) {
-      if (!run?.runId) throw new WorkflowPersistenceError("Run id is required");
-      if (this.domainApi) {
-        return clone(await this.storageArea.createRun(clone(run), this.ownerId));
-      }
-      const existing = await this.loadActiveRun();
-      if (existing && !["completed", "stopped", "failed"].includes(existing.status)) {
-        throw new WorkflowConflictError("A workflow run is already active", {
-          runId: existing.runId
-        });
-      }
-      await this.storageArea.set({ [this.storageKey]: clone(run) });
-      return clone(run);
-    }
-    async saveRun(run, { expectedRevision = null } = {}) {
-      if (this.domainApi) {
-        return clone(
-          await this.storageArea.saveRun(
-            clone(run),
-            expectedRevision,
-            this.ownerId
-          )
-        );
-      }
-      const current = await this.loadActiveRun();
-      if (!current || String(current.runId) !== String(run?.runId)) {
-        throw new WorkflowPersistenceError("Workflow run was not found", {
-          runId: run?.runId ?? null
-        });
-      }
-      if (expectedRevision != null && Number(current.revision) !== Number(expectedRevision)) {
-        throw new WorkflowConflictError("Workflow run revision changed", {
-          runId: run.runId,
-          expectedRevision,
-          actualRevision: current.revision
-        });
-      }
-      await this.storageArea.set({ [this.storageKey]: clone(run) });
-      return clone(run);
-    }
-    async clearActiveRun(runId = null) {
-      if (this.domainApi) {
-        await this.storageArea.clearActiveRun(runId, this.ownerId);
-        return;
-      }
-      const current = await this.loadActiveRun();
-      if (runId == null || String(current?.runId ?? "") === String(runId)) {
-        await this.storageArea.remove(this.storageKey);
-      }
-    }
-    async assertOwnership(runId) {
-      if (!this.domainApi) return true;
-      await this.storageArea.assertRunOwnership(runId, this.ownerId);
-      return true;
+    snapshot() {
+      return cloneAndFreeze({ revision: this.#revision, capabilities: [...this.#records.values()].sort((a, b) => a.id.localeCompare(b.id)) });
     }
   };
 
@@ -1728,6 +427,7 @@
     if (typeof untradeable === "boolean") return !untradeable;
     return false;
   };
+  var hasAnyValue = (source, keys) => keys.some((key) => source?.[key] !== void 0 && source?.[key] !== null);
   var normalizeStringList = (value) => Object.freeze(
     Array.from(
       new Set(
@@ -1760,6 +460,14 @@
     const location2 = normalizeInventoryLocation(options.location ?? raw.location);
     if (!location2) throw new TypeError("Inventory item location is required");
     const isTradable = readTradable(raw);
+    const movableEvidence = readFirst(raw, ["isMovable"]);
+    const storableEvidence = readFirst(raw, ["isStorable"]);
+    const movableEvidenceDeclared = readFirst(raw, ["hasMovableEvidence"]);
+    const storableEvidenceDeclared = readFirst(raw, ["hasStorableEvidence"]);
+    const evidence = (declaredKey, sourceKeys) => {
+      const declared = readFirst(raw, [declaredKey]);
+      return declared == null ? hasAnyValue(raw, sourceKeys) : Boolean(declared);
+    };
     return Object.freeze({
       itemId,
       resourceId,
@@ -1780,8 +488,35 @@
       isUntradeable: !isTradable,
       // Older/fake adapters did not expose these EA capabilities. Preserve their
       // historical permissive behavior, while honoring explicit live false flags.
-      isMovable: raw.isMovable == null ? true : Boolean(raw.isMovable),
-      isStorable: raw.isStorable == null ? true : Boolean(raw.isStorable),
+      isMovable: movableEvidence == null ? true : Boolean(movableEvidence),
+      isStorable: storableEvidence == null ? true : Boolean(storableEvidence),
+      hasMovableEvidence: movableEvidenceDeclared == null ? movableEvidence != null : Boolean(movableEvidenceDeclared),
+      hasStorableEvidence: storableEvidenceDeclared == null ? storableEvidence != null : Boolean(storableEvidenceDeclared),
+      hasTradabilityEvidence: evidence("hasTradabilityEvidence", [
+        "isTradable",
+        "isTradeable",
+        "tradable",
+        "isUntradeable",
+        "untradeable"
+      ]),
+      hasLockedEvidence: evidence("hasLockedEvidence", ["isLocked", "locked"]),
+      hasProtectedEvidence: evidence("hasProtectedEvidence", ["isProtected"]),
+      hasFavoriteEvidence: evidence("hasFavoriteEvidence", [
+        "isFavorite",
+        "isFavourite",
+        "favorite"
+      ]),
+      hasStartingSquadEvidence: evidence("hasStartingSquadEvidence", [
+        "isInStartingSquad",
+        "isInActive11"
+      ]),
+      hasSpecialEvidence: evidence("hasSpecialEvidence", [
+        "isSpecial",
+        "cardType",
+        "rarityId",
+        "rarityName",
+        "specialGroups"
+      ]),
       isDuplicate: Boolean(raw.isDuplicate),
       isLocked: Boolean(raw.isLocked ?? raw.locked),
       isFavorite: Boolean(raw.isFavorite ?? raw.isFavourite),
@@ -1972,746 +707,542 @@
     });
   };
 
-  // src/inventory/snapshot-store.js
-  var InventoryGenerationConflictError = class extends Error {
-    constructor(expected, actual) {
-      super(`Inventory generation conflict: expected ${expected}, current ${actual}`);
-      this.name = "InventoryGenerationConflictError";
-      this.expectedGeneration = expected;
-      this.actualGeneration = actual;
-    }
-  };
-  var InventoryIdentityConflictError = class extends Error {
-    constructor(itemId) {
-      super(`Owned item ${itemId} appears more than once in the same snapshot`);
-      this.name = "InventoryIdentityConflictError";
-      this.itemId = itemId;
-    }
-  };
-  var freezeSource = (location2, generation, items) => Object.freeze({ location: location2, generation, items: Object.freeze(items) });
-  var normalizeCapacity = (value) => {
-    if (value === null || value === void 0) return null;
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 0) {
-      throw new TypeError("storageCapacity must be a non-negative integer or null");
-    }
-    return parsed;
-  };
-  var createEmptyState = () => {
-    const generation = 0;
-    const club = freezeSource(INVENTORY_LOCATIONS.CLUB, generation, []);
-    const storage = freezeSource(INVENTORY_LOCATIONS.SBC_STORAGE, generation, []);
-    const unassigned = freezeSource(INVENTORY_LOCATIONS.UNASSIGNED, generation, []);
-    return Object.freeze({
-      generation,
-      updatedAt: null,
-      storageCapacity: null,
-      club,
-      storage,
-      unassigned,
-      items: Object.freeze([])
-    });
-  };
-  var InventorySnapshotStore = class {
-    #state = createEmptyState();
-    #clock;
-    constructor({ clock = () => (/* @__PURE__ */ new Date()).toISOString() } = {}) {
-      if (typeof clock !== "function") throw new TypeError("clock must be a function");
-      this.#clock = clock;
-    }
-    getSnapshot() {
-      return this.#state;
-    }
-    /**
-     * Build and validate the full next state before publishing it. A malformed
-     * source therefore cannot leave club/storage/unassigned on mixed generations.
-     */
-    replaceSnapshot(input = {}, { expectedGeneration = null } = {}) {
-      const current = this.#state;
-      if (expectedGeneration !== null && Number(expectedGeneration) !== current.generation) {
-        throw new InventoryGenerationConflictError(
-          Number(expectedGeneration),
-          current.generation
-        );
-      }
-      const nextGeneration = current.generation + 1;
-      const normalizeSource = (items, location2) => (Array.isArray(items) ? items : []).map(
-        (item) => normalizeInventoryItem(item, { location: location2 })
-      );
-      const clubItems = normalizeSource(input.club, INVENTORY_LOCATIONS.CLUB);
-      const storageItems = normalizeSource(
-        input.storage,
-        INVENTORY_LOCATIONS.SBC_STORAGE
-      );
-      const unassignedItems = normalizeSource(
-        input.unassigned,
-        INVENTORY_LOCATIONS.UNASSIGNED
-      );
-      const allItems = [...clubItems, ...storageItems, ...unassignedItems];
-      const itemIds = /* @__PURE__ */ new Set();
-      for (const item of allItems) {
-        if (itemIds.has(item.itemId)) {
-          throw new InventoryIdentityConflictError(item.itemId);
-        }
-        itemIds.add(item.itemId);
-      }
-      const club = freezeSource(
-        INVENTORY_LOCATIONS.CLUB,
-        nextGeneration,
-        clubItems
-      );
-      const storage = freezeSource(
-        INVENTORY_LOCATIONS.SBC_STORAGE,
-        nextGeneration,
-        storageItems
-      );
-      const unassigned = freezeSource(
-        INVENTORY_LOCATIONS.UNASSIGNED,
-        nextGeneration,
-        unassignedItems
-      );
-      const next = Object.freeze({
-        generation: nextGeneration,
-        updatedAt: String(this.#clock()),
-        storageCapacity: normalizeCapacity(input.storageCapacity),
-        club,
-        storage,
-        unassigned,
-        items: Object.freeze([...club.items, ...storage.items, ...unassigned.items])
-      });
-      this.#state = next;
-      return next;
-    }
-  };
-
-  // src/inventory/inventory-service.js
-  var InventoryService = class {
-    #store;
-    #duplicates;
-    constructor({ snapshotStore = new InventorySnapshotStore(), duplicateService = new DuplicateService() } = {}) {
-      this.#store = snapshotStore;
-      this.#duplicates = duplicateService;
-    }
-    synchronize(input, options) {
-      return this.#store.replaceSnapshot(input, options);
-    }
-    getSnapshot() {
-      return this.#store.getSnapshot();
-    }
-    getItems(location2 = null) {
-      const snapshot = this.getSnapshot();
-      if (location2 === null) return snapshot.items;
-      if (location2 === "club") return snapshot.club.items;
-      if (location2 === "storage" || location2 === "sbc_storage") {
-        return snapshot.storage.items;
-      }
-      if (location2 === "unassigned") return snapshot.unassigned.items;
-      throw new TypeError(`Unsupported inventory location: ${location2}`);
-    }
-    findByItemId(itemId) {
-      const normalized = normalizeIdentifier(itemId, {
-        required: true,
-        name: "itemId"
-      });
-      return this.getSnapshot().items.find((item) => item.itemId === normalized) ?? null;
-    }
-    findByResourceId(resourceId) {
-      const normalized = normalizeIdentifier(resourceId, {
-        required: true,
-        name: "resourceId"
-      });
-      return Object.freeze(
-        this.getSnapshot().items.filter((item) => item.resourceId === normalized)
-      );
-    }
-    getDuplicateGroups() {
-      return this.#duplicates.group(this.getSnapshot().items);
-    }
-    planUnassignedResolution(policy) {
-      return planUnassignedResolution(this.getSnapshot(), policy);
-    }
-    getStatus() {
-      const snapshot = this.getSnapshot();
-      const capacity = snapshot.storageCapacity;
-      return Object.freeze({
-        generation: snapshot.generation,
-        clubCount: snapshot.club.items.length,
-        storageCount: snapshot.storage.items.length,
-        storageCapacity: capacity,
-        storageFreeSlots: capacity == null ? null : Math.max(0, capacity - snapshot.storage.items.length),
-        unassignedCount: snapshot.unassigned.items.length,
-        duplicateGroupCount: this.getDuplicateGroups().length
-      });
-    }
-  };
-
-  // src/packs/pack-policy.js
-  var PACK_OPEN_MODES = Object.freeze({
-    CURRENT_REWARD: "OPEN_CURRENT_REWARD",
-    MATCHING_PACKS: "OPEN_MATCHING_PACKS",
-    ALL_ALLOWED_PACKS: "OPEN_ALL_ALLOWED_PACKS"
-  });
-  var VALID_MODES = new Set(Object.values(PACK_OPEN_MODES));
-  var PackPolicyError = class extends Error {
-    constructor(code, message, details = {}) {
-      super(message);
-      this.name = "PackPolicyError";
-      this.code = code;
-      this.details = details;
-    }
-  };
-  function stringSet(values, field) {
-    if (values == null) return [];
-    if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !value.trim())) {
-      throw new PackPolicyError("INVALID_PACK_POLICY", `${field} must be an array of non-empty strings`);
-    }
-    return [...new Set(values.map((value) => value.trim()))];
-  }
-  function normalizePackPolicy(input = {}) {
-    if (input == null || typeof input !== "object" || Array.isArray(input)) {
-      throw new PackPolicyError("INVALID_PACK_POLICY", "Pack policy must be an object");
-    }
-    for (const forbidden of ["allowPurchases", "allowStorePacks", "spendCoins", "spendPoints", "useFcPoints"]) {
-      if (input[forbidden] === true) {
-        throw new PackPolicyError(
-          "PURCHASE_FORBIDDEN",
-          "GrindPilot never buys packs or spends coins or FC Points",
-          { field: forbidden }
-        );
-      }
-    }
-    const mode = input.mode ?? PACK_OPEN_MODES.CURRENT_REWARD;
-    if (!VALID_MODES.has(mode)) {
-      throw new PackPolicyError("INVALID_PACK_MODE", `Unsupported pack mode: ${String(mode)}`);
-    }
-    const maxPacks = input.maxPacks ?? (mode === PACK_OPEN_MODES.CURRENT_REWARD ? 1 : 25);
-    if (!Number.isSafeInteger(maxPacks) || maxPacks < 1 || maxPacks > 100) {
-      throw new PackPolicyError("INVALID_PACK_POLICY", "maxPacks must be an integer from 1 to 100");
-    }
-    return Object.freeze({
-      mode,
-      maxPacks,
-      allowedPackIds: stringSet(input.allowedPackIds, "allowedPackIds"),
-      allowedPackTypes: stringSet(input.allowedPackTypes, "allowedPackTypes"),
-      excludedPackIds: stringSet(input.excludedPackIds, "excludedPackIds")
-    });
-  }
-  function packId(pack) {
-    return String(pack?.packId ?? pack?.id ?? "");
-  }
-  function packType(pack) {
-    return String(pack?.packType ?? pack?.type ?? "");
-  }
-  function numericCost(pack, keys) {
-    for (const key of keys) {
-      const value = pack?.[key] ?? pack?.cost?.[key];
-      if (value != null && Number(value) > 0) return Number(value);
-    }
-    return 0;
-  }
-  function assertOwnedFreePack(pack) {
-    const id = packId(pack);
-    if (!id) throw new PackPolicyError("INVALID_PACK", "Pack has no stable identifier");
-    const coinCost = numericCost(pack, ["coins", "coinCost", "coinsCost"]);
-    const pointsCost = numericCost(pack, ["points", "pointCost", "fcPoints", "fcPointsCost"]);
-    const requiresPurchase = pack.purchaseRequired === true || pack.owned === false;
-    const storeOnly = pack.source === "store" && pack.owned !== true && pack.isReward !== true;
-    if (coinCost > 0 || pointsCost > 0 || requiresPurchase || storeOnly) {
-      throw new PackPolicyError("PURCHASE_FORBIDDEN", "Pack is not proven to be owned and free to open", {
-        packId: id,
-        coinCost,
-        pointsCost
-      });
-    }
-    if (pack.owned !== true && pack.isReward !== true && pack.source !== "reward") {
-      throw new PackPolicyError("OWNERSHIP_UNVERIFIED", "Pack ownership could not be verified", { packId: id });
-    }
-    return true;
-  }
-  function getUnassignedCount(inventoryState = {}) {
-    let unresolved;
-    if (Array.isArray(inventoryState.unassigned)) {
-      unresolved = inventoryState.unassigned.length;
-    } else if (Object.hasOwn(inventoryState, "unassignedCount")) {
-      unresolved = Number(inventoryState.unassignedCount);
-    } else if (Object.hasOwn(inventoryState, "unresolvedUnassigned")) {
-      unresolved = Number(inventoryState.unresolvedUnassigned);
-    } else {
-      throw new PackPolicyError("INVENTORY_STATE_UNVERIFIED", "Unassigned state is missing");
-    }
-    if (!Number.isFinite(unresolved) || unresolved < 0) {
-      throw new PackPolicyError("INVALID_INVENTORY_STATE", "Unassigned count is invalid");
-    }
-    return unresolved;
-  }
-  function assertNoUnassigned(inventoryState = {}) {
-    const unresolved = getUnassignedCount(inventoryState);
-    if (unresolved > 0) {
-      throw new PackPolicyError("UNASSIGNED_BLOCKING", "Resolve unassigned items before opening another pack", {
-        unresolved
-      });
-    }
-    return true;
-  }
-  function matchesFilters(pack, policy) {
-    const id = packId(pack);
-    const type = packType(pack);
-    if (policy.excludedPackIds.includes(id)) return false;
-    if (policy.allowedPackIds.length && !policy.allowedPackIds.includes(id)) return false;
-    if (policy.allowedPackTypes.length && !policy.allowedPackTypes.includes(type)) return false;
-    return true;
-  }
-  function selectPacksForPolicy({ packs = [], policy: rawPolicy = {}, currentReward = null } = {}) {
-    if (!Array.isArray(packs)) throw new PackPolicyError("INVALID_PACKS", "packs must be an array");
-    const policy = normalizePackPolicy(rawPolicy);
-    const safe = packs.filter((pack) => {
-      try {
-        assertOwnedFreePack(pack);
-        return matchesFilters(pack, policy);
-      } catch {
-        return false;
-      }
-    });
-    let selected3;
-    if (policy.mode === PACK_OPEN_MODES.CURRENT_REWARD) {
-      const expectedId = String(currentReward?.packId ?? currentReward?.identifiedPackId ?? "");
-      if (!expectedId) {
-        throw new PackPolicyError("REWARD_PACK_UNIDENTIFIED", "The current reward has no verified pack identifier");
-      }
-      selected3 = safe.filter((pack) => packId(pack) === expectedId);
-      if (selected3.length !== 1) {
-        throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "The current reward pack was not uniquely identified", {
-          expectedId,
-          matches: selected3.length
-        });
-      }
-    } else if (policy.mode === PACK_OPEN_MODES.MATCHING_PACKS) {
-      const rewardType = String(currentReward?.packType ?? currentReward?.type ?? "");
-      if (!rewardType) {
-        throw new PackPolicyError("REWARD_PACK_UNIDENTIFIED", "A pack type is required for matching-pack mode");
-      }
-      selected3 = safe.filter((pack) => packType(pack) === rewardType);
-    } else {
-      selected3 = safe;
-    }
-    return selected3.slice(0, policy.maxPacks);
-  }
-
-  // src/packs/pack-service.js
-  var idOf = (pack) => String(pack?.packId ?? pack?.id ?? "");
-  var PackService = class {
-    constructor({ adapter, inventoryService, logger = null } = {}) {
-      if (!adapter?.listOwnedPacks || !adapter?.openOwnedPack) {
-        throw new TypeError("PackService requires listOwnedPacks and openOwnedPack adapter methods");
-      }
-      if (!inventoryService?.getState || !inventoryService?.refresh) {
-        throw new TypeError("PackService requires getState and refresh inventory methods");
-      }
-      this.adapter = adapter;
-      this.inventoryService = inventoryService;
-      this.logger = logger;
-    }
-    async plan({ policy, currentReward } = {}) {
-      assertNoUnassigned(await this.inventoryService.getState());
-      const packs = await this.adapter.listOwnedPacks();
-      const normalizedPolicy = normalizePackPolicy(policy);
-      const selected3 = selectPacksForPolicy({ packs, policy: normalizedPolicy, currentReward });
-      return { policy: normalizedPolicy, packs: selected3.map((pack) => ({ ...pack })) };
-    }
-    async open({ policy, currentReward } = {}) {
-      const plan = await this.plan({ policy, currentReward });
-      return this.openPlan(plan);
-    }
-    async openPlan(plan = {}) {
-      if (!Array.isArray(plan?.packs)) {
-        throw new PackPolicyError("INVALID_PACK_PLAN", "A verified owned-pack plan is required");
-      }
-      const opened = [];
-      for (const pack of plan.packs) {
-        assertNoUnassigned(await this.inventoryService.getState());
-        assertOwnedFreePack(pack);
-        const packId2 = idOf(pack);
-        this.logger?.info?.("pack.open.intent", { packId: packId2 });
-        const response = await this.adapter.openOwnedPack({ packId: packId2 });
-        if (response?.opened !== true || !Array.isArray(response.items)) {
-          throw new PackPolicyError("PACK_OPEN_UNVERIFIED", "Pack opening response was not verifiable", { packId: packId2 });
-        }
-        const inventory = await this.inventoryService.refresh();
-        opened.push({ packId: packId2, itemCount: response.items.length, response });
-        this.logger?.info?.("pack.opened", { packId: packId2, itemCount: response.items.length });
-        let unresolved;
-        try {
-          unresolved = getUnassignedCount(inventory);
-        } catch (error) {
-          return { status: "blocked", reason: error.code ?? "INVENTORY_STATE_UNVERIFIED", opened, inventory };
-        }
-        if (unresolved > 0) {
-          return { status: "blocked", reason: "UNASSIGNED_BLOCKING", opened, inventory };
-        }
-      }
-      return { status: "completed", opened };
-    }
-  };
-
-  // src/packs/reward-service.js
-  var idOf2 = (pack) => String(pack?.packId ?? pack?.id ?? "");
-  var countPacksById = (packs) => {
-    const counts = /* @__PURE__ */ new Map();
-    const packsById = /* @__PURE__ */ new Map();
-    for (const pack of packs) {
-      const id = idOf2(pack);
-      const count = Number(pack?.count ?? 1);
-      if (!id || !Number.isSafeInteger(count) || count < 0) {
-        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot contains an invalid ID or count");
-      }
-      const nextCount = (counts.get(id) ?? 0) + count;
-      if (!Number.isSafeInteger(nextCount)) {
-        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot count exceeds the safe range");
-      }
-      counts.set(id, nextCount);
-      const matches = packsById.get(id) ?? [];
-      matches.push(pack);
-      packsById.set(id, matches);
-    }
-    return { counts, packsById };
-  };
-  function identifyClaimedRewardPack({ claim, packsBefore = [], packsAfter = [] } = {}) {
-    if (!Array.isArray(packsBefore) || !Array.isArray(packsAfter)) {
-      throw new PackPolicyError("INVALID_PACKS", "Pack snapshots must be arrays");
-    }
-    const before = countPacksById(packsBefore);
-    const after = countPacksById(packsAfter);
-    const positiveDeltaIds = Array.from(after.counts.entries()).filter(([id, count]) => count - (before.counts.get(id) ?? 0) > 0).map(([id]) => id);
-    const explicitId = String(claim?.packId ?? claim?.rewardPackId ?? "");
-    if (positiveDeltaIds.length !== 1 || explicitId && positiveDeltaIds[0] !== explicitId) {
-      throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Could not uniquely identify the newly claimed pack", {
-        explicitId: explicitId || null,
-        positiveDeltaIds
-      });
-    }
-    const correlatedId = positiveDeltaIds[0];
-    const matches = after.packsById.get(correlatedId) ?? [];
-    if (!matches.length) {
-      throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Correlated reward pack was not present");
-    }
-    for (const pack of matches) assertOwnedFreePack(pack);
-    return matches[0];
-  }
-  var RewardService = class {
-    constructor({ adapter, logger = null } = {}) {
-      if (!adapter?.listOwnedPacks || !adapter?.claimReward) {
-        throw new TypeError("RewardService requires listOwnedPacks and claimReward adapter methods");
-      }
-      this.adapter = adapter;
-      this.logger = logger;
-    }
-    async claimAndIdentify(rewardRef, packsBefore = null) {
-      const before = Array.isArray(packsBefore) ? packsBefore.map((pack2) => ({ ...pack2 })) : await this.adapter.listOwnedPacks();
-      const claim = await this.adapter.claimReward(rewardRef, before);
-      if (claim?.claimed !== true && claim?.success !== true) {
-        throw new PackPolicyError("REWARD_CLAIM_UNVERIFIED", "Reward claim was not verified", { rewardRef });
-      }
-      const after = await this.adapter.listOwnedPacks();
-      const pack = identifyClaimedRewardPack({ claim, packsBefore: before, packsAfter: after });
-      this.logger?.info?.("reward.claimed", { rewardRef, packId: idOf2(pack) });
-      return { claim, pack, identifiedPackId: idOf2(pack), packType: pack.packType ?? pack.type ?? null };
-    }
-  };
-
-  // src/picks/pick-policy.js
-  var PLAYER_PICK_POLICIES = Object.freeze({
-    PAUSE_FOR_USER: "PAUSE_FOR_USER",
-    HIGHEST_RATING: "HIGHEST_RATING",
-    HIGHEST_VALUE: "HIGHEST_VALUE",
-    PREFER_NON_DUPLICATE: "PREFER_NON_DUPLICATE",
-    PREFER_REQUIRED_SPECIAL: "PREFER_REQUIRED_SPECIAL",
-    CUSTOM_PRIORITY: "CUSTOM_PRIORITY"
-  });
-  var VALID_POLICIES = new Set(Object.values(PLAYER_PICK_POLICIES));
-  var VALID_CRITERIA = /* @__PURE__ */ new Set([
-    "REQUIRED_SPECIAL",
-    "NON_DUPLICATE",
-    "PREFERRED_PLAYER",
-    "PREFERRED_RESOURCE",
-    "PREFERRED_CARD_TYPE",
-    "RATING",
-    "VALUE"
+  // src/application/sbc-preview.js
+  var SBC_PREVIEW_CAPABILITIES = Object.freeze([
+    "ea.inventory.read",
+    "ea.sbc.read",
+    "ea.sbc.solve.preview"
   ]);
-  var PlayerPickPolicyError = class extends Error {
-    constructor(code, message, details = {}) {
-      super(message);
-      this.name = "PlayerPickPolicyError";
-      this.code = code;
-      this.details = details;
+  var CAPABILITY_ALIASES = Object.freeze({
+    "inventory": ["ea.inventory.read"],
+    "inventory read": ["ea.inventory.read"],
+    "current sbc read": ["ea.sbc.read"],
+    "sbc project import": ["ea.sbc.read"],
+    "solve": ["ea.sbc.solve.preview"],
+    "unassigned": ["ea.unassigned.read"],
+    "resolve": ["ea.unassigned.read", "ea.items.move"],
+    "sbc storage move": ["ea.items.move"]
+  });
+  var STATUS_ALIASES = Object.freeze({
+    AVAILABLE: CapabilityState.AVAILABLE,
+    DEGRADED: CapabilityState.DEGRADED,
+    UNAVAILABLE: CapabilityState.UNAVAILABLE,
+    UNVERIFIED: CapabilityState.UNVERIFIED
+  });
+  var buildRuntimeCapabilityRegistry = (health = []) => {
+    const registry = new CapabilityRegistry();
+    for (const entry of Array.isArray(health) ? health : []) {
+      const sourceId = String(entry?.id || "").trim().toLowerCase();
+      const ids = CAPABILITY_ALIASES[sourceId];
+      if (!ids) continue;
+      const state = STATUS_ALIASES[String(entry?.status || "").toUpperCase()] || CapabilityState.UNVERIFIED;
+      for (const id of ids) {
+        const existing = registry.get(id);
+        const rank = {
+          [CapabilityState.UNAVAILABLE]: 0,
+          [CapabilityState.UNVERIFIED]: 1,
+          [CapabilityState.DEGRADED]: 2,
+          [CapabilityState.AVAILABLE]: 3
+        };
+        if (existing.revision && rank[existing.state] >= rank[state]) continue;
+        registry.declare(id, {
+          state,
+          reason: state === CapabilityState.AVAILABLE ? null : `${entry.id || id} is ${state}`,
+          evidence: entry?.evidence || null
+        });
+      }
     }
+    return registry;
   };
-  function strings(value, field) {
-    if (value == null) return [];
-    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
-      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", `${field} must be an array of non-empty strings`);
-    }
-    return [...new Set(value.map((entry) => entry.trim()))];
-  }
-  function normalizePlayerPickPolicy(input = {}) {
-    if (input == null || typeof input !== "object" || Array.isArray(input)) {
-      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", "Player-pick policy must be an object");
-    }
-    const type = input.type ?? PLAYER_PICK_POLICIES.PAUSE_FOR_USER;
-    if (!VALID_POLICIES.has(type)) {
-      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", `Unsupported player-pick policy: ${String(type)}`);
-    }
-    const criteria = input.criteria ?? [];
-    if (!Array.isArray(criteria) || criteria.some((criterion) => !VALID_CRITERIA.has(criterion))) {
-      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", "CUSTOM_PRIORITY contains an unsupported criterion");
-    }
-    if (type === PLAYER_PICK_POLICIES.CUSTOM_PRIORITY && criteria.length === 0) {
-      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", "CUSTOM_PRIORITY requires at least one typed criterion");
-    }
-    return Object.freeze({
-      type,
-      criteria: [...criteria],
-      preferredPlayerIds: strings(input.preferredPlayerIds, "preferredPlayerIds"),
-      preferredResourceIds: strings(input.preferredResourceIds, "preferredResourceIds"),
-      preferredCardTypes: strings(input.preferredCardTypes, "preferredCardTypes"),
-      requiredSpecialTypes: strings(input.requiredSpecialTypes, "requiredSpecialTypes")
+  var canonicalContext = (context = {}) => ({
+    gameVersion: context.gameVersion,
+    state: context.state,
+    route: context.route || null,
+    setId: context.setId || null,
+    challengeId: context.challengeId || null
+  });
+  var canonicalInventory = (snapshot = {}) => ({
+    storageCapacity: snapshot.storageCapacity ?? null,
+    items: [...snapshot.items || []].map((item) => ({
+      itemId: item.itemId,
+      resourceId: item.resourceId,
+      definitionId: item.definitionId,
+      assetId: item.assetId,
+      baseId: item.baseId,
+      location: item.location,
+      rating: item.rating,
+      cardType: item.cardType,
+      rarityId: item.rarityId,
+      specialGroups: item.specialGroups,
+      isSpecial: item.isSpecial,
+      isTradable: item.isTradable,
+      isDuplicate: item.isDuplicate,
+      isLocked: item.isLocked,
+      isFavorite: item.isFavorite,
+      isInStartingSquad: item.isInStartingSquad,
+      isMovable: item.isMovable,
+      isStorable: item.isStorable,
+      hasMovableEvidence: item.hasMovableEvidence,
+      hasStorableEvidence: item.hasStorableEvidence
+    })).sort((left, right) => String(left.itemId).localeCompare(String(right.itemId)))
+  });
+  var canonicalCapabilities = (snapshot = {}, requiredCapabilities = SBC_PREVIEW_CAPABILITIES) => ({
+    capabilities: (snapshot.capabilities || []).filter((entry) => requiredCapabilities.includes(entry.id)).map((entry) => ({ id: entry.id, state: entry.state, evidence: entry.evidence || null })).sort((left, right) => left.id.localeCompare(right.id))
+  });
+  var buildPlanningFingerprints = ({
+    gameContext,
+    inventorySnapshot,
+    capabilitySnapshot,
+    requiredCapabilities,
+    bindings = {}
+  }) => {
+    const components = {
+      gameContext: stableFingerprint(canonicalContext(gameContext)),
+      inventory: stableFingerprint(canonicalInventory(inventorySnapshot)),
+      capabilities: stableFingerprint(
+        canonicalCapabilities(capabilitySnapshot, requiredCapabilities)
+      ),
+      bindings: stableFingerprint(bindings)
+    };
+    return cloneAndFreeze({
+      ...components,
+      combined: stableFingerprint(components),
+      inventoryGeneration: Math.max(0, Number(inventorySnapshot?.generation || 0))
     });
-  }
-  function normalizeOffer(offer, index) {
-    if (offer == null || typeof offer !== "object" || Array.isArray(offer)) {
-      throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", `Offer ${index} is invalid`);
-    }
-    const itemId = String(offer.itemId ?? offer.id ?? "");
-    if (!itemId) throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", `Offer ${index} has no item ID`);
-    const rating = Number(offer.rating);
-    const value = offer.estimatedValue == null && offer.value == null ? null : Number(offer.estimatedValue ?? offer.value);
-    return {
-      ...offer,
-      itemId,
-      resourceId: String(offer.resourceId ?? ""),
-      basePlayerId: String(offer.basePlayerId ?? offer.assetId ?? ""),
-      name: offer.name == null ? null : String(offer.name),
-      cardType: String(offer.cardType ?? ""),
-      rarityName: String(offer.rarityName ?? offer.rarity ?? ""),
-      specialGroups: Array.isArray(offer.specialGroups) ? offer.specialGroups.map(String) : [],
-      isSpecial: offer.isSpecial === true,
-      rating: Number.isFinite(rating) ? rating : null,
-      estimatedValue: Number.isFinite(value) && value >= 0 ? value : null,
-      isDuplicate: offer.isDuplicate === true
+  };
+  var comparePlanningFingerprints = (expected, current) => {
+    const keys = ["gameContext", "inventory", "capabilities", "bindings"];
+    const changed = keys.filter((key) => expected?.[key] !== current?.[key]);
+    return cloneAndFreeze({ ok: changed.length === 0, changed });
+  };
+  var buildSbcPlanFingerprints = ({
+    gameContext,
+    inventorySnapshot,
+    project,
+    policySnapshot,
+    capabilitySnapshot
+  }) => {
+    const components = {
+      gameContext: stableFingerprint(canonicalContext(gameContext)),
+      inventory: stableFingerprint(canonicalInventory(inventorySnapshot)),
+      project: stableFingerprint(project),
+      policy: stableFingerprint(policySnapshot),
+      capabilities: stableFingerprint(canonicalCapabilities(capabilitySnapshot))
     };
-  }
-  function paused(reason, offers, extra = {}) {
-    return { status: "paused", reason, selectedItemId: null, offers, ...extra };
-  }
-  function uniqueBest(offers, score, reason) {
-    const scored = offers.map((offer) => ({ offer, score: score(offer) }));
-    if (scored.some((entry) => entry.score == null || Number.isNaN(entry.score))) {
-      return paused("INSUFFICIENT_PICK_DATA", offers, { criterion: reason });
-    }
-    const best = Math.max(...scored.map((entry) => entry.score));
-    const winners = scored.filter((entry) => entry.score === best).map((entry) => entry.offer);
-    if (winners.length !== 1) return paused("AMBIGUOUS_PICK", offers, { criterion: reason, candidates: winners.map((o) => o.itemId) });
-    return selected(winners[0], offers, reason);
-  }
-  function selected(offer, offers, reason) {
-    return {
-      status: "selected",
-      reason,
-      selectedItemId: offer.itemId,
-      selected: offer,
-      offers
-    };
-  }
-  function isRequiredSpecial(offer, policy, context) {
-    const required = new Set([
-      ...policy.requiredSpecialTypes,
-      ...Array.isArray(context?.requiredSpecialTypes) ? context.requiredSpecialTypes.map(String) : []
-    ].map((value) => String(value).trim().toLowerCase()).filter(Boolean));
-    return [offer.cardType, offer.rarityName, ...offer.specialGroups || []].map((value) => String(value).trim().toLowerCase()).some((value) => required.has(value));
-  }
-  function criterionScore(criterion, offer, policy, context) {
-    switch (criterion) {
-      case "REQUIRED_SPECIAL":
-        return isRequiredSpecial(offer, policy, context) ? 1 : 0;
-      case "NON_DUPLICATE":
-        return offer.isDuplicate ? 0 : 1;
-      case "PREFERRED_PLAYER":
-        return policy.preferredPlayerIds.includes(offer.basePlayerId) ? 1 : 0;
-      case "PREFERRED_RESOURCE":
-        return policy.preferredResourceIds.includes(offer.resourceId) ? 1 : 0;
-      case "PREFERRED_CARD_TYPE":
-        return policy.preferredCardTypes.includes(offer.cardType) ? 1 : 0;
-      case "RATING":
-        return offer.rating;
-      case "VALUE":
-        return offer.estimatedValue;
-      default:
-        return null;
-    }
-  }
-  function compareTuples(left, right) {
-    for (let i = 0; i < left.length; i += 1) {
-      if (left[i] !== right[i]) return left[i] > right[i] ? 1 : -1;
-    }
-    return 0;
-  }
-  function decidePlayerPick(rawOffers, rawPolicy = {}, context = {}) {
-    if (!Array.isArray(rawOffers) || rawOffers.length === 0) {
-      throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", "At least one player-pick offer is required");
-    }
-    const existingResourceIds = new Set(
-      (context?.existingResourceIds || []).map(String)
-    );
-    const duplicateResourceIds = new Set(
-      (context?.duplicateResourceIds || []).map(String)
-    );
-    const duplicateItemIds = new Set((context?.duplicateItemIds || []).map(String));
-    const offers = rawOffers.map(normalizeOffer).map((offer) => ({
-      ...offer,
-      isDuplicate: offer.isDuplicate || duplicateItemIds.has(offer.itemId) || offer.resourceId && (existingResourceIds.has(offer.resourceId) || duplicateResourceIds.has(offer.resourceId))
-    }));
-    if (new Set(offers.map((offer) => offer.itemId)).size !== offers.length) {
-      throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", "Player-pick item IDs must be unique");
-    }
-    const policy = normalizePlayerPickPolicy(rawPolicy);
-    switch (policy.type) {
-      case PLAYER_PICK_POLICIES.PAUSE_FOR_USER:
-        return paused("USER_SELECTION_REQUIRED", offers);
-      case PLAYER_PICK_POLICIES.HIGHEST_RATING:
-        return uniqueBest(offers, (offer) => offer.rating, "HIGHEST_RATING");
-      case PLAYER_PICK_POLICIES.HIGHEST_VALUE:
-        return uniqueBest(offers, (offer) => offer.estimatedValue, "HIGHEST_VALUE");
-      case PLAYER_PICK_POLICIES.PREFER_NON_DUPLICATE: {
-        const candidates = offers.filter((offer) => !offer.isDuplicate);
-        if (candidates.length === 1) return selected(candidates[0], offers, "PREFER_NON_DUPLICATE");
-        return paused(candidates.length ? "AMBIGUOUS_PICK" : "NO_NON_DUPLICATE_OPTION", offers, {
-          candidates: candidates.map((offer) => offer.itemId)
-        });
-      }
-      case PLAYER_PICK_POLICIES.PREFER_REQUIRED_SPECIAL: {
-        const candidates = offers.filter((offer) => isRequiredSpecial(offer, policy, context));
-        if (candidates.length === 1) return selected(candidates[0], offers, "PREFER_REQUIRED_SPECIAL");
-        return paused(candidates.length ? "AMBIGUOUS_PICK" : "NO_REQUIRED_SPECIAL_OPTION", offers, {
-          candidates: candidates.map((offer) => offer.itemId)
-        });
-      }
-      case PLAYER_PICK_POLICIES.CUSTOM_PRIORITY: {
-        const ranked = offers.map((offer) => ({
-          offer,
-          tuple: policy.criteria.map((criterion) => criterionScore(criterion, offer, policy, context))
-        }));
-        if (ranked.some((entry) => entry.tuple.some((value) => value == null || Number.isNaN(value)))) {
-          return paused("INSUFFICIENT_PICK_DATA", offers);
-        }
-        ranked.sort((a, b) => compareTuples(b.tuple, a.tuple));
-        if (ranked.length > 1 && compareTuples(ranked[0].tuple, ranked[1].tuple) === 0) {
-          return paused("AMBIGUOUS_PICK", offers, { candidates: ranked.filter((entry) => compareTuples(entry.tuple, ranked[0].tuple) === 0).map((entry) => entry.offer.itemId) });
-        }
-        return selected(ranked[0].offer, offers, "CUSTOM_PRIORITY");
-      }
-      default:
-        return paused("USER_SELECTION_REQUIRED", offers);
-    }
-  }
+    return cloneAndFreeze({
+      ...components,
+      combined: stableFingerprint(components),
+      inventoryGeneration: Math.max(0, Number(inventorySnapshot?.generation || 0))
+    });
+  };
+  var compareSbcPlanFingerprints = (expected, current) => {
+    const keys = ["gameContext", "inventory", "project", "policy", "capabilities"];
+    const changed = keys.filter((key) => expected?.[key] !== current?.[key]);
+    return cloneAndFreeze({ ok: changed.length === 0, changed });
+  };
+  var projectChallengeForContext = (project, context) => (project?.sourceChallenges || []).find((challenge) => String(challenge.id) === String(context?.challengeId || "")) || null;
+  var summarizeSbcSolution = ({ solution, inventorySnapshot, protectedItemIds = [] }) => {
+    const byId = new Map((inventorySnapshot?.items || []).map((item) => [String(item.itemId), item]));
+    const protectedIds = new Set((protectedItemIds || []).map(String));
+    const selectedIds = (solution?.solutionIds || []).map(String);
+    const selected3 = selectedIds.map((id) => byId.get(id)).filter(Boolean);
+    const unobservedItemIds = selectedIds.filter((id) => !byId.has(id));
+    const protectedViolations = selectedIds.filter((id) => protectedIds.has(id));
+    const ratings = selected3.map((item) => Number(item.rating || 0));
+    return cloneAndFreeze({
+      solved: solution?.solved === true && solution?.submitReady === true,
+      selectedCount: selectedIds.length,
+      cards: selected3.map((item) => ({
+        name: item.name || null,
+        rating: Number(item.rating || 0),
+        location: item.location,
+        isSpecial: Boolean(item.isSpecial),
+        isDuplicate: Boolean(item.isDuplicate),
+        isTradable: Boolean(item.isTradable)
+      })).sort((left, right) => right.rating - left.rating || String(left.name || "").localeCompare(String(right.name || ""))),
+      ratingRange: ratings.length ? { min: Math.min(...ratings), max: Math.max(...ratings) } : null,
+      specialCount: selected3.filter((item) => item.isSpecial).length,
+      duplicateCount: selected3.filter((item) => item.isDuplicate).length,
+      storageCount: selected3.filter((item) => item.location === "sbc_storage").length,
+      selectedProtectedCount: protectedViolations.length,
+      protectedViolations,
+      unobservedItemIds,
+      objectiveTuple: solution?.stats?.conservationObjectiveTuple || null
+    });
+  };
 
-  // src/picks/player-pick-service.js
-  var pickIdentity = (pick) => String(pick?.pickIdentity ?? pick?.pickId ?? pick?.id ?? "");
-  var offerIdentity = (pick) => {
-    if (pick?.offerIdentity) return String(pick.offerIdentity);
-    if (!Array.isArray(pick?.offers)) return "";
-    return pick.offers.map((offer) => `${String(offer?.itemId ?? offer?.id ?? "")}:${String(offer?.resourceId ?? "")}`).sort().join("|");
+  // src/application/duplicate-route-preview.js
+  var DUPLICATE_ROUTE_READ_CAPABILITIES = Object.freeze([
+    "ea.inventory.read",
+    "ea.unassigned.read"
+  ]);
+  var DUPLICATE_ROUTE_MOVE_CAPABILITIES = Object.freeze([
+    "ea.items.move"
+  ]);
+  var DUPLICATE_ROUTE_POLICY = Object.freeze({
+    schemaVersion: 1,
+    preferSbcStorage: true,
+    tradableWhenStorageUnavailable: INVENTORY_RESOLUTION_ACTIONS.SAFE_HOLD,
+    untradeableWhenStorageUnavailable: INVENTORY_RESOLUTION_ACTIONS.PAUSE
+  });
+  var SAFE_TYPES = /* @__PURE__ */ new Set([
+    INVENTORY_RESOLUTION_ACTIONS.SEND_TO_CLUB,
+    INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE
+  ]);
+  var MAX_APPROVABLE_ROUTE_ITEMS = 100;
+  var canonicalAction = (action = {}) => ({
+    itemId: String(action.itemId || ""),
+    type: String(action.type || ""),
+    from: String(action.from || ""),
+    to: String(action.to || ""),
+    reason: String(action.reason || "")
+  });
+  var canonicalDuplicateRouteActions = (actions = []) => cloneAndFreeze((actions || []).map(canonicalAction).sort((left, right) => `${left.itemId}:${left.type}:${left.to}`.localeCompare(
+    `${right.itemId}:${right.type}:${right.to}`
+  )));
+  var fingerprintDuplicateRouteActions = (actions = []) => stableFingerprint(canonicalDuplicateRouteActions(actions));
+  var publicReason = (action) => {
+    const reasons = {
+      not_duplicate: "Unique card can move to Club",
+      duplicate_storage_available: "Exact duplicate can move to SBC Storage",
+      tradable_duplicate_storage_unavailable: "Tradable duplicate stays for your decision",
+      untradeable_duplicate_storage_unavailable: "No verified safe destination is available",
+      duplicate_identity_ambiguous: "Exact card version could not be verified",
+      unassigned_item_not_movable: "EA reports this card cannot move"
+    };
+    return reasons[action.reason] || "Kept unassigned for your decision";
   };
-  var PlayerPickService = class {
-    constructor({ adapter, logger = null } = {}) {
-      if (!adapter?.getPlayerPick || !adapter?.selectPlayerPick) {
-        throw new TypeError("PlayerPickService requires getPlayerPick and selectPlayerPick adapter methods");
+  var summarizeDuplicateRoute = ({ plan, inventorySnapshot }) => {
+    const byId = new Map(
+      (inventorySnapshot?.unassigned?.items || []).map((item) => [String(item.itemId), item])
+    );
+    const actions = canonicalDuplicateRouteActions(plan?.actions || []);
+    const blockers = [];
+    for (const action of actions) {
+      const item = byId.get(action.itemId);
+      if (!item) {
+        blockers.push({
+          code: "ROUTE_ITEM_UNOBSERVED",
+          message: "The route references an item outside the current Unassigned snapshot."
+        });
+        continue;
       }
-      this.adapter = adapter;
-      this.logger = logger;
+      if (action.type === INVENTORY_RESOLUTION_ACTIONS.SEND_TO_CLUB && (!item.hasMovableEvidence || item.isMovable !== true)) {
+        blockers.push({
+          code: "ROUTING_CAPABILITY_EVIDENCE_MISSING",
+          message: "EA did not provide verified Club-move evidence for every proposed card."
+        });
+      }
+      if (action.type === INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE && (!item.hasMovableEvidence || item.isMovable !== false || !item.hasStorableEvidence || item.isStorable !== true)) {
+        blockers.push({
+          code: "ROUTING_CAPABILITY_EVIDENCE_MISSING",
+          message: "EA did not provide verified SBC Storage evidence for every proposed card."
+        });
+      }
     }
-    async handle({ pickId, policy, context = {}, execute = false, approved = false, expectedIntent = null } = {}) {
-      const pick = await this.adapter.getPlayerPick(pickId);
-      if (pick?.resolved === true && pick?.pending !== true) {
-        return { status: "completed", reason: "PICK_ALREADY_RESOLVED", selectedItemId: null };
-      }
-      if (!pick || pick?.availability === "unavailable" || !Array.isArray(pick.offers) || !pick.offers.length) {
-        return { status: "paused", reason: "PICK_STATE_UNVERIFIED", selectedItemId: null };
-      }
-      const observedPickIdentity = pickIdentity(pick);
-      const observedOfferIdentity = offerIdentity(pick);
-      if (!observedPickIdentity || !observedOfferIdentity) {
-        return { status: "paused", reason: "PICK_IDENTITY_UNVERIFIED", selectedItemId: null };
-      }
-      if (pickId != null && String(pickId) !== observedPickIdentity) {
-        return { status: "paused", reason: "PICK_IDENTITY_CHANGED", selectedItemId: null };
-      }
-      const decision = decidePlayerPick(pick.offers, policy, context);
-      const intent = decision.selectedItemId ? {
-        pickIdentity: observedPickIdentity,
-        offerIdentity: observedOfferIdentity,
-        selectedItemId: decision.selectedItemId,
-        selectedResourceId: decision.selected?.resourceId || null
-      } : null;
-      if (expectedIntent && (String(expectedIntent.pickIdentity ?? "") !== String(intent?.pickIdentity ?? "") || String(expectedIntent.offerIdentity ?? "") !== String(intent?.offerIdentity ?? "") || String(expectedIntent.selectedItemId ?? "") !== String(intent?.selectedItemId ?? ""))) {
-        return { ...decision, intent, status: "paused", reason: "PICK_INTENT_STALE" };
-      }
-      this.logger?.info?.("player-pick.decision", {
-        pickId,
-        status: decision.status,
-        reason: decision.reason,
-        intendedItemId: decision.selectedItemId
+    const safeActions = actions.filter((action) => SAFE_TYPES.has(action.type));
+    const heldActions = actions.filter((action) => !SAFE_TYPES.has(action.type));
+    const expectedUnassignedItemIdsBefore = [...byId.keys()].sort();
+    const expectedRemainingItemIdsAfter = heldActions.map((action) => action.itemId).sort();
+    if (actions.length !== expectedUnassignedItemIdsBefore.length || new Set(actions.map((action) => action.itemId)).size !== actions.length) {
+      blockers.push({
+        code: "ROUTE_COVERAGE_MISMATCH",
+        message: "The route does not account for every current Unassigned item exactly once."
       });
-      if (decision.status !== "selected" || !execute) return { ...decision, intent };
-      if (!approved) return { ...decision, intent, status: "paused", reason: "DESTRUCTIVE_APPROVAL_REQUIRED" };
-      const current = await this.adapter.getPlayerPick(observedPickIdentity);
-      if (pickIdentity(current) !== observedPickIdentity || offerIdentity(current) !== observedOfferIdentity || !current?.offers?.some((offer) => String(offer?.itemId ?? offer?.id ?? "") === decision.selectedItemId)) {
-        return { ...decision, intent, status: "paused", reason: "PICK_INTENT_STALE" };
-      }
-      const response = await this.adapter.selectPlayerPick({
-        pickId: observedPickIdentity,
-        pickIdentity: observedPickIdentity,
-        offerIdentity: observedOfferIdentity,
-        itemId: decision.selectedItemId,
-        resourceId: decision.selected?.resourceId || null
-      });
-      const responseItemId = String(response?.selectedItemId ?? response?.itemId ?? "");
-      if (response?.success !== true || responseItemId !== decision.selectedItemId) {
-        return { ...decision, intent, status: "paused", reason: "PICK_SELECTION_UNVERIFIED", response };
-      }
-      this.logger?.info?.("player-pick.selected", { pickId, itemId: decision.selectedItemId });
-      return { ...decision, intent, status: "completed", response };
     }
-    async recover(intent, context = {}) {
-      if (!intent?.pickIdentity || !intent?.selectedItemId) {
-        return { status: "ambiguous", reason: "PICK_INTENT_MISSING" };
-      }
-      if (typeof this.adapter.reconcilePlayerPick === "function") {
-        return this.adapter.reconcilePlayerPick(intent, context);
-      }
-      const current = await this.adapter.getPlayerPick(intent.pickIdentity);
-      if (current?.pending === true && pickIdentity(current) === String(intent.pickIdentity)) {
-        if (offerIdentity(current) === String(intent.offerIdentity)) {
-          return { status: "not_applied", reason: "PICK_STILL_PENDING" };
-        }
-        return { status: "ambiguous", reason: "PICK_OFFERS_CHANGED" };
-      }
-      const items = Array.isArray(context?.inventoryItems) ? context.inventoryItems : [];
-      const beforeItemIds = new Set(
-        (intent.inventoryItemIdsBefore ?? []).map(String)
-      );
-      const selectedObserved = items.some((item) => {
-        const id = String(item?.itemId ?? item?.id ?? "");
-        return id === String(intent.selectedItemId) && !beforeItemIds.has(id);
+    if (actions.length > MAX_APPROVABLE_ROUTE_ITEMS) {
+      blockers.push({
+        code: "ROUTE_TOO_LARGE",
+        message: `This route exceeds the ${MAX_APPROVABLE_ROUTE_ITEMS}-item safety boundary.`
       });
-      const resourceCountAfter = intent.selectedResourceId ? items.filter(
-        (item) => String(item?.resourceId ?? "") === String(intent.selectedResourceId)
-      ).length : 0;
-      const resourceDeltaObserved = intent.selectedResourceId && Number.isSafeInteger(intent.selectedResourceCountBefore) && resourceCountAfter > intent.selectedResourceCountBefore;
-      if (selectedObserved || resourceDeltaObserved) {
-        return { status: "completed", result: { selectedItemId: intent.selectedItemId } };
-      }
-      return { status: "ambiguous", reason: "PICK_CONSUMPTION_UNVERIFIED" };
+    }
+    const uniqueBlockers = [...new Map(
+      blockers.map((blocker) => [`${blocker.code}:${blocker.message}`, blocker])
+    ).values()];
+    const cards = actions.map((action) => {
+      const item = byId.get(action.itemId) || {};
+      return {
+        itemId: action.itemId,
+        name: item.name || null,
+        rating: Number(item.rating || 0),
+        isSpecial: Boolean(item.isSpecial),
+        isTradable: Boolean(item.isTradable),
+        action: action.type,
+        destination: action.to,
+        reason: publicReason(action)
+      };
+    });
+    return cloneAndFreeze({
+      status: uniqueBlockers.length ? "blocked" : safeActions.length ? "ready" : "clear",
+      totalCount: actions.length,
+      safeCount: safeActions.length,
+      toClubCount: safeActions.filter((action) => action.type === INVENTORY_RESOLUTION_ACTIONS.SEND_TO_CLUB).length,
+      toStorageCount: safeActions.filter((action) => action.type === INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE).length,
+      attentionCount: heldActions.length,
+      cards,
+      blockers: uniqueBlockers,
+      routeActions: actions,
+      approvedActions: safeActions,
+      expectedUnassignedItemIdsBefore,
+      expectedRemainingItemIdsAfter,
+      actionSetFingerprint: fingerprintDuplicateRouteActions(actions)
+    });
+  };
+  var buildDuplicateRouteFingerprints = ({
+    gameContext,
+    inventorySnapshot,
+    capabilitySnapshot,
+    policy,
+    routeActions
+  }) => buildPlanningFingerprints({
+    gameContext,
+    inventorySnapshot,
+    capabilitySnapshot,
+    requiredCapabilities: [
+      ...DUPLICATE_ROUTE_READ_CAPABILITIES,
+      ...DUPLICATE_ROUTE_MOVE_CAPABILITIES
+    ],
+    bindings: {
+      policy,
+      actionSetFingerprint: fingerprintDuplicateRouteActions(routeActions)
+    }
+  });
+  var compareDuplicateRouteFingerprints = comparePlanningFingerprints;
+
+  // src/application/entitlement-service.js
+  var ProductPlan = Object.freeze({ FREE: "free", PRO: "pro" });
+  var Feature = Object.freeze({
+    PRODUCT_SHELL: "product_shell",
+    SBC_PROJECTS: "sbc_projects",
+    LOCAL_RECIPES: "local_recipes",
+    ADVANCED_TOOLS: "advanced_tools",
+    EVOLUTION_PLANNING: "evolution_planning",
+    CLUB_OPTIMIZATION: "club_optimization",
+    PROJECT_OPTIMIZATION: "project_optimization",
+    SMART_ROUTING: "smart_routing",
+    CLOUD_RECIPES: "cloud_recipes"
+  });
+  var FREE_FEATURES = /* @__PURE__ */ new Set([Feature.PRODUCT_SHELL, Feature.SBC_PROJECTS, Feature.LOCAL_RECIPES, Feature.ADVANCED_TOOLS]);
+  var PRO_FEATURES = /* @__PURE__ */ new Set([
+    ...FREE_FEATURES,
+    Feature.EVOLUTION_PLANNING,
+    Feature.CLUB_OPTIMIZATION,
+    Feature.PROJECT_OPTIMIZATION,
+    Feature.SMART_ROUTING,
+    Feature.CLOUD_RECIPES
+  ]);
+  var EntitlementService = class {
+    constructor({ plan = ProductPlan.FREE } = {}) {
+      if (!Object.values(ProductPlan).includes(plan)) throw new TypeError(`Unknown product plan: ${plan}`);
+      this.plan = plan;
+    }
+    check(feature) {
+      if (!Object.values(Feature).includes(feature)) throw new TypeError(`Unknown feature: ${feature}`);
+      const entitled = (this.plan === ProductPlan.PRO ? PRO_FEATURES : FREE_FEATURES).has(feature);
+      return cloneAndFreeze({ entitled, feature, plan: this.plan, requiredPlan: entitled ? this.plan : ProductPlan.PRO });
     }
   };
+
+  // src/application/pro-contracts/errors.js
+  var PRO_CONTRACT_ERROR_CODES = Object.freeze({
+    CONTRACT_INVALID: "CONTRACT_INVALID",
+    CONTRACT_VERSION_UNSUPPORTED: "CONTRACT_VERSION_UNSUPPORTED",
+    CONTRACT_TOO_LARGE: "CONTRACT_TOO_LARGE",
+    PROVIDER_NOT_CONFIGURED: "PROVIDER_NOT_CONFIGURED",
+    PROVIDER_OFFLINE: "PROVIDER_OFFLINE",
+    PROVIDER_TIMEOUT: "PROVIDER_TIMEOUT",
+    PROVIDER_INVALID_RESPONSE: "PROVIDER_INVALID_RESPONSE",
+    RESPONSE_MISMATCH: "RESPONSE_MISMATCH",
+    RESPONSE_EXPIRED: "RESPONSE_EXPIRED",
+    HANDLE_UNKNOWN: "HANDLE_UNKNOWN",
+    LOCAL_REVALIDATION_FAILED: "LOCAL_REVALIDATION_FAILED"
+  });
+
+  // src/application/pro-contracts/schema.js
+  var PRO_CONTRACT_LIMITS = Object.freeze({
+    MAX_BYTES: 512 * 1024,
+    MAX_DEPTH: 16,
+    MAX_ARRAY_LENGTH: 5e3,
+    MAX_OBJECT_KEYS: 128,
+    MAX_STRING_BYTES: 240,
+    // Compatibility alias for callers written before limits were clarified as
+    // UTF-8 byte limits. Both names intentionally have the same value.
+    MAX_STRING_LENGTH: 240,
+    MAX_ID_LENGTH: 128,
+    MAX_FEATURES: 64
+  });
+  var FORBIDDEN_KEY_TOKENS = [
+    "authorization",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "password",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "session",
+    "sessionid",
+    "sessiontoken",
+    "headers",
+    "endpoint",
+    "url",
+    "uri",
+    "href",
+    "html",
+    "script",
+    "selector",
+    "expression",
+    "workflow",
+    "steps",
+    "command",
+    "module",
+    "wasm",
+    "function",
+    "itemid",
+    "resourceid",
+    "definitionid",
+    "assetid",
+    "baseplayerid",
+    "playerid"
+  ];
+  var PRO_CONTRACT_FORBIDDEN_KEYS = Object.freeze(
+    [...new Set(FORBIDDEN_KEY_TOKENS)].sort()
+  );
+  var forbiddenKeys = new Set(PRO_CONTRACT_FORBIDDEN_KEYS);
+  var encoder = new TextEncoder();
+
+  // src/application/evolution-metadata-provider.js
+  var EVOLUTION_METADATA_LIMITS = Object.freeze({
+    maxBytes: 16 * 1024,
+    maxDepth: 5,
+    maxObjectKeys: 16,
+    maxRequestTtlMs: 2 * 6e4,
+    maxEvidenceTtlMs: 24 * 60 * 6e4,
+    maxDefinitions: 2e3,
+    maxStringBytes: 128
+  });
+  var EvolutionMetadataProviderState = Object.freeze({
+    READY: "ready",
+    UNVERIFIED: "unverified",
+    NOT_CONFIGURED: "not_configured"
+  });
+  var EvolutionMetadataEvidenceState = Object.freeze({
+    VERIFIED: "verified",
+    UNVERIFIED: "unverified"
+  });
+  var EvolutionMetadataGameVersion = Object.freeze({
+    FC26: "fc26",
+    FC27: "fc27"
+  });
+
+  // src/application/evolution-planner.js
+  var EVOLUTION_PLANNER_LIMITS = Object.freeze({
+    maxDepth: 4,
+    maxNodes: 256,
+    maxEdges: 128,
+    maxEdgeEvaluations: 1e4,
+    maxAlternatives: 16,
+    maxCollectionSize: 32
+  });
+  var EVOLUTION_PLANNER_HARD_LIMITS = Object.freeze({
+    maxDepth: 8,
+    maxNodes: 2e3,
+    maxEdges: 512,
+    maxEdgeEvaluations: 5e4,
+    maxAlternatives: 64,
+    maxCollectionSize: 64
+  });
+  var EvolutionAttribute = Object.freeze({
+    PACE: "pace",
+    SHOOTING: "shooting",
+    PASSING: "passing",
+    DRIBBLING: "dribbling",
+    DEFENDING: "defending",
+    PHYSICAL: "physical"
+  });
+  var EvolutionPosition = Object.freeze([
+    "GK",
+    "RB",
+    "RWB",
+    "CB",
+    "LB",
+    "LWB",
+    "CDM",
+    "CM",
+    "CAM",
+    "RM",
+    "RW",
+    "LM",
+    "LW",
+    "CF",
+    "ST"
+  ]);
+  var EvolutionObjectiveDimension = Object.freeze({
+    OVERALL: "OVERALL",
+    PACE: "PACE",
+    SHOOTING: "SHOOTING",
+    PASSING: "PASSING",
+    DRIBBLING: "DRIBBLING",
+    DEFENDING: "DEFENDING",
+    PHYSICAL: "PHYSICAL",
+    POSITION_MATCHES: "POSITION_MATCHES",
+    ROLE_MATCHES: "ROLE_MATCHES",
+    PLAYSTYLE_MATCHES: "PLAYSTYLE_MATCHES",
+    PLAYSTYLE_PLUS_MATCHES: "PLAYSTYLE_PLUS_MATCHES",
+    ELIGIBILITY_TAG_MATCHES: "ELIGIBILITY_TAG_MATCHES",
+    PATH_LENGTH: "PATH_LENGTH"
+  });
+  var EvolutionObjectiveDirection = Object.freeze({
+    MAXIMIZE: "MAXIMIZE",
+    MINIMIZE: "MINIMIZE"
+  });
+  var EvolutionTransformOperation = Object.freeze({
+    ADD_CAPPED: "ADD_CAPPED",
+    SET: "SET",
+    MAX: "MAX"
+  });
+  var EvolutionSearchStatus = Object.freeze({
+    COMPLETE_WITHIN_BOUNDS: "COMPLETE_WITHIN_BOUNDS",
+    NO_VERIFIED_PATH: "NO_VERIFIED_PATH",
+    BOUNDED: "BOUNDED"
+  });
+  var EvolutionBoundReason = Object.freeze({
+    DEPTH_BOUND_REACHED: "DEPTH_BOUND_REACHED",
+    NODE_BOUND_REACHED: "NODE_BOUND_REACHED",
+    EDGE_EVALUATION_BOUND_REACHED: "EDGE_EVALUATION_BOUND_REACHED",
+    ALTERNATIVE_BOUND_REACHED: "ALTERNATIVE_BOUND_REACHED"
+  });
+  var EvolutionExplanationCode = Object.freeze({
+    STARTING_STATE: "STARTING_STATE",
+    VERIFIED_EDGE_APPLIED: "VERIFIED_EDGE_APPLIED",
+    OVERALL_CHANGED: "OVERALL_CHANGED",
+    ATTRIBUTE_CHANGED: "ATTRIBUTE_CHANGED",
+    POSITION_ADDED: "POSITION_ADDED",
+    ROLE_ADDED: "ROLE_ADDED",
+    PLAYSTYLE_ADDED: "PLAYSTYLE_ADDED",
+    PLAYSTYLE_PLUS_ADDED: "PLAYSTYLE_PLUS_ADDED",
+    RARITY_CHANGED: "RARITY_CHANGED",
+    ELIGIBILITY_TAG_CHANGED: "ELIGIBILITY_TAG_CHANGED",
+    PARETO_NON_DOMINATED: "PARETO_NON_DOMINATED"
+  });
+  var EvolutionPlannerErrorCode = Object.freeze({
+    INVALID_INPUT: "INVALID_INPUT",
+    BOUND_EXCEEDED: "BOUND_EXCEEDED",
+    UNVERIFIED_EDGE: "UNVERIFIED_EDGE",
+    DUPLICATE_EDGE: "DUPLICATE_EDGE",
+    INVALID_TRANSFORMATION: "INVALID_TRANSFORMATION",
+    INVALID_OBJECTIVE: "INVALID_OBJECTIVE"
+  });
+  var ATTRIBUTE_KEYS = Object.freeze(Object.values(EvolutionAttribute));
+  var POSITION_SET = new Set(EvolutionPosition);
+  var OBJECTIVE_DIMENSIONS = new Set(Object.values(EvolutionObjectiveDimension));
+  var DIRECTIONS = new Set(Object.values(EvolutionObjectiveDirection));
+  var TRANSFORM_OPERATIONS = new Set(Object.values(EvolutionTransformOperation));
 
   // src/sbc/solver/item-identity.js
   var firstDefined = (...values) => values.find((value) => value !== null && value !== void 0 && value !== "");
@@ -3464,6 +1995,4014 @@
     }
   };
 
+  // src/application/goals.js
+  var GoalKind = Object.freeze({
+    COMPLETE_SBC: "complete_sbc",
+    GRIND_UPGRADES: "grind_upgrades",
+    CLEAR_DUPLICATES: "clear_duplicates",
+    OPTIMIZE_FODDER: "optimize_fodder",
+    PLAN_EVOLUTION: "plan_evolution",
+    OPTIMIZE_CLUB: "optimize_club"
+  });
+  var createGoal = ({ kind, intent, inputs = {}, createdAt = Date.now() }) => {
+    if (!Object.values(GoalKind).includes(kind)) throw new TypeError(`Unknown goal kind: ${kind}`);
+    const normalized = { kind, intent: String(intent || kind), inputs, createdAt: Math.max(0, Number(createdAt) || 0) };
+    return cloneAndFreeze({ id: stableFingerprint(normalized), ...normalized });
+  };
+
+  // src/application/fodder-review.js
+  var FODDER_REVIEW_KIND = "PROTECTION_REVIEW_V1";
+  var FODDER_REVIEW_SAFETY_BOUNDARY = "READ_ONLY_NO_EXECUTION";
+  var FODDER_REVIEW_CAPABILITIES = Object.freeze(["ea.inventory.read"]);
+  var FODDER_REVIEW_LIMITS = Object.freeze({
+    maxItems: 5e3,
+    maxActiveProjects: 100,
+    maxExamplesPerReason: 5,
+    maxSpecialReserveSignals: 100,
+    maxSignalsPerProject: 12,
+    maxProjectNameLength: 120
+  });
+  var FodderReviewVerificationState = Object.freeze({
+    VERIFIED: "verified",
+    UNVERIFIED: "unverified"
+  });
+  var REASON_DEFINITIONS = Object.freeze([
+    ["locked-item", "EA item lock", "ea_item"],
+    ["protected-item-flag", "EA protected-item flag", "ea_item"],
+    ["protected-item", "Protected owned card", "user_policy"],
+    ["protected-player", "Protected footballer", "user_or_project_policy"],
+    ["protected-resource", "Protected card version", "user_or_project_policy"],
+    ["protected-rating", "Protected rating threshold", "user_or_project_policy"],
+    ["target-project-rating", "Target Project exact rating", "target_project"],
+    ["protected-card-type", "Protected card type", "user_policy"],
+    ["special-type-not-allowed", "Special type is not allowed", "user_policy"],
+    ["starting-squad", "Active Squad protection", "safety_invariant"],
+    ["favorite", "Favorite-card protection", "user_policy"],
+    ["tradable", "Tradable-card protection", "user_policy"]
+  ]);
+  var REASON_ORDER = new Map(REASON_DEFINITIONS.map(([code], index) => [code, index]));
+  var REASON_META = new Map(
+    REASON_DEFINITIONS.map(([code, label, source]) => [code, { label, source }])
+  );
+  var FIELD_LABELS = Object.freeze({
+    locked: "item-lock",
+    protected: "protected-item",
+    favorite: "favorite-card",
+    special: "special-card",
+    tradability: "tradability",
+    startingSquad: "Active Squad"
+  });
+  var normalizeState = (value) => {
+    const raw = value && typeof value === "object" ? value.state : value;
+    return String(raw || "unverified").trim().toLowerCase() === "verified" ? FodderReviewVerificationState.VERIFIED : FodderReviewVerificationState.UNVERIFIED;
+  };
+  var normalizeActiveSquadEvidence = (value = {}) => ({
+    state: normalizeState(value),
+    mode: value?.mode == null ? null : String(value.mode)
+  });
+  var canonicalSourceEvidence = (sourceEvidence = {}) => {
+    const fields = sourceEvidence?.fields || {};
+    return {
+      schemaVersion: Math.max(0, Number(sourceEvidence?.schemaVersion || 0)),
+      fields: Object.fromEntries(
+        Object.keys(FIELD_LABELS).sort().map((field) => [field, normalizeState(fields[field])])
+      ),
+      activeSquadProtection: normalizeActiveSquadEvidence(
+        sourceEvidence?.activeSquadProtection
+      ),
+      loansIncluded: sourceEvidence?.loansIncluded === true
+    };
+  };
+  var toSortedUniqueStrings = (values) => [...new Set((Array.isArray(values) ? values : []).map(String))].sort();
+  var canonicalMapEntries = (value) => {
+    const entries = value instanceof Map ? [...value.entries()] : value && typeof value === "object" ? Object.entries(value) : [];
+    return entries.map(([key, entry]) => [String(key), Number(entry) || 0]).sort(([left], [right]) => left.localeCompare(right));
+  };
+  var canonicalProjectDemand = (value) => (Array.isArray(value) ? value : []).map((entry) => ({
+    projectId: String(entry?.projectId || ""),
+    rating: Number(entry?.rating || 0),
+    count: Math.max(0, Number(entry?.count || 0)),
+    priority: Math.max(0, Number(entry?.priority || 0))
+  })).sort((left, right) => left.projectId.localeCompare(right.projectId) || left.rating - right.rating || left.count - right.count || left.priority - right.priority);
+  var canonicalPolicy = (policy) => {
+    const config = policy?.config || {};
+    return {
+      protectRatingAtOrAbove: config.protectRatingAtOrAbove ?? null,
+      preferredFodderRange: {
+        min: Number(config.preferredFodderRange?.min || 0),
+        max: Number(config.preferredFodderRange?.max || 0)
+      },
+      protectedCardTypes: toSortedUniqueStrings(config.protectedCardTypes),
+      allowedSpecialTypes: toSortedUniqueStrings(config.allowedSpecialTypes),
+      restrictSpecialTypes: config.restrictSpecialTypes === true,
+      protectedItemIds: toSortedUniqueStrings(config.protectedItemIds),
+      protectedPlayerIds: toSortedUniqueStrings(config.protectedPlayerIds),
+      protectedResourceIds: toSortedUniqueStrings(config.protectedResourceIds),
+      protectedExactRatings: [...new Set(config.protectedExactRatings || [])].map(Number).sort((left, right) => left - right),
+      protectStartingSquad: config.protectStartingSquad === true,
+      protectFavorites: config.protectFavorites === true,
+      protectTradables: config.protectTradables === true,
+      preferUntradeables: config.preferUntradeables === true,
+      preferDuplicates: config.preferDuplicates === true,
+      preferSbcStorage: config.preferSbcStorage === true,
+      minimumReserveByRating: canonicalMapEntries(config.minimumReserveByRating),
+      specialReserveByCardType: canonicalMapEntries(config.specialReserveByCardType),
+      projectRatingDemand: canonicalProjectDemand(config.projectRatingDemand),
+      activeTargetProjectIds: toSortedUniqueStrings(config.activeTargetProjectIds)
+    };
+  };
+  var canonicalInventory2 = (snapshot = {}) => ({
+    storageCapacity: snapshot?.storageCapacity ?? null,
+    items: (Array.isArray(snapshot?.items) ? snapshot.items : []).map((item) => ({
+      itemId: String(item?.itemId ?? item?.id ?? ""),
+      resourceId: item?.resourceId == null ? null : String(item.resourceId),
+      baseId: item?.baseId ?? item?.basePlayerId ?? null,
+      assetId: item?.assetId ?? null,
+      location: item?.location ?? null,
+      rating: Number(item?.rating || 0),
+      cardType: item?.cardType ?? null,
+      rarityName: item?.rarityName ?? null,
+      isSpecial: item?.isSpecial ?? null,
+      isTradable: item?.isTradable ?? item?.isTradeable ?? null,
+      isDuplicate: item?.isDuplicate ?? null,
+      isStorage: item?.isStorage ?? null,
+      isLocked: item?.isLocked ?? item?.locked ?? null,
+      isProtected: item?.isProtected ?? null,
+      isFavorite: item?.isFavorite ?? item?.isFavourite ?? null,
+      isInStartingSquad: item?.isInStartingSquad ?? item?.isInActive11 ?? null,
+      hasTradabilityEvidence: item?.hasTradabilityEvidence ?? null,
+      hasLockedEvidence: item?.hasLockedEvidence ?? null,
+      hasProtectedEvidence: item?.hasProtectedEvidence ?? null,
+      hasFavoriteEvidence: item?.hasFavoriteEvidence ?? null,
+      hasStartingSquadEvidence: item?.hasStartingSquadEvidence ?? null,
+      hasSpecialEvidence: item?.hasSpecialEvidence ?? null,
+      hasMovableEvidence: item?.hasMovableEvidence ?? null,
+      hasStorableEvidence: item?.hasStorableEvidence ?? null
+    })).sort((left, right) => left.itemId.localeCompare(right.itemId))
+  });
+  var sortCanonicalArray = (values) => (Array.isArray(values) ? values : []).map((value) => canonicalValue(value)).sort((left, right) => stableStringify(left).localeCompare(stableStringify(right)));
+  var canonicalValue = (value) => {
+    if (Array.isArray(value)) return sortCanonicalArray(value);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])])
+    );
+  };
+  var getActiveProjects = (targetProjects) => {
+    if (targetProjects instanceof TargetProjectService) {
+      return targetProjects.getActiveProjects();
+    }
+    return new TargetProjectService(Array.isArray(targetProjects) ? targetProjects : []).getActiveProjects();
+  };
+  var canonicalProjects = (projects) => sortCanonicalArray(projects).sort((left, right) => String(left?.id || "").localeCompare(String(right?.id || "")));
+  var canonicalCapabilityEvidence = (evidence) => {
+    if (!evidence || typeof evidence !== "object") return null;
+    const keys = ["kind", "source", "schemaVersion", "adapterVersion", "mode"];
+    const result = Object.fromEntries(
+      keys.filter((key) => evidence[key] != null).map((key) => [key, evidence[key]])
+    );
+    return Object.keys(result).length ? canonicalValue(result) : null;
+  };
+  var canonicalCapabilities2 = (snapshot = {}) => ({
+    capabilities: (Array.isArray(snapshot?.capabilities) ? snapshot.capabilities : []).filter((entry) => FODDER_REVIEW_CAPABILITIES.includes(entry?.id)).map((entry) => ({
+      id: String(entry.id),
+      state: String(entry.state || "unverified"),
+      evidence: canonicalCapabilityEvidence(entry.evidence)
+    })).sort((left, right) => left.id.localeCompare(right.id))
+  });
+  var buildFodderReviewFingerprints = ({
+    gameContext,
+    inventorySnapshot,
+    policy,
+    targetProjects = [],
+    capabilitySnapshot,
+    sourceEvidence
+  } = {}) => {
+    if (!(policy instanceof FodderPolicy)) {
+      throw new TypeError("Fodder review requires a FodderPolicy");
+    }
+    const projects = getActiveProjects(targetProjects);
+    const components = {
+      game: stableFingerprint({
+        gameVersion: gameContext?.gameVersion ?? null,
+        state: gameContext?.state ?? null
+      }),
+      inventory: stableFingerprint(canonicalInventory2(inventorySnapshot)),
+      policy: stableFingerprint(canonicalPolicy(policy)),
+      projects: stableFingerprint(canonicalProjects(projects)),
+      capabilities: stableFingerprint(canonicalCapabilities2(capabilitySnapshot)),
+      sourceEvidence: stableFingerprint(canonicalSourceEvidence(sourceEvidence))
+    };
+    return cloneAndFreeze({
+      ...components,
+      combined: stableFingerprint(components),
+      inventoryGeneration: Math.max(0, Number(inventorySnapshot?.generation || 0))
+    });
+  };
+  var getCardType2 = (item) => String(
+    item?.cardType ?? item?.specialCardGroup ?? item?.rarityGroup ?? item?.rarityName ?? "base"
+  ).trim().toLowerCase();
+  var locationCounts = (items) => {
+    const counts = { club: 0, sbcStorage: 0, unassigned: 0 };
+    for (const item of items) {
+      if (item?.location === "club") counts.club += 1;
+      else if (item?.location === "sbc_storage" || item?.isStorage === true) counts.sbcStorage += 1;
+      else if (item?.location === "unassigned") counts.unassigned += 1;
+    }
+    return counts;
+  };
+  var parseObservedAt = (value) => {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    if (typeof value !== "string" || !value.trim()) return null;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  var boundedText = (value, maxLength) => String(value || "").slice(0, maxLength);
+  var buildProjectSignals = (projects, { maxSignalsPerProject, maxProjectNameLength }) => projects.map((project) => {
+    const hardExclusions = [];
+    if (project.protectedRatings?.atOrAbove != null) {
+      hardExclusions.push(`${project.protectedRatings.atOrAbove}+ rating threshold`);
+    }
+    for (const rating of project.protectedRatings?.exact || []) {
+      hardExclusions.push(`Exact ${rating} rating`);
+    }
+    const reserveEntries = Object.entries(project.protectedRatings?.reserveByRating || {});
+    if (project.protectedPlayerIds?.length) {
+      hardExclusions.push(`${project.protectedPlayerIds.length} protected footballer${project.protectedPlayerIds.length === 1 ? "" : "s"}`);
+    }
+    if (project.protectedResourceIds?.length) {
+      hardExclusions.push(`${project.protectedResourceIds.length} protected card version${project.protectedResourceIds.length === 1 ? "" : "s"}`);
+    }
+    const conservationPreferences = reserveEntries.map(([rating, count]) => `Keep ${count} at ${rating} rating`);
+    for (const requirement of project.ratingRequirements || []) {
+      const remaining = Math.max(0, Number(requirement.count || 0) - Number(requirement.completed || 0));
+      if (remaining > 0) conservationPreferences.push(
+        `${remaining} remaining ${requirement.rating}-rated squad signal${remaining === 1 ? "" : "s"}`
+      );
+    }
+    for (const requirement of project.specialCardRequirements || []) {
+      const remaining = Math.max(0, Number(requirement.count || 0) - Number(requirement.completed || 0));
+      if (remaining > 0) conservationPreferences.push(
+        `Keep ${remaining} ${String(requirement.cardType).toUpperCase()} special signal${remaining === 1 ? "" : "s"}`
+      );
+    }
+    const unknownRequirementCount = (project.sourceChallenges || []).reduce(
+      (sum, challenge) => sum + (challenge.unknownRequirements?.length || 0),
+      0
+    );
+    return {
+      name: boundedText(project.name || "Target Project", maxProjectNameLength),
+      hardExclusions: hardExclusions.slice(0, maxSignalsPerProject),
+      conservationPreferences: conservationPreferences.slice(0, maxSignalsPerProject),
+      unknownRequirementCount
+    };
+  });
+  var buildCoverage = (policy, sourceEvidence) => {
+    const evidence = canonicalSourceEvidence(sourceEvidence);
+    const required = /* @__PURE__ */ new Set(["locked", "protected"]);
+    if (policy.config.protectFavorites) required.add("favorite");
+    if (policy.config.protectTradables) required.add("tradability");
+    if (policy.config.restrictSpecialTypes || Object.keys(policy.config.specialReserveByCardType || {}).length > 0) {
+      required.add("special");
+    }
+    if (policy.config.protectStartingSquad && evidence.activeSquadProtection.state !== FodderReviewVerificationState.VERIFIED) {
+      required.add("startingSquad");
+    }
+    const missingFields = [...required].filter((field) => evidence.fields[field] !== FodderReviewVerificationState.VERIFIED).sort();
+    const warnings = missingFields.map((field) => `${FIELD_LABELS[field] || field} evidence is UNVERIFIED; cards without a known hard reason are not classified as safe fodder.`);
+    return {
+      evidence,
+      missingFields,
+      warnings,
+      state: missingFields.length ? FodderReviewVerificationState.UNVERIFIED : FodderReviewVerificationState.VERIFIED
+    };
+  };
+  var emptyPreview = ({ itemCount, projectCount, warnings }) => ({
+    kind: FODDER_REVIEW_KIND,
+    safetyBoundary: FODDER_REVIEW_SAFETY_BOUNDARY,
+    readOnly: true,
+    canApprove: false,
+    verificationState: FodderReviewVerificationState.UNVERIFIED,
+    analyzedItemCount: 0,
+    observedItemCount: itemCount,
+    observedAt: null,
+    activeProjectCount: projectCount,
+    uniqueHardProtectedCount: 0,
+    notHardProtectedCount: null,
+    reasonGroups: [],
+    projectSignals: [],
+    softConservation: {
+      ratingReserves: [],
+      specialReserves: [],
+      projectRatingDemand: [],
+      preferences: {},
+      activeTargetProjectIds: []
+    },
+    sourceCoverage: null,
+    warnings,
+    limits: { ...FODDER_REVIEW_LIMITS }
+  });
+  var summarizeFodderReview = ({
+    inventorySnapshot,
+    policy,
+    targetProjects = [],
+    sourceEvidence = {},
+    limits = FODDER_REVIEW_LIMITS
+  } = {}) => {
+    if (!(policy instanceof FodderPolicy)) {
+      throw new TypeError("Fodder review requires a FodderPolicy");
+    }
+    const items = Array.isArray(inventorySnapshot?.items) ? inventorySnapshot.items : [];
+    const projects = getActiveProjects(targetProjects);
+    const boundedLimit = (value, fallback, minimum) => {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.min(fallback, Math.max(minimum, Math.trunc(parsed)));
+    };
+    const maxItems = boundedLimit(
+      limits?.maxItems,
+      FODDER_REVIEW_LIMITS.maxItems,
+      1
+    );
+    const maxActiveProjects = boundedLimit(
+      limits?.maxActiveProjects,
+      FODDER_REVIEW_LIMITS.maxActiveProjects,
+      1
+    );
+    const maxExamples = boundedLimit(
+      limits?.maxExamplesPerReason,
+      FODDER_REVIEW_LIMITS.maxExamplesPerReason,
+      0
+    );
+    const maxSignalsPerProject = boundedLimit(
+      limits?.maxSignalsPerProject,
+      FODDER_REVIEW_LIMITS.maxSignalsPerProject,
+      0
+    );
+    const maxProjectNameLength = boundedLimit(
+      limits?.maxProjectNameLength,
+      FODDER_REVIEW_LIMITS.maxProjectNameLength,
+      1
+    );
+    const maxSpecialReserveSignals = boundedLimit(
+      limits?.maxSpecialReserveSignals,
+      FODDER_REVIEW_LIMITS.maxSpecialReserveSignals,
+      1
+    );
+    const conservation = policy.toSolverConservationPolicy();
+    const blockers = [];
+    if (items.length > maxItems) {
+      blockers.push({
+        code: "REVIEW_INPUT_TOO_LARGE",
+        message: `Protection Review supports at most ${maxItems} inventory items without truncation.`
+      });
+    }
+    if (projects.length > maxActiveProjects) {
+      blockers.push({
+        code: "REVIEW_INPUT_TOO_LARGE",
+        message: `Protection Review supports at most ${maxActiveProjects} active projects without truncation.`
+      });
+    }
+    if (Object.keys(conservation.specialReserveByCardType || {}).length > maxSpecialReserveSignals) {
+      blockers.push({
+        code: "REVIEW_INPUT_TOO_LARGE",
+        message: `Protection Review supports at most ${maxSpecialReserveSignals} special-card reserve signals without truncation.`
+      });
+    }
+    if (blockers.length) {
+      return cloneAndFreeze({
+        blockers,
+        preview: emptyPreview({
+          itemCount: items.length,
+          projectCount: projects.length,
+          warnings: blockers.map((blocker) => blocker.message)
+        })
+      });
+    }
+    const analysis = policy.analyze(items);
+    const byId = new Map(analysis.items.map((item) => [String(item.itemId), item]));
+    const groups = /* @__PURE__ */ new Map();
+    for (const [itemId, reasons] of Object.entries(analysis.reasonsByItemId)) {
+      const item = byId.get(String(itemId));
+      for (const code of reasons) {
+        if (!groups.has(code)) groups.set(code, []);
+        groups.get(code).push({ itemId: String(itemId), item });
+      }
+    }
+    const reasonGroups = [...groups.entries()].sort(([left], [right]) => (REASON_ORDER.get(left) ?? Number.MAX_SAFE_INTEGER) - (REASON_ORDER.get(right) ?? Number.MAX_SAFE_INTEGER) || left.localeCompare(right)).map(([code, entries]) => {
+      const meta = REASON_META.get(code) || {
+        label: code.replaceAll("-", " "),
+        source: "policy"
+      };
+      const sorted = entries.sort((left, right) => left.itemId.localeCompare(right.itemId));
+      return {
+        code,
+        label: meta.label,
+        source: meta.source,
+        itemCount: sorted.length,
+        examples: sorted.slice(0, maxExamples).map(({ item }) => ({
+          name: item?.name == null ? null : String(item.name),
+          rating: Number(item?.rating || 0),
+          location: item?.location ?? (item?.isStorage ? "sbc_storage" : null),
+          cardType: getCardType2(item)
+        }))
+      };
+    });
+    const coverage = buildCoverage(policy, sourceEvidence);
+    const ratingReserves = Object.entries(conservation.minimumReserveByRating || {}).map(([rating, reserved]) => {
+      const matches = analysis.items.filter((item) => Number(item?.rating || 0) === Number(rating));
+      return {
+        rating: Number(rating),
+        reserved: Math.max(0, Number(reserved || 0)),
+        observedCount: matches.length,
+        observedByLocation: locationCounts(matches),
+        signal: "soft_conservation"
+      };
+    }).sort((left, right) => left.rating - right.rating);
+    const specialReserves = Object.entries(conservation.specialReserveByCardType || {}).map(([cardType, reserved]) => {
+      const normalizedType = String(cardType).trim().toLowerCase();
+      const matches = analysis.items.filter((item) => item?.isSpecial === true && getCardType2(item) === normalizedType);
+      return {
+        cardType: normalizedType,
+        reserved: Math.max(0, Number(reserved || 0)),
+        observedCount: coverage.evidence.fields.special === FodderReviewVerificationState.VERIFIED ? matches.length : null,
+        observedByLocation: coverage.evidence.fields.special === FodderReviewVerificationState.VERIFIED ? locationCounts(matches) : null,
+        signal: "soft_conservation"
+      };
+    }).sort((left, right) => left.cardType.localeCompare(right.cardType));
+    const projectWarnings = projects.flatMap((project) => {
+      const unknown = (project.sourceChallenges || []).reduce(
+        (sum, challenge) => sum + (challenge.unknownRequirements?.length || 0),
+        0
+      );
+      return unknown > 0 ? [`Target Project ${project.name} has ${unknown} unknown requirement${unknown === 1 ? "" : "s"}; its conservation signals are incomplete.`] : [];
+    });
+    const projectSignals = buildProjectSignals(projects, {
+      maxSignalsPerProject,
+      maxProjectNameLength
+    });
+    const warnings = [...coverage.warnings, ...projectWarnings];
+    return cloneAndFreeze({
+      blockers: [],
+      preview: {
+        kind: FODDER_REVIEW_KIND,
+        safetyBoundary: FODDER_REVIEW_SAFETY_BOUNDARY,
+        readOnly: true,
+        canApprove: false,
+        verificationState: coverage.state,
+        analyzedItemCount: analysis.items.length,
+        observedItemCount: items.length,
+        observedAt: parseObservedAt(inventorySnapshot?.updatedAt),
+        activeProjectCount: projects.length,
+        uniqueHardProtectedCount: analysis.protectedItemIds.length,
+        notHardProtectedCount: coverage.state === FodderReviewVerificationState.VERIFIED ? analysis.eligibleItems.length : null,
+        reasonGroups,
+        projectSignals,
+        softConservation: {
+          ratingReserves,
+          specialReserves,
+          projectRatingDemand: canonicalProjectDemand(conservation.projectRatingDemand),
+          preferences: {
+            preferDuplicates: conservation.preferDuplicates === true,
+            preferSbcStorage: conservation.preferSbcStorage === true,
+            preferUntradeables: conservation.preferUntradeables === true,
+            preferredFodderRange: { ...conservation.preferredFodderRange }
+          },
+          activeTargetProjectIds: toSortedUniqueStrings(analysis.activeTargetProjectIds)
+        },
+        sourceCoverage: coverage.evidence,
+        warnings,
+        limits: {
+          maxItems,
+          maxActiveProjects,
+          maxExamplesPerReason: maxExamples,
+          maxSignalsPerProject,
+          maxProjectNameLength,
+          maxSpecialReserveSignals
+        }
+      }
+    });
+  };
+  var buildFodderReview = ({
+    gameContext,
+    inventorySnapshot,
+    policy,
+    targetProjects = [],
+    capabilitySnapshot,
+    sourceEvidence,
+    limits
+  } = {}) => {
+    const summary = summarizeFodderReview({
+      inventorySnapshot,
+      policy,
+      targetProjects,
+      sourceEvidence,
+      limits
+    });
+    return cloneAndFreeze({
+      requiredCapabilities: [...FODDER_REVIEW_CAPABILITIES],
+      blockers: summary.blockers,
+      fingerprints: buildFodderReviewFingerprints({
+        gameContext,
+        inventorySnapshot,
+        policy,
+        targetProjects,
+        capabilitySnapshot,
+        sourceEvidence
+      }),
+      explanation: [
+        "This review reports current hard protections and soft conservation signals.",
+        "It does not select fodder, optimize an SBC, change cards, or create an executable workflow."
+      ],
+      preview: summary.preview,
+      steps: []
+    });
+  };
+
+  // src/application/fc27-streamlined.js
+  var FC27_STREAMLINED_LIMITS = Object.freeze({
+    maxBytes: 64 * 1024,
+    maxDepth: 8,
+    maxObjectKeys: 24,
+    maxSourcesPerField: 16,
+    maxUnmappedEvidence: 32,
+    maxStringBytes: 128,
+    maxScore: 1e9
+  });
+  var Fc27EvidenceState = Object.freeze({
+    VERIFIED: "VERIFIED",
+    UNVERIFIED: "UNVERIFIED",
+    UNKNOWN: "UNKNOWN"
+  });
+  var Fc27EvidenceSourceKind = Object.freeze({
+    REVIEWED_FIXTURE: "REVIEWED_FIXTURE",
+    UNREVIEWED_FIXTURE: "UNREVIEWED_FIXTURE",
+    LIVE_OBSERVATION: "LIVE_OBSERVATION"
+  });
+  var Fc27EvidenceReason = Object.freeze({
+    REVIEWED_FIXTURE_MATCH: "REVIEWED_FIXTURE_MATCH",
+    UNREVIEWED_OBSERVATION: "UNREVIEWED_OBSERVATION",
+    SHAPE_UNCLASSIFIED: "SHAPE_UNCLASSIFIED",
+    FIXTURE_INSUFFICIENT: "FIXTURE_INSUFFICIENT",
+    CONFLICTING_OBSERVATIONS: "CONFLICTING_OBSERVATIONS",
+    ADAPTER_UNVERIFIED: "ADAPTER_UNVERIFIED",
+    NOT_OBSERVED: "NOT_OBSERVED",
+    FIELD_ABSENT: "FIELD_ABSENT"
+  });
+  var Fc27ChallengeClassification = Object.freeze({
+    STREAMLINED_SCORE: "STREAMLINED_SCORE"
+  });
+  var Fc27UnmappedEvidenceType = Object.freeze({
+    SCALAR: "SCALAR",
+    ARRAY: "ARRAY",
+    OBJECT: "OBJECT"
+  });
+  var Fc27ObservedValueKind = Object.freeze({
+    CLASSIFICATION: "CLASSIFICATION",
+    SAFE_ID: "SAFE_ID",
+    SCORE: "SCORE",
+    BOOLEAN: "BOOLEAN",
+    RULE_SET_REF: "RULE_SET_REF",
+    SCORE_MODEL_VERSION: "SCORE_MODEL_VERSION",
+    RATING: "RATING",
+    STRING_LIST: "STRING_LIST"
+  });
+  var VERIFIED_REASONS = Object.freeze([Fc27EvidenceReason.REVIEWED_FIXTURE_MATCH]);
+  var UNVERIFIED_REASONS = Object.freeze([
+    Fc27EvidenceReason.UNREVIEWED_OBSERVATION,
+    Fc27EvidenceReason.SHAPE_UNCLASSIFIED,
+    Fc27EvidenceReason.FIXTURE_INSUFFICIENT,
+    Fc27EvidenceReason.CONFLICTING_OBSERVATIONS,
+    Fc27EvidenceReason.ADAPTER_UNVERIFIED
+  ]);
+  var UNKNOWN_REASONS = Object.freeze([
+    Fc27EvidenceReason.NOT_OBSERVED,
+    Fc27EvidenceReason.FIELD_ABSENT
+  ]);
+  var FIELD_KINDS = Object.freeze({
+    classification: Fc27ObservedValueKind.CLASSIFICATION,
+    setId: Fc27ObservedValueKind.SAFE_ID,
+    challengeId: Fc27ObservedValueKind.SAFE_ID,
+    targetScore: Fc27ObservedValueKind.SCORE,
+    currentScore: Fc27ObservedValueKind.SCORE,
+    eligibility: Fc27ObservedValueKind.RULE_SET_REF,
+    rarityRules: Fc27ObservedValueKind.RULE_SET_REF,
+    allowsDuplicates: Fc27ObservedValueKind.BOOLEAN,
+    allowsPartialSubmission: Fc27ObservedValueKind.BOOLEAN,
+    scoreModelVersion: Fc27ObservedValueKind.SCORE_MODEL_VERSION
+  });
+  var ROOT_KEYS = Object.freeze([
+    "schemaVersion",
+    "contract",
+    "observationId",
+    "gameVersion",
+    ...Object.keys(FIELD_KINDS),
+    "unmappedEvidence",
+    "adapterVersion",
+    "eaBuild",
+    "observedAt",
+    "fingerprint"
+  ]);
+
+  // src/application/game-context.js
+  var GameVersion = Object.freeze({ FC26: "fc26", FC27: "fc27", UNKNOWN: "unknown" });
+  var GameContextState = Object.freeze({ VERIFIED: "verified", UNVERIFIED: "unverified" });
+  var GameChallengeKind = Object.freeze({
+    CLASSIC_SQUAD: "classic_squad",
+    STREAMLINED_SCORE: "streamlined_score",
+    UNKNOWN: "unknown"
+  });
+  var GameVersionObservation = Object.freeze({
+    OBSERVED: "observed",
+    COMPATIBILITY_DEFAULT: "compatibility_default",
+    UNVERIFIED: "unverified"
+  });
+  var normalizeGameVersion = (value) => {
+    const normalized = String(value || "").trim().toLowerCase().replaceAll(" ", "");
+    if (["fc26", "26", "eafc26"].includes(normalized)) return GameVersion.FC26;
+    if (["fc27", "27", "eafc27"].includes(normalized)) return GameVersion.FC27;
+    if (["unknown", "unverified"].includes(normalized)) return GameVersion.UNKNOWN;
+    throw new TypeError(`Unsupported game version: ${String(value || "missing")}`);
+  };
+  var createGameContext = ({
+    gameVersion = GameVersion.UNKNOWN,
+    state,
+    challengeKind,
+    gameVersionObservation,
+    gameVersionSource = null,
+    route = null,
+    setId = null,
+    setName = null,
+    challengeId = null,
+    challengeName = null,
+    observedAt = Date.now(),
+    evidence = null
+  } = {}) => {
+    const version = normalizeGameVersion(gameVersion);
+    const requestedState = state || (version === GameVersion.FC26 ? GameContextState.VERIFIED : GameContextState.UNVERIFIED);
+    if (!Object.values(GameContextState).includes(requestedState)) {
+      throw new TypeError(`Unsupported game-context state: ${requestedState}`);
+    }
+    const resolvedState = version === GameVersion.FC26 ? requestedState : GameContextState.UNVERIFIED;
+    const resolvedChallengeKind = challengeKind == null ? version === GameVersion.FC26 ? GameChallengeKind.CLASSIC_SQUAD : GameChallengeKind.UNKNOWN : String(challengeKind);
+    if (!Object.values(GameChallengeKind).includes(resolvedChallengeKind)) {
+      throw new TypeError(`Unsupported challenge kind: ${resolvedChallengeKind}`);
+    }
+    const resolvedObservation = gameVersionObservation || (version === GameVersion.UNKNOWN ? GameVersionObservation.UNVERIFIED : GameVersionObservation.OBSERVED);
+    if (!Object.values(GameVersionObservation).includes(resolvedObservation)) {
+      throw new TypeError(`Unsupported game-version observation: ${resolvedObservation}`);
+    }
+    return cloneAndFreeze({
+      gameVersion: version,
+      state: resolvedState,
+      challengeKind: resolvedChallengeKind,
+      gameVersionObservation: resolvedObservation,
+      gameVersionSource: gameVersionSource == null ? null : String(gameVersionSource),
+      route: route == null ? null : String(route),
+      setId: setId == null ? null : String(setId),
+      setName: setName == null ? null : String(setName),
+      challengeId: challengeId == null ? null : String(challengeId),
+      challengeName: challengeName == null ? null : String(challengeName),
+      observedAt: Math.max(0, Number(observedAt) || 0),
+      evidence
+    });
+  };
+
+  // src/application/game-strategy-registry.js
+  var GameStrategyReadiness = Object.freeze({
+    VERIFIED: "verified",
+    OBSERVE_ONLY: "observe_only",
+    UNAVAILABLE: "unavailable"
+  });
+  var EXECUTABLE_GAME_STRATEGY_VERSIONS = Object.freeze([
+    GameVersion.FC26
+  ]);
+  var isGameStrategyExecutionEnabled = (gameVersion) => EXECUTABLE_GAME_STRATEGY_VERSIONS.includes(normalizeGameVersion(gameVersion));
+  var ENTRY_KEYS = /* @__PURE__ */ new Set([
+    "id",
+    "gameVersion",
+    "goalKind",
+    "challengeKind",
+    "readiness",
+    "canCompileSteps",
+    "requiredCapabilities",
+    "evidenceRevision",
+    "strategy"
+  ]);
+  var identifier = (value, name) => {
+    const normalized = String(value ?? "").trim();
+    if (!normalized || normalized.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(normalized)) {
+      throw new TypeError(`Invalid game-strategy ${name}`);
+    }
+    return normalized;
+  };
+  var optionalIdentifier = (value, name) => value == null ? null : identifier(value, name);
+  var normalizeCapabilities = (value) => {
+    if (value == null) return [];
+    if (!Array.isArray(value)) throw new TypeError("Game-strategy requiredCapabilities must be an array");
+    const capabilities = value.map((entry) => identifier(entry, "capability id"));
+    if (new Set(capabilities).size !== capabilities.length) {
+      throw new TypeError("Game-strategy requiredCapabilities must be unique");
+    }
+    return capabilities.sort();
+  };
+  var normalizeEntry = (input) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("Game-strategy entry must be an object");
+    }
+    for (const key of Reflect.ownKeys(input)) {
+      if (typeof key !== "string" || !ENTRY_KEYS.has(key)) {
+        throw new TypeError(`Unsupported game-strategy field: ${String(key)}`);
+      }
+    }
+    const gameVersion = normalizeGameVersion(input.gameVersion);
+    const goalKind = identifier(input.goalKind, "goal kind");
+    const challengeKind = optionalIdentifier(input.challengeKind, "challenge kind");
+    const readiness = input.readiness ?? GameStrategyReadiness.VERIFIED;
+    if (!Object.values(GameStrategyReadiness).includes(readiness)) {
+      throw new TypeError(`Invalid game-strategy readiness: ${String(readiness)}`);
+    }
+    const strategy = input.strategy ?? null;
+    const canCompileSteps = input.canCompileSteps ?? readiness === GameStrategyReadiness.VERIFIED;
+    if (typeof canCompileSteps !== "boolean") {
+      throw new TypeError("Game-strategy canCompileSteps must be a boolean");
+    }
+    if (readiness === GameStrategyReadiness.VERIFIED && typeof strategy !== "function") {
+      throw new TypeError("A verified game strategy requires a strategy function");
+    }
+    if (readiness === GameStrategyReadiness.VERIFIED && !isGameStrategyExecutionEnabled(gameVersion)) {
+      throw new TypeError(`Executable game strategies are not enabled for ${gameVersion}`);
+    }
+    if (readiness !== GameStrategyReadiness.VERIFIED && strategy !== null) {
+      throw new TypeError("An unverified game strategy cannot contain a strategy function");
+    }
+    if (readiness !== GameStrategyReadiness.VERIFIED && canCompileSteps) {
+      throw new TypeError("An unverified game strategy cannot compile steps");
+    }
+    return Object.freeze({
+      id: identifier(input.id, "id"),
+      gameVersion,
+      goalKind,
+      challengeKind,
+      readiness,
+      canCompileSteps,
+      requiredCapabilities: Object.freeze(normalizeCapabilities(input.requiredCapabilities)),
+      evidenceRevision: optionalIdentifier(input.evidenceRevision, "evidence revision"),
+      strategy
+    });
+  };
+  var keyFor = (gameVersion, goalKind) => `${gameVersion}\0${goalKind}`;
+  var unavailableResolution = ({ gameVersion, goalKind, challengeKind, reason }) => Object.freeze({
+    id: null,
+    gameVersion,
+    goalKind,
+    challengeKind,
+    readiness: GameStrategyReadiness.UNAVAILABLE,
+    canCompileSteps: false,
+    requiredCapabilities: Object.freeze([]),
+    evidenceRevision: null,
+    strategy: null,
+    reason
+  });
+  var gameStrategyMetadata = (resolution) => cloneAndFreeze({
+    id: resolution?.id ?? null,
+    gameVersion: resolution?.gameVersion ?? GameVersion.UNKNOWN,
+    goalKind: resolution?.goalKind ?? null,
+    challengeKind: resolution?.challengeKind ?? null,
+    readiness: resolution?.readiness ?? GameStrategyReadiness.UNAVAILABLE,
+    canCompileSteps: resolution?.canCompileSteps === true,
+    evidenceRevision: resolution?.evidenceRevision ?? null
+  });
+  var GameStrategyRegistry = class {
+    #entries = /* @__PURE__ */ new Map();
+    constructor(entries = []) {
+      if (!Array.isArray(entries)) throw new TypeError("GameStrategyRegistry entries must be an array");
+      for (const input of entries) {
+        const entry = normalizeEntry(input);
+        const key = keyFor(entry.gameVersion, entry.goalKind);
+        if (this.#entries.has(key)) {
+          throw new TypeError(`Duplicate game strategy for ${entry.gameVersion}/${entry.goalKind}`);
+        }
+        this.#entries.set(key, entry);
+      }
+      Object.freeze(this);
+    }
+    resolve({ gameVersion, goalKind, challengeKind = null } = {}) {
+      const normalizedVersion = normalizeGameVersion(gameVersion);
+      const normalizedGoalKind = identifier(goalKind, "goal kind");
+      const normalizedChallengeKind = optionalIdentifier(challengeKind, "challenge kind");
+      const entry = this.#entries.get(keyFor(normalizedVersion, normalizedGoalKind));
+      if (!entry) {
+        return unavailableResolution({
+          gameVersion: normalizedVersion,
+          goalKind: normalizedGoalKind,
+          challengeKind: normalizedChallengeKind,
+          reason: "No local strategy is registered for this game version and goal"
+        });
+      }
+      if (entry.challengeKind !== null && entry.challengeKind !== normalizedChallengeKind) {
+        return unavailableResolution({
+          gameVersion: normalizedVersion,
+          goalKind: normalizedGoalKind,
+          challengeKind: normalizedChallengeKind,
+          reason: "The observed challenge kind does not match the local strategy"
+        });
+      }
+      return entry;
+    }
+    snapshot() {
+      return cloneAndFreeze([...this.#entries.values()].map(gameStrategyMetadata).sort((left, right) => `${left.gameVersion}:${left.goalKind}`.localeCompare(
+        `${right.gameVersion}:${right.goalKind}`
+      )));
+    }
+  };
+  var createLegacyFc26StrategyRegistry = (strategies = {}) => {
+    if (!strategies || typeof strategies !== "object" || Array.isArray(strategies)) {
+      throw new TypeError("PlanCompiler strategies must be an object");
+    }
+    const entries = Object.entries(strategies).flatMap(([goalKind, strategy]) => {
+      const normalizedGoalKind = identifier(goalKind, "goal kind");
+      return [
+        {
+          id: `legacy.fc26.${normalizedGoalKind}.v1`,
+          gameVersion: GameVersion.FC26,
+          goalKind,
+          readiness: GameStrategyReadiness.VERIFIED,
+          canCompileSteps: true,
+          requiredCapabilities: strategy?.requiredCapabilities || [],
+          evidenceRevision: "legacy-fc26-v1",
+          strategy
+        },
+        {
+          id: `builtin.fc27.${normalizedGoalKind}.observe.v1`,
+          gameVersion: GameVersion.FC27,
+          goalKind,
+          readiness: GameStrategyReadiness.OBSERVE_ONLY,
+          canCompileSteps: false,
+          requiredCapabilities: [],
+          evidenceRevision: "fc27-unverified-observation-v1",
+          strategy: null
+        }
+      ];
+    });
+    return new GameStrategyRegistry(entries);
+  };
+
+  // src/application/plans.js
+  var PlanState = Object.freeze({ READY: "ready", BLOCKED: "blocked" });
+  var createPlan = ({
+    goal,
+    gameContext,
+    steps = [],
+    blockers = [],
+    explanation = [],
+    fingerprints = null,
+    preview = null,
+    strategy = null,
+    compilerVersion = 1,
+    createdAt = Date.now()
+  }) => {
+    if (!goal?.id) throw new TypeError("Plan requires a goal");
+    if (!gameContext?.gameVersion) throw new TypeError("Plan requires a game context");
+    const state = blockers.length ? PlanState.BLOCKED : PlanState.READY;
+    const body = {
+      goalId: goal.id,
+      gameContext,
+      state,
+      steps,
+      blockers,
+      explanation,
+      fingerprints,
+      preview,
+      strategy,
+      compilerVersion
+    };
+    return cloneAndFreeze({
+      id: stableFingerprint(body),
+      createdAt: Math.max(0, Number(createdAt) || 0),
+      ...body
+    });
+  };
+
+  // src/application/plan-compiler.js
+  var DEFAULT_FEATURES = Object.freeze({
+    complete_sbc: Feature.SBC_PROJECTS,
+    grind_upgrades: Feature.LOCAL_RECIPES,
+    clear_duplicates: Feature.PRODUCT_SHELL,
+    optimize_fodder: Feature.PRODUCT_SHELL,
+    plan_evolution: Feature.EVOLUTION_PLANNING,
+    optimize_club: Feature.CLUB_OPTIMIZATION
+  });
+  var PlanCompiler = class {
+    constructor({
+      capabilityRegistry,
+      entitlementService,
+      strategies = {},
+      strategyRegistry = null,
+      compilerVersion = 1
+    }) {
+      this.capabilities = capabilityRegistry;
+      this.entitlements = entitlementService;
+      if (strategyRegistry != null && typeof strategyRegistry.resolve !== "function") {
+        throw new TypeError("PlanCompiler strategyRegistry must provide resolve()");
+      }
+      this.strategyRegistry = strategyRegistry ?? createLegacyFc26StrategyRegistry(strategies);
+      this.compilerVersion = compilerVersion;
+    }
+    async compile(goal, gameContext) {
+      const resolution = this.strategyRegistry.resolve({
+        gameVersion: gameContext?.gameVersion,
+        goalKind: goal?.kind,
+        challengeKind: gameContext?.challengeKind ?? null
+      });
+      const executionEnabled = isGameStrategyExecutionEnabled(gameContext?.gameVersion);
+      const strategy = executionEnabled ? resolution.strategy : null;
+      const strategyMetadata = gameStrategyMetadata(resolution);
+      const feature = DEFAULT_FEATURES[goal?.kind];
+      const entitlement = this.entitlements.check(feature);
+      const blockers = [];
+      if (!entitlement.entitled) blockers.push({ code: "ENTITLEMENT_REQUIRED", feature, requiredPlan: entitlement.requiredPlan });
+      if (resolution.readiness === GameStrategyReadiness.OBSERVE_ONLY) {
+        blockers.push({
+          code: "GAME_STRATEGY_OBSERVE_ONLY",
+          goalKind: goal?.kind,
+          gameVersion: gameContext?.gameVersion,
+          strategyId: resolution.id
+        });
+      } else if (!executionEnabled || resolution.readiness !== GameStrategyReadiness.VERIFIED || typeof strategy !== "function") {
+        blockers.push({
+          code: "GAME_STRATEGY_UNAVAILABLE",
+          goalKind: goal?.kind,
+          gameVersion: gameContext?.gameVersion
+        });
+      }
+      if (gameContext?.state !== "verified") blockers.push({ code: "GAME_CONTEXT_UNVERIFIED", gameVersion: gameContext?.gameVersion });
+      const preflight = this.capabilities.require(resolution.requiredCapabilities || []);
+      if (!preflight.ok) {
+        blockers.push(...preflight.missing.map((id) => ({ code: "CAPABILITY_UNAVAILABLE", capabilityId: id })));
+      }
+      if (blockers.length) return createPlan({
+        goal,
+        gameContext,
+        blockers,
+        strategy: strategyMetadata,
+        compilerVersion: this.compilerVersion
+      });
+      const draft = await strategy({ goal, gameContext });
+      const capabilityCheck = this.capabilities.require(draft.requiredCapabilities || []);
+      if (!capabilityCheck.ok) {
+        blockers.push(...capabilityCheck.missing.map((id) => ({ code: "CAPABILITY_UNAVAILABLE", capabilityId: id })));
+      }
+      blockers.push(...draft.blockers || []);
+      return createPlan({
+        goal,
+        gameContext,
+        steps: blockers.length ? [] : draft.steps || [],
+        blockers,
+        explanation: draft.explanation || [],
+        fingerprints: draft.fingerprints || null,
+        preview: draft.preview || null,
+        strategy: strategyMetadata,
+        compilerVersion: this.compilerVersion
+      });
+    }
+  };
+
+  // src/application/pro-contracts/auth-provider.js
+  var AuthState = Object.freeze({
+    CHECKING: "checking",
+    AUTHORIZING: "authorizing",
+    SIGNED_OUT: "signed_out",
+    SIGNED_IN: "signed_in",
+    EXPIRED: "expired",
+    OFFLINE: "offline",
+    ERROR: "error",
+    NOT_CONFIGURED: "not_configured"
+  });
+  var AuthErrorCode = Object.freeze({
+    REQUIRED: "AUTH_REQUIRED",
+    EXPIRED: "AUTH_EXPIRED",
+    NETWORK_UNAVAILABLE: "NETWORK_UNAVAILABLE",
+    PROVIDER_ERROR: "PROVIDER_ERROR",
+    PROVIDER_NOT_CONFIGURED: "PROVIDER_NOT_CONFIGURED"
+  });
+
+  // src/application/pro-contracts/project-optimization.js
+  var PROJECT_OPTIMIZATION_STATUS = Object.freeze(["complete", "partial", "infeasible"]);
+  var PROJECT_CANDIDATE_LOCATIONS = Object.freeze([
+    "club",
+    "sbc_storage",
+    "unassigned"
+  ]);
+  var PROJECT_CANDIDATE_TRADABILITY = Object.freeze([
+    "tradable",
+    "untradeable",
+    "unknown"
+  ]);
+  var PROJECT_SPECIAL_CLASSES = Object.freeze([
+    "totw",
+    "tots",
+    "evolution",
+    "icon",
+    "hero",
+    "promo"
+  ]);
+  var PROJECT_OPTIMIZATION_REASON_CODES = Object.freeze([
+    "coverage_complete",
+    "coverage_gap",
+    "lower_local_cost",
+    "prefer_duplicate",
+    "prefer_sbc_storage",
+    "prefer_untradeable",
+    "preserve_future_flexibility",
+    "preserve_scarce_special",
+    "no_feasible_allocation"
+  ]);
+  var PROJECT_OPTIMIZATION_WARNING_CODES = Object.freeze([
+    "best_effort_not_proven_optimal",
+    "input_near_contract_limit",
+    "provider_degraded"
+  ]);
+  var PROJECT_OPTIMIZATION_OPTIMALITY_STATES = Object.freeze([
+    "globally_optimal",
+    "best_found",
+    "infeasible"
+  ]);
+  var PROJECT_OPTIMIZATION_LIMITS = Object.freeze({
+    maxBytes: 512e3,
+    maxDepth: 10,
+    maxObjectKeys: 24,
+    maxCandidates: 5e3,
+    maxProjects: 100,
+    maxRequirements: 500,
+    maxSpecialRequirementsPerSquad: 8,
+    maxReasonCodes: 8,
+    maxWarnings: 16,
+    maxObjectiveFields: 12,
+    maxHandleLength: 80,
+    maxFingerprintLength: 128,
+    maxModelVersionLength: 64,
+    maxTtlMs: 5 * 6e4,
+    maxLocalCost: 1e9
+  });
+
+  // src/application/pro-contracts/smart-route.js
+  var SMART_ROUTE_STATUS = Object.freeze(["proposal", "no_proposal"]);
+  var SMART_ROUTE_ACTION_KINDS = Object.freeze([
+    "move_to_club",
+    "move_to_sbc_storage",
+    "hold_for_review",
+    "candidate_for_known_recipe",
+    "no_action"
+  ]);
+  var SMART_ROUTE_REASON_CODES = Object.freeze([
+    "verified_club_destination",
+    "verified_storage_destination",
+    "duplicate_pressure",
+    "project_reserve",
+    "scarce_special",
+    "tradable_opportunity_cost",
+    "known_recipe_candidate",
+    "no_verified_destination",
+    "manual_review_required"
+  ]);
+  var SMART_ROUTE_WARNING_CODES = Object.freeze([
+    "input_near_contract_limit",
+    "provider_degraded",
+    "recommendations_incomplete"
+  ]);
+  var SMART_ROUTE_LOCATIONS = Object.freeze([
+    "club",
+    "sbc_storage",
+    "unassigned"
+  ]);
+  var SMART_ROUTE_TRADABILITY = Object.freeze([
+    "tradable",
+    "untradeable",
+    "unknown"
+  ]);
+  var SMART_ROUTE_SPECIAL_CLASSES = Object.freeze([
+    "totw",
+    "tots",
+    "evolution",
+    "icon",
+    "hero",
+    "promo"
+  ]);
+  var SMART_ROUTE_DESTINATION_STATES = Object.freeze([
+    "verified_available",
+    "verified_unavailable",
+    "unverified"
+  ]);
+  var SMART_ROUTE_LIMITS = Object.freeze({
+    maxBytes: 256e3,
+    maxDepth: 9,
+    maxObjectKeys: 24,
+    maxCandidates: 100,
+    maxKnownRecipesPerCandidate: 32,
+    maxProjectDemandSignals: 100,
+    maxReasonCodes: 8,
+    maxWarnings: 16,
+    maxHandleLength: 80,
+    maxFingerprintLength: 128,
+    maxModelVersionLength: 64,
+    maxTtlMs: 2 * 6e4,
+    maxLocalCost: 1e9
+  });
+
+  // src/application/pro-contracts/cloud-planner-provider.js
+  var CloudPlannerOperation = Object.freeze({
+    OPTIMIZE_PROJECT: "optimize_project",
+    SMART_ROUTE: "smart_route"
+  });
+  var CLOUD_PLANNER_DEADLINES = Object.freeze({
+    MIN_MS: 250,
+    DEFAULT_MS: 1e4,
+    MAX_MS: 3e4
+  });
+  var ABORT_KIND = Object.freeze({ EXTERNAL: "external", TIMEOUT: "timeout" });
+
+  // src/application/pro-contracts/compatibility-config.js
+  var COMPATIBILITY_CONFIG_STATUS = Object.freeze({
+    READY: "ready",
+    CACHED: "cached"
+  });
+  var COMPATIBILITY_CONFIG_MAX_VALIDITY_MS = 7 * 24 * 60 * 60 * 1e3;
+  var GAME_VERSIONS = Object.freeze(["fc26", "fc27"]);
+  var DOWNGRADE_STATES = Object.freeze([
+    CapabilityState.DEGRADED,
+    CapabilityState.UNVERIFIED,
+    CapabilityState.UNAVAILABLE
+  ]);
+  var REASON_CODES = Object.freeze([
+    "ea_update",
+    "feature_disabled",
+    "fresh_evidence_required",
+    "minimum_client_version",
+    "unsupported_game_version"
+  ]);
+  var STATE_RANK = Object.freeze({
+    [CapabilityState.AVAILABLE]: 0,
+    [CapabilityState.DEGRADED]: 1,
+    [CapabilityState.UNVERIFIED]: 2,
+    [CapabilityState.UNAVAILABLE]: 3
+  });
+
+  // src/application/pro-contracts/entitlement-provider.js
+  var EntitlementState = Object.freeze({
+    CHECKING: "checking",
+    READY: "ready",
+    VERIFIED: "ready",
+    NOT_CONFIGURED: "not_configured",
+    SIGN_IN_REQUIRED: "sign_in_required",
+    LOCKED: "locked",
+    OFFLINE: "offline",
+    SERVICE_UNAVAILABLE: "service_unavailable",
+    STALE: "stale",
+    EXPIRED: "stale",
+    ERROR: "error"
+  });
+  var EntitlementErrorCode = Object.freeze({
+    EXPIRED: "ENTITLEMENT_EXPIRED",
+    STALE: "ENTITLEMENT_STALE",
+    SIGN_IN_REQUIRED: "SIGN_IN_REQUIRED",
+    LOCKED: "ENTITLEMENT_LOCKED",
+    NETWORK_UNAVAILABLE: "NETWORK_UNAVAILABLE",
+    SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
+    PROVIDER_ERROR: "PROVIDER_ERROR",
+    PROVIDER_NOT_CONFIGURED: "PROVIDER_NOT_CONFIGURED",
+    INVALID_RESPONSE: "INVALID_RESPONSE"
+  });
+  var FREE_FEATURE_IDS = Object.freeze([
+    Feature.ADVANCED_TOOLS,
+    Feature.LOCAL_RECIPES,
+    Feature.PRODUCT_SHELL,
+    Feature.SBC_PROJECTS
+  ].sort());
+  var PRO_FEATURE_IDS = Object.freeze([
+    .../* @__PURE__ */ new Set([
+      ...FREE_FEATURE_IDS,
+      Feature.CLUB_OPTIMIZATION,
+      Feature.EVOLUTION_PLANNING,
+      Feature.PROJECT_OPTIMIZATION,
+      Feature.SMART_ROUTING,
+      Feature.CLOUD_RECIPES
+    ])
+  ].sort());
+
+  // src/application/pro-contracts/recipe-catalog.js
+  var RECIPE_CATALOG_STATUS = Object.freeze({
+    READY: "ready",
+    CACHED: "cached"
+  });
+  var RECIPE_CATALOG_MAX_VALIDITY_MS = 7 * 24 * 60 * 60 * 1e3;
+  var GAME_VERSIONS2 = Object.freeze(["fc26", "fc27"]);
+
+  // src/application/pro-contracts/request-handles.js
+  var HANDLE_KINDS = Object.freeze({
+    ITEM: "item",
+    PLAYER_GROUP: "player_group",
+    VERSION_GROUP: "version_group",
+    PROJECT: "project",
+    REQUIREMENT: "requirement",
+    RECIPE: "recipe"
+  });
+  var HANDLE_PREFIX = Object.freeze({
+    [HANDLE_KINDS.ITEM]: "itm",
+    [HANDLE_KINDS.PLAYER_GROUP]: "ply",
+    [HANDLE_KINDS.VERSION_GROUP]: "ver",
+    [HANDLE_KINDS.PROJECT]: "prj",
+    [HANDLE_KINDS.REQUIREMENT]: "req",
+    [HANDLE_KINDS.RECIPE]: "rcp"
+  });
+
+  // src/application/item-score-provider.js
+  var ITEM_SCORE_LIMITS = Object.freeze({
+    maxBytes: 256 * 1024,
+    maxDepth: 9,
+    maxObjectKeys: 20,
+    maxItems: 100,
+    maxTtlMs: 2 * 6e4,
+    maxScore: 1e9
+  });
+  var ItemScoreProviderState = Object.freeze({
+    READY: "READY",
+    UNVERIFIED: "UNVERIFIED",
+    NOT_CONFIGURED: "NOT_CONFIGURED"
+  });
+  var ItemScoreResponseStatus = Object.freeze({
+    SCORED: "SCORED"
+  });
+  var ItemScoreFeatureCode = Object.freeze({
+    RATING: "rating",
+    RARITY_ID: "rarity_id",
+    CARD_TYPE: "card_type",
+    SPECIAL_GROUPS: "special_groups"
+  });
+  var FEATURE_KINDS = Object.freeze({
+    rating: Fc27ObservedValueKind.RATING,
+    rarityId: Fc27ObservedValueKind.SAFE_ID,
+    cardType: Fc27ObservedValueKind.SAFE_ID,
+    specialGroups: Fc27ObservedValueKind.STRING_LIST
+  });
+  var FEATURE_FIELD_BY_CODE = Object.freeze({
+    [ItemScoreFeatureCode.RATING]: "rating",
+    [ItemScoreFeatureCode.RARITY_ID]: "rarityId",
+    [ItemScoreFeatureCode.CARD_TYPE]: "cardType",
+    [ItemScoreFeatureCode.SPECIAL_GROUPS]: "specialGroups"
+  });
+
+  // src/application/router-next-action.js
+  var ROUTER_NEXT_ACTION_KIND = "ROUTER_NEXT_ACTION_V1";
+  var ROUTER_NEXT_ACTION_SCHEMA_VERSION = 1;
+  var ROUTER_NEXT_ACTION_SAFETY_BOUNDARY = "READ_ONLY_ONE_RECOMMENDATION";
+  var ROUTER_NEXT_ACTION_LIMITS = Object.freeze({
+    maxItems: 5e3,
+    maxUnassignedItems: 100,
+    maxStorageItems: 100
+  });
+  var RouterNextActionState = Object.freeze({
+    READY: "READY",
+    ATTENTION: "ATTENTION",
+    CLEAR: "CLEAR",
+    BLOCKED: "BLOCKED"
+  });
+  var RouterNextActionKind = Object.freeze({
+    KEEP: "KEEP",
+    MOVE_TO_CLUB: "MOVE_TO_CLUB",
+    MOVE_TO_SBC_STORAGE: "MOVE_TO_SBC_STORAGE",
+    RESERVE: "RESERVE",
+    PAUSE: "PAUSE",
+    ASK_USER: "ASK_USER"
+  });
+  var RouterActivityGuardState = Object.freeze({
+    IDLE: "IDLE",
+    NON_IDLE: "NON_IDLE",
+    UNKNOWN: "UNKNOWN"
+  });
+  var RouterNextActionReason = Object.freeze({
+    UNASSIGNED_CLEAR: "UNASSIGNED_CLEAR",
+    EXACT_DUPLICATE_STORAGE_MOVE_VERIFIED: "EXACT_DUPLICATE_STORAGE_MOVE_VERIFIED",
+    UNIQUE_CLUB_MOVE_VERIFIED: "UNIQUE_CLUB_MOVE_VERIFIED",
+    TRADABLE_DUPLICATE_STORAGE_UNAVAILABLE: "TRADABLE_DUPLICATE_STORAGE_UNAVAILABLE",
+    UNTRADEABLE_DUPLICATE_NO_SAFE_DESTINATION: "UNTRADEABLE_DUPLICATE_NO_SAFE_DESTINATION",
+    DUPLICATE_IDENTITY_UNVERIFIED: "DUPLICATE_IDENTITY_UNVERIFIED",
+    CLUB_MOVE_EVIDENCE_UNVERIFIED: "CLUB_MOVE_EVIDENCE_UNVERIFIED",
+    STORAGE_MOVE_EVIDENCE_UNVERIFIED: "STORAGE_MOVE_EVIDENCE_UNVERIFIED",
+    TRADABILITY_EVIDENCE_UNVERIFIED: "TRADABILITY_EVIDENCE_UNVERIFIED",
+    STORAGE_CAPACITY_UNVERIFIED: "STORAGE_CAPACITY_UNVERIFIED",
+    ITEM_EXPLICITLY_NOT_MOVABLE: "ITEM_EXPLICITLY_NOT_MOVABLE",
+    ROUTE_EVIDENCE_MISSING: "ROUTE_EVIDENCE_MISSING",
+    ROUTE_EVIDENCE_CONFLICT: "ROUTE_EVIDENCE_CONFLICT",
+    INVENTORY_SNAPSHOT_INVALID: "INVENTORY_SNAPSHOT_INVALID",
+    INPUT_LIMIT_EXCEEDED: "INPUT_LIMIT_EXCEEDED",
+    GAME_CONTEXT_UNVERIFIED: "GAME_CONTEXT_UNVERIFIED",
+    READ_CAPABILITY_UNAVAILABLE: "READ_CAPABILITY_UNAVAILABLE",
+    MOVE_CAPABILITY_UNAVAILABLE: "MOVE_CAPABILITY_UNAVAILABLE",
+    ACTIVITY_GUARD_NOT_IDLE: "ACTIVITY_GUARD_NOT_IDLE",
+    ACTIVITY_GUARD_UNVERIFIED: "ACTIVITY_GUARD_UNVERIFIED"
+  });
+  var ROUTER_NEXT_ACTION_CAPABILITIES = Object.freeze([
+    "ea.inventory.read",
+    "ea.unassigned.read",
+    "ea.items.move"
+  ]);
+  var ROUTER_NEXT_ACTION_OBJECTIVE_FIELDS = Object.freeze([
+    "protected_item_violations",
+    "unresolved_blocking_duplicates",
+    "active_project_damage",
+    "scarce_special_consumption",
+    "tradable_opportunity_cost",
+    "replacement_value",
+    "future_flexibility_loss",
+    "unassigned_items_after",
+    "interaction_friction",
+    "action_rank",
+    "exact_identity_key",
+    "owned_item_id"
+  ]);
+  var ROUTER_VERSION = 1;
+  var TIE_RULE_VERSION = 1;
+  var compareText = (left, right) => {
+    const a = String(left ?? "");
+    const b = String(right ?? "");
+    return a < b ? -1 : a > b ? 1 : 0;
+  };
+  var compareTuples = (left, right) => {
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const a = left[index];
+      const b = right[index];
+      const comparison = typeof a === "number" && typeof b === "number" ? a - b : compareText(a, b);
+      if (comparison !== 0) return comparison;
+    }
+    return 0;
+  };
+  var canonicalValue2 = (value) => {
+    if (Array.isArray(value)) {
+      return value.map((entry) => canonicalValue2(entry)).sort((left, right) => compareText(stableStringify(left), stableStringify(right)));
+    }
+    if (!value || typeof value !== "object") return value ?? null;
+    return Object.fromEntries(
+      Object.keys(value).sort(compareText).map((key) => [key, canonicalValue2(value[key])])
+    );
+  };
+  var sourceItems = (snapshot, sourceName) => {
+    const source = snapshot?.[sourceName];
+    return Array.isArray(source?.items) ? source.items : null;
+  };
+  var allSnapshotItems = (snapshot) => {
+    const club = sourceItems(snapshot, "club");
+    const storage = sourceItems(snapshot, "storage");
+    const unassigned = sourceItems(snapshot, "unassigned");
+    if (!club || !storage || !unassigned) return null;
+    return { club, storage, unassigned, all: [...club, ...storage, ...unassigned] };
+  };
+  var canonicalItem = (item = {}) => ({
+    itemId: String(item.itemId ?? item.id ?? ""),
+    resourceId: item.resourceId == null ? null : String(item.resourceId),
+    definitionId: item.definitionId == null ? null : String(item.definitionId),
+    assetId: item.assetId == null ? null : String(item.assetId),
+    baseId: item.baseId == null ? null : String(item.baseId),
+    location: item.location == null ? null : String(item.location),
+    rating: Number(item.rating || 0),
+    name: item.name == null ? null : String(item.name),
+    cardType: item.cardType == null ? null : String(item.cardType),
+    rarityId: item.rarityId == null ? null : String(item.rarityId),
+    rarityName: item.rarityName == null ? null : String(item.rarityName),
+    specialGroups: [...Array.isArray(item.specialGroups) ? item.specialGroups : []].map(String).sort(compareText),
+    isSpecial: item.isSpecial ?? null,
+    isTradable: item.isTradable ?? item.isTradeable ?? null,
+    isDuplicate: item.isDuplicate ?? null,
+    isMovable: item.isMovable ?? null,
+    isStorable: item.isStorable ?? null,
+    isLocked: item.isLocked ?? item.locked ?? null,
+    isProtected: item.isProtected ?? null,
+    isFavorite: item.isFavorite ?? item.isFavourite ?? null,
+    isInStartingSquad: item.isInStartingSquad ?? item.isInActive11 ?? null,
+    hasMovableEvidence: item.hasMovableEvidence ?? null,
+    hasStorableEvidence: item.hasStorableEvidence ?? null,
+    hasTradabilityEvidence: item.hasTradabilityEvidence ?? null,
+    hasLockedEvidence: item.hasLockedEvidence ?? null,
+    hasProtectedEvidence: item.hasProtectedEvidence ?? null,
+    hasFavoriteEvidence: item.hasFavoriteEvidence ?? null,
+    hasStartingSquadEvidence: item.hasStartingSquadEvidence ?? null,
+    hasSpecialEvidence: item.hasSpecialEvidence ?? null
+  });
+  var canonicalInventory3 = (snapshot, sources) => ({
+    storageCapacity: snapshot?.storageCapacity ?? null,
+    items: sources.all.map(canonicalItem).sort((left, right) => compareText(left.itemId, right.itemId))
+  });
+  var canonicalRouteAction = (action = {}) => ({
+    itemId: String(action.itemId ?? ""),
+    type: String(action.type ?? ""),
+    from: String(action.from ?? ""),
+    to: String(action.to ?? ""),
+    reason: String(action.reason ?? "")
+  });
+  var canonicalRouteEvidence = (routeSummary) => ({
+    actions: (Array.isArray(routeSummary?.routeActions) ? routeSummary.routeActions : []).map(canonicalRouteAction).sort((left, right) => compareText(left.itemId, right.itemId) || compareText(left.type, right.type) || compareText(left.to, right.to))
+  });
+  var canonicalCapabilities3 = (snapshot = {}) => ({
+    capabilities: ROUTER_NEXT_ACTION_CAPABILITIES.map((id) => {
+      const record = (snapshot.capabilities || []).find((entry) => entry?.id === id);
+      return {
+        id,
+        state: record?.state ?? "unverified",
+        evidence: canonicalValue2(record?.evidence ?? null)
+      };
+    })
+  });
+  var canonicalContext2 = (context = {}) => ({
+    gameVersion: String(context.gameVersion ?? "unknown").toLowerCase(),
+    state: String(context.state ?? "unverified").toLowerCase(),
+    route: context.route == null ? null : String(context.route),
+    evidence: canonicalValue2(context.evidence ?? null)
+  });
+  var normalizedGuard = (guard) => {
+    const state = String(guard?.state ?? RouterActivityGuardState.UNKNOWN).toUpperCase();
+    if (state === RouterActivityGuardState.IDLE) {
+      return { state: RouterActivityGuardState.IDLE, evidence: canonicalValue2(guard?.evidence ?? null) };
+    }
+    if (state === RouterActivityGuardState.UNKNOWN) {
+      return { state: RouterActivityGuardState.UNKNOWN, evidence: canonicalValue2(guard?.evidence ?? null) };
+    }
+    return { state: RouterActivityGuardState.NON_IDLE, evidence: canonicalValue2(guard?.evidence ?? null) };
+  };
+  var capabilityState = (snapshot, id) => (snapshot?.capabilities || []).find((entry) => entry?.id === id)?.state ?? "unverified";
+  var displayItem = (item = {}) => ({
+    name: item.name == null ? null : String(item.name),
+    rating: Number(item.rating || 0),
+    isSpecial: Boolean(item.isSpecial),
+    isTradable: item.hasTradabilityEvidence === true ? Boolean(item.isTradable) : null,
+    location: "unassigned"
+  });
+  var makeFingerprints = ({
+    inventory = null,
+    routeEvidence = null,
+    capabilities,
+    context,
+    guard,
+    protectionAnalysis,
+    conservationPolicy,
+    duplicatePolicy,
+    failure = null
+  }) => {
+    const components = {
+      inventory: stableFingerprint(inventory ?? { unavailable: true }),
+      routeEvidence: stableFingerprint(routeEvidence ?? { unavailable: true }),
+      capabilities: stableFingerprint(capabilities),
+      gameContext: stableFingerprint(context),
+      activityGuard: stableFingerprint(guard),
+      protection: stableFingerprint({
+        analysis: canonicalValue2(protectionAnalysis ?? null),
+        conservationPolicy: canonicalValue2(conservationPolicy ?? null)
+      }),
+      policy: stableFingerprint(canonicalValue2(duplicatePolicy ?? null)),
+      version: stableFingerprint({
+        kind: ROUTER_NEXT_ACTION_KIND,
+        schemaVersion: ROUTER_NEXT_ACTION_SCHEMA_VERSION,
+        routerVersion: ROUTER_VERSION,
+        tieRuleVersion: TIE_RULE_VERSION
+      }),
+      failure: stableFingerprint(failure)
+    };
+    return {
+      ...components,
+      input: stableFingerprint(components)
+    };
+  };
+  var outcomeFor = ({ kind, reasonCode, item = null, duplicateKey = null, destination = null, tuple = [] }) => ({
+    kind,
+    reasonCode,
+    destination,
+    display: item ? displayItem(item) : null,
+    binding: item ? {
+      itemId: String(item.itemId),
+      expectedFrom: "unassigned",
+      exactDuplicateKey: duplicateKey
+    } : null,
+    objectiveTuple: [...tuple]
+  });
+  var finalize = ({ state, outcome: outcome2, fingerprints, observedAt, counts }) => {
+    const decisionFingerprint = stableFingerprint({
+      input: fingerprints.input,
+      kind: outcome2.kind,
+      reasonCode: outcome2.reasonCode,
+      destination: outcome2.destination,
+      binding: outcome2.binding,
+      objectiveTuple: outcome2.objectiveTuple
+    });
+    return cloneAndFreeze({
+      kind: ROUTER_NEXT_ACTION_KIND,
+      schemaVersion: ROUTER_NEXT_ACTION_SCHEMA_VERSION,
+      state,
+      safetyBoundary: ROUTER_NEXT_ACTION_SAFETY_BOUNDARY,
+      readOnly: true,
+      canExecute: false,
+      outcome: outcome2,
+      counts,
+      observedAt,
+      fingerprints: { ...fingerprints, decision: decisionFingerprint }
+    });
+  };
+  var blocked = ({ reasonCode, fingerprints, observedAt, counts }) => finalize({
+    state: RouterNextActionState.BLOCKED,
+    outcome: outcomeFor({ kind: RouterNextActionKind.PAUSE, reasonCode }),
+    fingerprints,
+    observedAt,
+    counts
+  });
+  var routeMapFor = (routeEvidence, unassignedIds) => {
+    const map = /* @__PURE__ */ new Map();
+    let conflict = false;
+    for (const action of routeEvidence.actions) {
+      if (!unassignedIds.has(action.itemId) || map.has(action.itemId)) {
+        conflict = true;
+        continue;
+      }
+      map.set(action.itemId, action);
+    }
+    if (map.size !== unassignedIds.size) conflict = true;
+    return { map, conflict };
+  };
+  var attentionReason = (item, action, duplicateKey, exactDuplicate, capacityKnown) => {
+    if ((item.isDuplicate === true || action?.reason === "duplicate_identity_ambiguous") && !duplicateKey) {
+      return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.DUPLICATE_IDENTITY_UNVERIFIED, severity: 0 };
+    }
+    if (action?.type === INVENTORY_RESOLUTION_ACTIONS.PAUSE && action.reason === "unassigned_item_not_movable") {
+      return {
+        kind: RouterNextActionKind.PAUSE,
+        reasonCode: item.hasMovableEvidence === true ? RouterNextActionReason.ITEM_EXPLICITLY_NOT_MOVABLE : RouterNextActionReason.CLUB_MOVE_EVIDENCE_UNVERIFIED,
+        severity: 1
+      };
+    }
+    if (action?.type === INVENTORY_RESOLUTION_ACTIONS.SEND_TO_CLUB) {
+      if (exactDuplicate) {
+        return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.ROUTE_EVIDENCE_CONFLICT, severity: 0 };
+      }
+      if (item.hasMovableEvidence !== true) {
+        return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.CLUB_MOVE_EVIDENCE_UNVERIFIED, severity: 1 };
+      }
+      return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.ITEM_EXPLICITLY_NOT_MOVABLE, severity: 2 };
+    }
+    if (action?.type === INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE) {
+      if (!exactDuplicate) {
+        return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.ROUTE_EVIDENCE_CONFLICT, severity: 0 };
+      }
+      if (!capacityKnown) {
+        return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.STORAGE_CAPACITY_UNVERIFIED, severity: 1 };
+      }
+      return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.STORAGE_MOVE_EVIDENCE_UNVERIFIED, severity: 1 };
+    }
+    if (exactDuplicate && !capacityKnown) {
+      return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.STORAGE_CAPACITY_UNVERIFIED, severity: 1 };
+    }
+    if (exactDuplicate && item.hasTradabilityEvidence !== true) {
+      return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.TRADABILITY_EVIDENCE_UNVERIFIED, severity: 3 };
+    }
+    if (exactDuplicate && item.isTradable === true) {
+      return { kind: RouterNextActionKind.ASK_USER, reasonCode: RouterNextActionReason.TRADABLE_DUPLICATE_STORAGE_UNAVAILABLE, severity: 5 };
+    }
+    if (exactDuplicate) {
+      return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.UNTRADEABLE_DUPLICATE_NO_SAFE_DESTINATION, severity: 2 };
+    }
+    return { kind: RouterNextActionKind.PAUSE, reasonCode: RouterNextActionReason.ROUTE_EVIDENCE_CONFLICT, severity: 1 };
+  };
+  var recommendRouterNextAction = (input = {}) => {
+    const observedAt = input.observedAt ?? input.inventorySnapshot?.updatedAt ?? null;
+    const guard = normalizedGuard(input.activityGuard);
+    const capabilities = canonicalCapabilities3(input.capabilitySnapshot);
+    const context = canonicalContext2(input.gameContext);
+    const initialCounts = { totalItems: 0, unassignedItems: 0, safeCandidates: 0, attentionCandidates: 0 };
+    const earlyFingerprints = (failure) => makeFingerprints({
+      capabilities,
+      context,
+      guard,
+      protectionAnalysis: input.protectionAnalysis,
+      conservationPolicy: input.conservationPolicy,
+      duplicatePolicy: input.duplicatePolicy,
+      failure
+    });
+    if (guard.state !== RouterActivityGuardState.IDLE) {
+      const reasonCode = guard.state === RouterActivityGuardState.UNKNOWN ? RouterNextActionReason.ACTIVITY_GUARD_UNVERIFIED : RouterNextActionReason.ACTIVITY_GUARD_NOT_IDLE;
+      return blocked({
+        reasonCode,
+        fingerprints: earlyFingerprints({ reasonCode }),
+        observedAt,
+        counts: initialCounts
+      });
+    }
+    const sources = allSnapshotItems(input.inventorySnapshot);
+    const totalCount = sources?.all.length ?? 0;
+    const unassignedCount = sources?.unassigned.length ?? 0;
+    const counts = { ...initialCounts, totalItems: totalCount, unassignedItems: unassignedCount };
+    if (!sources) {
+      const reasonCode = RouterNextActionReason.INVENTORY_SNAPSHOT_INVALID;
+      return blocked({ reasonCode, fingerprints: earlyFingerprints({ reasonCode }), observedAt, counts });
+    }
+    if (totalCount > ROUTER_NEXT_ACTION_LIMITS.maxItems || unassignedCount > ROUTER_NEXT_ACTION_LIMITS.maxUnassignedItems || sources.storage.length > ROUTER_NEXT_ACTION_LIMITS.maxStorageItems) {
+      const reasonCode = RouterNextActionReason.INPUT_LIMIT_EXCEEDED;
+      return blocked({
+        reasonCode,
+        fingerprints: earlyFingerprints({ reasonCode, totalCount, unassignedCount, storageCount: sources.storage.length }),
+        observedAt,
+        counts
+      });
+    }
+    const expectedLocations = [
+      [sources.club, "club"],
+      [sources.storage, "sbc_storage"],
+      [sources.unassigned, "unassigned"]
+    ];
+    const ids = /* @__PURE__ */ new Set();
+    let invalidInventory = false;
+    for (const [items, location2] of expectedLocations) {
+      for (const item of items) {
+        const itemId = String(item?.itemId ?? "");
+        if (!itemId || ids.has(itemId) || String(item?.location ?? "") !== location2) {
+          invalidInventory = true;
+        }
+        ids.add(itemId);
+      }
+    }
+    if (Array.isArray(input.inventorySnapshot?.items)) {
+      const aggregateIds = input.inventorySnapshot.items.map((item) => String(item?.itemId ?? "")).sort(compareText);
+      const sourceIds = [...ids].sort(compareText);
+      if (stableStringify(aggregateIds) !== stableStringify(sourceIds)) invalidInventory = true;
+    }
+    const inventory = canonicalInventory3(input.inventorySnapshot, sources);
+    const routeEvidence = canonicalRouteEvidence(input.routeSummary);
+    const fingerprints = makeFingerprints({
+      inventory,
+      routeEvidence,
+      capabilities,
+      context,
+      guard,
+      protectionAnalysis: input.protectionAnalysis,
+      conservationPolicy: input.conservationPolicy,
+      duplicatePolicy: input.duplicatePolicy
+    });
+    if (invalidInventory) {
+      return blocked({
+        reasonCode: RouterNextActionReason.INVENTORY_SNAPSHOT_INVALID,
+        fingerprints,
+        observedAt,
+        counts
+      });
+    }
+    if (context.gameVersion !== "fc26" || context.state !== "verified") {
+      return blocked({
+        reasonCode: RouterNextActionReason.GAME_CONTEXT_UNVERIFIED,
+        fingerprints,
+        observedAt,
+        counts
+      });
+    }
+    if (capabilityState(input.capabilitySnapshot, "ea.inventory.read") !== "available" || capabilityState(input.capabilitySnapshot, "ea.unassigned.read") !== "available") {
+      return blocked({
+        reasonCode: RouterNextActionReason.READ_CAPABILITY_UNAVAILABLE,
+        fingerprints,
+        observedAt,
+        counts
+      });
+    }
+    if (unassignedCount === 0) {
+      return finalize({
+        state: RouterNextActionState.CLEAR,
+        outcome: outcomeFor({
+          kind: RouterNextActionKind.KEEP,
+          reasonCode: RouterNextActionReason.UNASSIGNED_CLEAR
+        }),
+        fingerprints,
+        observedAt,
+        counts
+      });
+    }
+    const unassignedIds = new Set(sources.unassigned.map((item) => String(item.itemId)));
+    const { map: routeByItemId, conflict: routeConflict } = routeMapFor(routeEvidence, unassignedIds);
+    if (!Array.isArray(input.routeSummary?.routeActions)) {
+      return blocked({
+        reasonCode: RouterNextActionReason.ROUTE_EVIDENCE_MISSING,
+        fingerprints,
+        observedAt,
+        counts
+      });
+    }
+    if (routeConflict) {
+      return blocked({
+        reasonCode: RouterNextActionReason.ROUTE_EVIDENCE_CONFLICT,
+        fingerprints,
+        observedAt,
+        counts
+      });
+    }
+    const capacity = input.inventorySnapshot.storageCapacity;
+    const capacityKnown = Number.isInteger(capacity) && capacity >= 0 && capacity <= 100;
+    const hasStorageSlot = capacityKnown && sources.storage.length < capacity;
+    const occupiedKeys = new Set(
+      [...sources.club, ...sources.storage].map(getDuplicateKey).filter(Boolean)
+    );
+    const blockingDuplicateCount = sources.unassigned.reduce((count, item) => {
+      const key = getDuplicateKey(item);
+      return count + Number(Boolean(key && occupiedKeys.has(key)));
+    }, 0);
+    const safeCandidates = [];
+    const attentionCandidates = [];
+    for (const item of sources.unassigned) {
+      const itemId = String(item.itemId);
+      const action = routeByItemId.get(itemId);
+      const duplicateKey = getDuplicateKey(item);
+      const exactDuplicate = Boolean(duplicateKey && occupiedKeys.has(duplicateKey));
+      let safe = null;
+      if (action.type === INVENTORY_RESOLUTION_ACTIONS.SEND_TO_CLUB && action.from === "unassigned" && action.to === "club" && action.reason === "not_duplicate" && !exactDuplicate && item.hasMovableEvidence === true && item.isMovable === true) {
+        safe = {
+          item,
+          duplicateKey,
+          kind: RouterNextActionKind.MOVE_TO_CLUB,
+          reasonCode: RouterNextActionReason.UNIQUE_CLUB_MOVE_VERIFIED,
+          destination: "club",
+          tuple: [0, blockingDuplicateCount, 0, 0, 0, 0, 0, Math.max(0, unassignedCount - 1), 1, 1, duplicateKey ?? "", itemId]
+        };
+      }
+      if (action.type === INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE && action.from === "unassigned" && action.to === "sbc_storage" && action.reason === "duplicate_storage_available" && exactDuplicate && hasStorageSlot && item.hasMovableEvidence === true && item.isMovable === false && item.hasStorableEvidence === true && item.isStorable === true) {
+        const tradableRank = item.hasTradabilityEvidence === true ? item.isTradable === true ? 1 : 0 : 2;
+        safe = {
+          item,
+          duplicateKey,
+          kind: RouterNextActionKind.MOVE_TO_SBC_STORAGE,
+          reasonCode: RouterNextActionReason.EXACT_DUPLICATE_STORAGE_MOVE_VERIFIED,
+          destination: "sbc_storage",
+          tuple: [0, Math.max(0, blockingDuplicateCount - 1), 0, 0, tradableRank, 0, 1, Math.max(0, unassignedCount - 1), 1, 0, duplicateKey, itemId]
+        };
+      }
+      if (safe) {
+        safeCandidates.push(safe);
+        continue;
+      }
+      const attention = attentionReason(item, action, duplicateKey, exactDuplicate, capacityKnown);
+      attentionCandidates.push({
+        item,
+        duplicateKey,
+        ...attention,
+        tuple: [attention.severity, duplicateKey ?? "", itemId]
+      });
+    }
+    const resultCounts = {
+      ...counts,
+      safeCandidates: safeCandidates.length,
+      attentionCandidates: attentionCandidates.length
+    };
+    if (safeCandidates.length > 0) {
+      if (capabilityState(input.capabilitySnapshot, "ea.items.move") !== "available") {
+        return blocked({
+          reasonCode: RouterNextActionReason.MOVE_CAPABILITY_UNAVAILABLE,
+          fingerprints,
+          observedAt,
+          counts: resultCounts
+        });
+      }
+      const selected4 = safeCandidates.sort((left, right) => compareTuples(left.tuple, right.tuple))[0];
+      return finalize({
+        state: RouterNextActionState.READY,
+        outcome: outcomeFor(selected4),
+        fingerprints,
+        observedAt,
+        counts: resultCounts
+      });
+    }
+    const selected3 = attentionCandidates.sort((left, right) => compareTuples(left.tuple, right.tuple))[0];
+    return finalize({
+      state: RouterNextActionState.ATTENTION,
+      outcome: outcomeFor(selected3),
+      fingerprints,
+      observedAt,
+      counts: resultCounts
+    });
+  };
+
+  // src/application/surface-slot-registry.js
+  var SurfaceSlot = Object.freeze({
+    PACK_ACTIONS: "ea.pack.actions",
+    ITEMS_HEADER: "ea.items.header",
+    SBC_HEADER: "ea.sbc.header",
+    GLOBAL_HEADER: "ea.global.header"
+  });
+
+  // src/dev/limits.js
+  var DEV_LIMITS = Object.freeze({
+    maxClasses: 500,
+    maxMethodsPerClass: 192,
+    maxCapabilities: 128,
+    maxSnapshots: 5,
+    maxSnapshotBytes: 256 * 1024,
+    maxSnapshotHistoryBytes: 768 * 1024,
+    maxDiffItems: 750,
+    maxRoutes: 100,
+    maxNetworkRecords: 200,
+    maxLogs: 250,
+    maxCollectionItems: 250,
+    maxObjectKeys: 100,
+    maxDepth: 6,
+    maxStringLength: 1e3,
+    maxExportBytes: 512 * 1024
+  });
+  var MIN_LIMIT = 1;
+  var MAX_LIMIT = 1e7;
+  var BYTE_LIMIT_KEYS = /* @__PURE__ */ new Set([
+    "maxSnapshotBytes",
+    "maxSnapshotHistoryBytes",
+    "maxExportBytes"
+  ]);
+  function clampLimit(value, fallback, minimum = MIN_LIMIT) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.min(MAX_LIMIT, Math.max(minimum, Math.floor(numeric)));
+  }
+  function resolveDevLimits(overrides = {}) {
+    const resolved = {};
+    for (const [key, fallback] of Object.entries(DEV_LIMITS)) {
+      resolved[key] = clampLimit(
+        overrides?.[key],
+        fallback,
+        BYTE_LIMIT_KEYS.has(key) ? 1024 : MIN_LIMIT
+      );
+    }
+    return Object.freeze(resolved);
+  }
+  function utf8ByteLength(value) {
+    return new TextEncoder().encode(String(value)).byteLength;
+  }
+  function jsonByteLength(value) {
+    try {
+      return utf8ByteLength(JSON.stringify(value));
+    } catch {
+      return Number.POSITIVE_INFINITY;
+    }
+  }
+
+  // src/dev/redaction.js
+  var REDACTED2 = "[REDACTED]";
+  var OMITTED_ACCESSOR = "[Accessor omitted]";
+  var SECRET_KEY_PARTS = Object.freeze([
+    "authorization",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "authtoken",
+    "sessiontoken",
+    "sessionid",
+    "password",
+    "passwd",
+    "clientsecret",
+    "apikey",
+    "apiSecret",
+    "cookie",
+    "setcookie",
+    "csrf",
+    "xsrf"
+  ]);
+  function normalizeKey(key) {
+    return String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+  function isSensitiveKey(key) {
+    const normalized = normalizeKey(key);
+    if ([
+      "auth",
+      "credential",
+      "credentials",
+      "session",
+      "sid",
+      "token",
+      "secret",
+      "xutsid"
+    ].includes(normalized) || normalized.endsWith("token") || normalized.endsWith("secret") || normalized.endsWith("password") || normalized.endsWith("cookie") || normalized.endsWith("sid")) {
+      return true;
+    }
+    return SECRET_KEY_PARTS.some((part) => normalized.includes(part.toLowerCase()));
+  }
+  function truncateDiagnosticString(value, maxLength = DEV_LIMITS.maxStringLength) {
+    const text = String(value);
+    const limit = clampLimit(maxLength, DEV_LIMITS.maxStringLength);
+    if (text.length <= limit) return text;
+    return `${text.slice(0, Math.max(0, limit - 1))}…`;
+  }
+  function redactSecretText(value, maxLength = DEV_LIMITS.maxStringLength) {
+    let text = String(value);
+    text = text.replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi, REDACTED2);
+    text = text.replace(
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+      REDACTED2
+    );
+    text = text.replace(
+      /([?&](?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|code|password|secret)=)[^&#\s]*/gi,
+      `$1${REDACTED2}`
+    );
+    text = text.replace(
+      /\b(?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|password|secret)\s*[:=]\s*[^\s,;]+/gi,
+      (match) => `${match.slice(0, Math.max(match.indexOf(":"), match.indexOf("=")) + 1)}${REDACTED2}`
+    );
+    return truncateDiagnosticString(text, maxLength);
+  }
+  function normalizeOptions(options = {}) {
+    return {
+      maxDepth: clampLimit(options.maxDepth, DEV_LIMITS.maxDepth),
+      maxItems: clampLimit(options.maxItems, DEV_LIMITS.maxCollectionItems),
+      maxKeys: clampLimit(options.maxKeys, DEV_LIMITS.maxObjectKeys),
+      maxStringLength: clampLimit(
+        options.maxStringLength,
+        DEV_LIMITS.maxStringLength
+      )
+    };
+  }
+  function sanitizeInternal(value, options, depth, seen) {
+    if (value === null || typeof value === "boolean") return value;
+    if (typeof value === "number") return Number.isFinite(value) ? value : null;
+    if (typeof value === "string") {
+      return redactSecretText(value, options.maxStringLength);
+    }
+    if (typeof value === "bigint") return truncateDiagnosticString(value, options.maxStringLength);
+    if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
+      return void 0;
+    }
+    if (depth >= options.maxDepth) return "[Maximum depth reached]";
+    if (seen.has(value)) return "[Circular]";
+    if (value instanceof Date) {
+      return Number.isNaN(value.getTime()) ? null : value.toISOString();
+    }
+    if (value instanceof Error) {
+      return {
+        name: truncateDiagnosticString(value.name || "Error", 100),
+        message: redactSecretText(value.message || "", options.maxStringLength)
+      };
+    }
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) {
+        const result2 = [];
+        for (const entry of value.slice(0, options.maxItems)) {
+          const sanitized = sanitizeInternal(entry, options, depth + 1, seen);
+          if (sanitized !== void 0) result2.push(sanitized);
+        }
+        return result2;
+      }
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        return "[Unreadable object]";
+      }
+      const result = {};
+      const keys = Object.keys(descriptors).sort().slice(0, options.maxKeys);
+      for (const key of keys) {
+        const safeKey = truncateDiagnosticString(key, 200);
+        if (isSensitiveKey(key)) {
+          result[safeKey] = REDACTED2;
+          continue;
+        }
+        const descriptor = descriptors[key];
+        if (!("value" in descriptor)) {
+          result[safeKey] = OMITTED_ACCESSOR;
+          continue;
+        }
+        const sanitized = sanitizeInternal(
+          descriptor.value,
+          options,
+          depth + 1,
+          seen
+        );
+        if (sanitized !== void 0) result[safeKey] = sanitized;
+      }
+      return result;
+    } finally {
+      seen.delete(value);
+    }
+  }
+  function sanitizeDiagnosticValue(value, options = {}) {
+    return sanitizeInternal(value, normalizeOptions(options), 0, /* @__PURE__ */ new WeakSet());
+  }
+
+  // src/dev/class-discovery.js
+  var UT_CLASS_PATTERN = /^UT[A-Z][A-Za-z0-9_$]*$/;
+  var STATIC_IGNORES = /* @__PURE__ */ new Set([
+    "arguments",
+    "caller",
+    "length",
+    "name",
+    "prototype"
+  ]);
+  function safeOwnPropertyNames(value) {
+    try {
+      return Object.getOwnPropertyNames(value);
+    } catch {
+      return [];
+    }
+  }
+  function safeDescriptor(value, key) {
+    try {
+      return Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return void 0;
+    }
+  }
+  function describeMembers(target, ignoredNames, maxItems) {
+    if (!target || typeof target !== "object" && typeof target !== "function") {
+      return [];
+    }
+    const members = [];
+    for (const name of safeOwnPropertyNames(target).sort()) {
+      if (ignoredNames.has(name)) continue;
+      const descriptor = safeDescriptor(target, name);
+      if (!descriptor) continue;
+      if (typeof descriptor.value === "function") {
+        members.push({
+          name: truncateDiagnosticString(name, 160),
+          kind: "method",
+          arity: Math.max(0, Math.floor(descriptor.value.length || 0))
+        });
+      } else if (typeof descriptor.get === "function" || typeof descriptor.set === "function") {
+        members.push({
+          name: truncateDiagnosticString(name, 160),
+          kind: "accessor",
+          getter: typeof descriptor.get === "function",
+          setter: typeof descriptor.set === "function"
+        });
+      }
+      if (members.length >= maxItems) break;
+    }
+    return members;
+  }
+  function getDataDescriptorValue(target, key) {
+    const descriptor = safeDescriptor(target, key);
+    if (!descriptor || !("value" in descriptor)) {
+      return { ok: false, accessor: !!descriptor };
+    }
+    return { ok: true, value: descriptor.value };
+  }
+  function discoverUTClasses(root = globalThis, options = {}) {
+    const limits = resolveDevLimits(options);
+    const matchingNames = safeOwnPropertyNames(root).filter((name) => UT_CLASS_PATTERN.test(name)).sort();
+    const classes = [];
+    for (const name of matchingNames.slice(0, limits.maxClasses)) {
+      const rootValue = getDataDescriptorValue(root, name);
+      if (!rootValue.ok || typeof rootValue.value !== "function") continue;
+      const constructor = rootValue.value;
+      const prototypeValue = getDataDescriptorValue(constructor, "prototype");
+      classes.push({
+        name,
+        prototypeMembers: prototypeValue.ok ? describeMembers(
+          prototypeValue.value,
+          /* @__PURE__ */ new Set(["constructor"]),
+          limits.maxMethodsPerClass
+        ) : [],
+        staticMembers: describeMembers(
+          constructor,
+          STATIC_IGNORES,
+          limits.maxMethodsPerClass
+        )
+      });
+    }
+    return {
+      classes,
+      totalMatchingGlobals: matchingNames.length,
+      truncated: matchingNames.length > limits.maxClasses
+    };
+  }
+  function normalizeCapabilityPath(path) {
+    const parts = Array.isArray(path) ? path : String(path || "").split(".");
+    return parts.map((part) => String(part).trim()).filter(Boolean).slice(0, 16);
+  }
+  function inspectPath(root, path) {
+    let current = root;
+    for (const segment of path) {
+      if (current === null || typeof current !== "object" && typeof current !== "function") {
+        return { available: false, reason: "parent_missing", valueType: "undefined" };
+      }
+      const descriptor = safeDescriptor(current, segment);
+      if (!descriptor) {
+        return { available: false, reason: "missing", valueType: "undefined" };
+      }
+      if (!("value" in descriptor)) {
+        return { available: false, reason: "accessor_blocked", valueType: "accessor" };
+      }
+      current = descriptor.value;
+    }
+    return { available: true, reason: null, valueType: typeof current };
+  }
+  function discoverCapabilities(root = globalThis, definitions = [], options = {}) {
+    const limits = resolveDevLimits(options);
+    const normalizedDefinitions = Array.isArray(definitions) ? definitions.slice(0, limits.maxCapabilities) : [];
+    return normalizedDefinitions.map((definition, index) => {
+      const path = normalizeCapabilityPath(definition?.path);
+      const id = truncateDiagnosticString(
+        definition?.id || path.join(".") || `capability-${index + 1}`,
+        160
+      );
+      if (path.length === 0) {
+        return { id, path: [], available: false, reason: "invalid_path", valueType: "undefined" };
+      }
+      const inspected = inspectPath(root, path);
+      const expectedType = definition?.expectedType ? truncateDiagnosticString(definition.expectedType, 40) : null;
+      const matchesExpectedType = !expectedType || inspected.available && inspected.valueType === expectedType;
+      return {
+        id,
+        path,
+        available: inspected.available && matchesExpectedType,
+        reason: matchesExpectedType ? inspected.reason : "type_mismatch",
+        valueType: inspected.valueType,
+        expectedType
+      };
+    }).sort((a, b) => a.id.localeCompare(b.id));
+  }
+  var DEFAULT_DISCOVERY_LIMITS = Object.freeze({
+    maxClasses: DEV_LIMITS.maxClasses,
+    maxMethodsPerClass: DEV_LIMITS.maxMethodsPerClass,
+    maxCapabilities: DEV_LIMITS.maxCapabilities
+  });
+
+  // src/dev/metadata.js
+  var ROUTE_TYPES = /* @__PURE__ */ new Set([
+    "adapter",
+    "hashchange",
+    "navigation",
+    "popstate",
+    "pushState",
+    "replaceState"
+  ]);
+  function parseHttpUrl(value, baseUrl) {
+    try {
+      const raw = String(value || "");
+      const isAbsolute = /^[a-z][a-z0-9+.-]*:/i.test(raw);
+      if (!isAbsolute && !baseUrl) return null;
+      const url = new URL(raw, baseUrl);
+      if (!/^https?:$/.test(url.protocol) || url.username || url.password) return null;
+      return url;
+    } catch {
+      return null;
+    }
+  }
+  function safePathname(url) {
+    const decoded = (() => {
+      try {
+        return decodeURIComponent(url.pathname);
+      } catch {
+        return url.pathname;
+      }
+    })();
+    return redactSecretText(decoded || "/", 500);
+  }
+  function sanitizeUrl(value, options = {}) {
+    let url;
+    if (value && typeof value === "object" && typeof value.origin === "string" && typeof value.pathname === "string") {
+      url = parseHttpUrl(value.origin);
+      if (url) url.pathname = value.pathname;
+    } else {
+      url = parseHttpUrl(value, options.baseUrl);
+    }
+    if (!url) return null;
+    return {
+      origin: url.origin,
+      pathname: safePathname(url)
+    };
+  }
+  function sanitizeRouteMetadata(input = {}, options = {}) {
+    const from = sanitizeUrl(input.from, options);
+    const to = sanitizeUrl(input.to, options);
+    if (!from && !to) return null;
+    const rawType = String(input.type || "navigation");
+    return {
+      timestamp: Number.isFinite(Number(input.timestamp)) ? Math.max(0, Math.floor(Number(input.timestamp))) : null,
+      type: ROUTE_TYPES.has(rawType) ? rawType : "navigation",
+      from,
+      to,
+      source: redactSecretText(input.source || "webapp", 80)
+    };
+  }
+  function normalizeAllowedOrigins(values) {
+    const origins = /* @__PURE__ */ new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+      const parsed = parseHttpUrl(value);
+      if (parsed) origins.add(parsed.origin);
+    }
+    return origins;
+  }
+  function finiteInteger(value, minimum, maximum, fallback = null) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.min(maximum, Math.max(minimum, Math.floor(numeric)));
+  }
+  function sanitizeNetworkMetadata(input = {}, options = {}) {
+    const allowedOrigins = normalizeAllowedOrigins(options.allowedOrigins);
+    if (allowedOrigins.size === 0) return null;
+    let url;
+    if (typeof input.origin === "string" && typeof input.pathname === "string") {
+      url = parseHttpUrl(input.origin);
+      if (url) url.pathname = input.pathname;
+    } else {
+      url = parseHttpUrl(input.url || input.endpoint, options.baseUrl);
+    }
+    if (!url || !allowedOrigins.has(url.origin)) return null;
+    const rawMethod = String(input.method || "GET").toUpperCase();
+    const method = /^[A-Z]{1,12}$/.test(rawMethod) ? rawMethod : "OTHER";
+    const status = finiteInteger(input.status, 0, 599, 0);
+    const durationMs = Number(input.durationMs);
+    const sizeBytes = Number(input.sizeBytes ?? input.size);
+    return {
+      timestamp: finiteInteger(input.timestamp ?? input.ts, 0, Number.MAX_SAFE_INTEGER),
+      requestId: redactSecretText(input.requestId ?? input.id ?? "", 100),
+      origin: url.origin,
+      pathname: safePathname(url),
+      method,
+      status,
+      ok: typeof input.ok === "boolean" ? input.ok : status >= 200 && status < 400,
+      durationMs: Number.isFinite(durationMs) ? Math.min(6e5, Math.max(0, Math.round(durationMs * 100) / 100)) : null,
+      sizeBytes: Number.isFinite(sizeBytes) ? Math.min(1e8, Math.max(0, Math.floor(sizeBytes))) : null,
+      transport: ["adapter", "fetch", "xhr"].includes(input.transport) ? input.transport : "adapter",
+      errorCode: input.errorCode ? redactSecretText(input.errorCode, 100) : null
+    };
+  }
+  function sanitizeRouteBatch(records, options = {}) {
+    const limit = clampLimit(options.maxItems, DEV_LIMITS.maxRoutes);
+    return (Array.isArray(records) ? records : []).slice(-limit).map((record) => sanitizeRouteMetadata(record, options)).filter(Boolean);
+  }
+  function sanitizeNetworkBatch(records, options = {}) {
+    const limit = clampLimit(options.maxItems, DEV_LIMITS.maxNetworkRecords);
+    return (Array.isArray(records) ? records : []).slice(-limit).map((record) => sanitizeNetworkMetadata(record, options)).filter(Boolean);
+  }
+
+  // src/dev/diagnostics-export.js
+  function sanitizeLogs(logs, limits) {
+    return (Array.isArray(logs) ? logs : []).slice(-limits.maxLogs).map((entry) => {
+      const safe = sanitizeDiagnosticValue(entry, {
+        maxDepth: 5,
+        maxItems: 50,
+        maxKeys: 50,
+        maxStringLength: 750
+      });
+      return {
+        timestamp: typeof safe?.timestamp === "string" ? safe.timestamp : null,
+        level: ["debug", "info", "warn", "error"].includes(safe?.level) ? safe.level : null,
+        action: typeof safe?.action === "string" ? truncateDiagnosticString(safe.action, 100) : null,
+        code: typeof safe?.data?.code === "string" ? truncateDiagnosticString(safe.data.code, 100) : null
+      };
+    });
+  }
+  function sanitizeHealthChecks(checks, limits) {
+    return (Array.isArray(checks) ? checks : []).slice(-Math.min(100, limits.maxCollectionItems)).map((entry) => {
+      const safe = sanitizeDiagnosticValue(entry, {
+        maxDepth: 4,
+        maxItems: 100,
+        maxKeys: 50,
+        maxStringLength: 200
+      });
+      const capabilities = Array.isArray(safe?.capabilities) ? safe.capabilities.slice(0, 100).map((capability) => ({
+        id: typeof capability?.id === "string" ? truncateDiagnosticString(capability.id, 100) : null,
+        state: typeof capability?.state === "string" ? truncateDiagnosticString(capability.state, 50) : typeof capability?.status === "string" ? truncateDiagnosticString(capability.status, 50) : null
+      })) : [];
+      return {
+        status: typeof safe?.status === "string" ? truncateDiagnosticString(safe.status, 50) : typeof safe?.state === "string" ? truncateDiagnosticString(safe.state, 50) : null,
+        capabilities
+      };
+    });
+  }
+  function trimExportToLimit(bundle, maxBytes) {
+    const trimOrder = [
+      bundle.network,
+      bundle.navigation,
+      bundle.logs,
+      bundle.healthChecks
+    ];
+    let changed = false;
+    for (const collection of trimOrder) {
+      while (jsonByteLength(bundle) > maxBytes && collection.length > 0) {
+        collection.shift();
+        changed = true;
+      }
+    }
+    while (jsonByteLength(bundle) > maxBytes && Array.isArray(bundle.latestSnapshot?.classes) && bundle.latestSnapshot.classes.length > 0) {
+      bundle.latestSnapshot.classes.pop();
+      changed = true;
+    }
+    while (jsonByteLength(bundle) > maxBytes && Array.isArray(bundle.latestSnapshot?.capabilities) && bundle.latestSnapshot.capabilities.length > 0) {
+      bundle.latestSnapshot.capabilities.pop();
+      changed = true;
+    }
+    if (jsonByteLength(bundle) > maxBytes) {
+      bundle.latestSnapshot = null;
+      bundle.snapshotDiff = null;
+      changed = true;
+    }
+    if (jsonByteLength(bundle) > maxBytes) {
+      bundle.developerMode = { enabled: !!bundle.developerMode?.enabled };
+      changed = true;
+    }
+    bundle.truncated = bundle.truncated || changed;
+    return bundle;
+  }
+  function createDiagnosticsExport(input = {}, options = {}) {
+    const limits = resolveDevLimits(options);
+    const bundle = {
+      schemaVersion: 1,
+      product: truncateDiagnosticString(input.product || "FUT Magic", 100),
+      extensionVersion: truncateDiagnosticString(input.extensionVersion || "unknown", 80),
+      generatedAt: Number.isFinite(Number(input.generatedAt)) ? Math.max(0, Math.floor(Number(input.generatedAt))) : 0,
+      developerMode: sanitizeDiagnosticValue(input.developerMode ?? { enabled: false }, {
+        maxDepth: 3,
+        maxItems: 20,
+        maxKeys: 20,
+        maxStringLength: 200
+      }),
+      latestSnapshot: sanitizeDiagnosticValue(input.latestSnapshot ?? null, {
+        maxDepth: limits.maxDepth,
+        maxItems: Math.max(limits.maxClasses, limits.maxMethodsPerClass),
+        maxKeys: limits.maxObjectKeys,
+        maxStringLength: limits.maxStringLength
+      }),
+      snapshotDiff: sanitizeDiagnosticValue(input.snapshotDiff ?? null, {
+        maxDepth: limits.maxDepth,
+        maxItems: limits.maxDiffItems,
+        maxKeys: limits.maxObjectKeys,
+        maxStringLength: limits.maxStringLength
+      }),
+      navigation: sanitizeRouteBatch(input.navigation, {
+        ...options,
+        maxItems: limits.maxRoutes
+      }),
+      network: sanitizeNetworkBatch(input.network, {
+        ...options,
+        maxItems: limits.maxNetworkRecords
+      }),
+      logs: sanitizeLogs(input.logs, limits),
+      healthChecks: sanitizeHealthChecks(input.healthChecks, limits),
+      truncated: false
+    };
+    return trimExportToLimit(bundle, limits.maxExportBytes);
+  }
+
+  // src/dev/snapshot.js
+  function finiteTimestamp(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : 0;
+  }
+  function normalizeMember(member) {
+    if (!member || typeof member !== "object") return null;
+    const kind = member.kind === "accessor" ? "accessor" : "method";
+    const normalized = {
+      name: truncateDiagnosticString(member.name || "unknown", 160),
+      kind
+    };
+    if (kind === "method") {
+      normalized.arity = Number.isFinite(Number(member.arity)) ? Math.max(0, Math.floor(Number(member.arity))) : 0;
+    } else {
+      normalized.getter = !!member.getter;
+      normalized.setter = !!member.setter;
+    }
+    return normalized;
+  }
+  function normalizeMembers(members, limit) {
+    return (Array.isArray(members) ? members : []).slice(0, limit).map(normalizeMember).filter(Boolean).sort((a, b) => `${a.name}:${a.kind}`.localeCompare(`${b.name}:${b.kind}`));
+  }
+  function normalizeClasses(classes, limits) {
+    return (Array.isArray(classes) ? classes : []).slice(0, limits.maxClasses).map((entry) => ({
+      name: truncateDiagnosticString(entry?.name || "unknown", 160),
+      prototypeMembers: normalizeMembers(
+        entry?.prototypeMembers,
+        limits.maxMethodsPerClass
+      ),
+      staticMembers: normalizeMembers(entry?.staticMembers, limits.maxMethodsPerClass)
+    })).sort((a, b) => a.name.localeCompare(b.name));
+  }
+  function normalizeCapabilities2(capabilities, limits) {
+    return (Array.isArray(capabilities) ? capabilities : []).slice(0, limits.maxCapabilities).map((entry, index) => ({
+      id: truncateDiagnosticString(entry?.id || `capability-${index + 1}`, 160),
+      path: (Array.isArray(entry?.path) ? entry.path : []).slice(0, 16).map((part) => truncateDiagnosticString(part, 100)),
+      available: !!entry?.available,
+      reason: entry?.reason ? truncateDiagnosticString(entry.reason, 80) : null,
+      valueType: truncateDiagnosticString(entry?.valueType || "undefined", 40),
+      expectedType: entry?.expectedType ? truncateDiagnosticString(entry.expectedType, 40) : null
+    })).sort((a, b) => a.id.localeCompare(b.id));
+  }
+  function trimSnapshotToByteLimit(snapshot, maxBytes) {
+    const result = snapshot;
+    while (jsonByteLength(result) > maxBytes && result.classes.length > 0) {
+      result.classes.pop();
+      result.truncated.classes = true;
+      result.truncated.bytes = true;
+    }
+    while (jsonByteLength(result) > maxBytes && result.capabilities.length > 0) {
+      result.capabilities.pop();
+      result.truncated.capabilities = true;
+      result.truncated.bytes = true;
+    }
+    if (jsonByteLength(result) > maxBytes) {
+      result.bridgeHealth = null;
+      result.selectors = null;
+      result.route = null;
+      result.truncated.bytes = true;
+    }
+    return result;
+  }
+  function createWebAppSnapshot(input = {}, options = {}) {
+    const limits = resolveDevLimits(options);
+    const sourceClasses = Array.isArray(input.classes) ? input.classes : [];
+    const sourceCapabilities = Array.isArray(input.capabilities) ? input.capabilities : [];
+    const snapshot = {
+      schemaVersion: 1,
+      capturedAt: finiteTimestamp(input.capturedAt),
+      extensionVersion: truncateDiagnosticString(input.extensionVersion || "unknown", 80),
+      webAppVersion: truncateDiagnosticString(input.webAppVersion || "unknown", 120),
+      classes: normalizeClasses(sourceClasses, limits),
+      capabilities: normalizeCapabilities2(sourceCapabilities, limits),
+      bridgeHealth: sanitizeDiagnosticValue(input.bridgeHealth ?? null, {
+        maxDepth: 4,
+        maxItems: 50,
+        maxKeys: 50,
+        maxStringLength: 500
+      }),
+      selectors: sanitizeDiagnosticValue(input.selectors ?? null, {
+        maxDepth: 3,
+        maxItems: 50,
+        maxKeys: 50,
+        maxStringLength: 300
+      }),
+      route: sanitizeDiagnosticValue(input.route ?? null, {
+        maxDepth: 3,
+        maxItems: 20,
+        maxKeys: 20,
+        maxStringLength: 500
+      }),
+      truncated: {
+        classes: sourceClasses.length > limits.maxClasses,
+        capabilities: sourceCapabilities.length > limits.maxCapabilities,
+        bytes: false
+      }
+    };
+    return trimSnapshotToByteLimit(snapshot, limits.maxSnapshotBytes);
+  }
+  function memberIdentity(member) {
+    if (!member || typeof member !== "object") return null;
+    return member.kind === "accessor" ? `${member.name}:accessor:${member.getter ? 1 : 0}:${member.setter ? 1 : 0}` : `${member.name}:method:${member.arity}`;
+  }
+  function difference(left, right) {
+    const filteredLeft = left.filter(Boolean);
+    const rightSet = new Set(right.filter(Boolean));
+    return filteredLeft.filter((value) => !rightSet.has(value));
+  }
+  function classMap(snapshot) {
+    return new Map(
+      (Array.isArray(snapshot?.classes) ? snapshot.classes : []).map((entry) => [
+        String(entry.name),
+        entry
+      ])
+    );
+  }
+  function capabilityMap(snapshot) {
+    return new Map(
+      (Array.isArray(snapshot?.capabilities) ? snapshot.capabilities : []).map((entry) => [
+        String(entry.id),
+        entry
+      ])
+    );
+  }
+  function comparableCapability(entry) {
+    return JSON.stringify({
+      available: !!entry?.available,
+      reason: entry?.reason ?? null,
+      valueType: entry?.valueType ?? "undefined",
+      expectedType: entry?.expectedType ?? null
+    });
+  }
+  function diffWebAppSnapshots(previous = {}, current = {}, options = {}) {
+    const limits = resolveDevLimits(options);
+    const beforeClasses = classMap(previous);
+    const afterClasses = classMap(current);
+    const allClassNames = [.../* @__PURE__ */ new Set([...beforeClasses.keys(), ...afterClasses.keys()])].sort();
+    const addedClasses = [];
+    const removedClasses = [];
+    const changedClasses = [];
+    for (const name of allClassNames) {
+      const before = beforeClasses.get(name);
+      const after = afterClasses.get(name);
+      if (!before) {
+        addedClasses.push(name);
+        continue;
+      }
+      if (!after) {
+        removedClasses.push(name);
+        continue;
+      }
+      const beforePrototype = (before.prototypeMembers || []).map(memberIdentity);
+      const afterPrototype = (after.prototypeMembers || []).map(memberIdentity);
+      const beforeStatic = (before.staticMembers || []).map(memberIdentity);
+      const afterStatic = (after.staticMembers || []).map(memberIdentity);
+      const changes = {
+        name,
+        prototypeAdded: difference(afterPrototype, beforePrototype),
+        prototypeRemoved: difference(beforePrototype, afterPrototype),
+        staticAdded: difference(afterStatic, beforeStatic),
+        staticRemoved: difference(beforeStatic, afterStatic)
+      };
+      if (changes.prototypeAdded.length || changes.prototypeRemoved.length || changes.staticAdded.length || changes.staticRemoved.length) {
+        changedClasses.push(changes);
+      }
+    }
+    const beforeCapabilities = capabilityMap(previous);
+    const afterCapabilities = capabilityMap(current);
+    const capabilityChanges = [];
+    for (const id of [.../* @__PURE__ */ new Set([...beforeCapabilities.keys(), ...afterCapabilities.keys()])].sort()) {
+      const before = beforeCapabilities.get(id) ?? null;
+      const after = afterCapabilities.get(id) ?? null;
+      if (!before || !after || comparableCapability(before) !== comparableCapability(after)) {
+        capabilityChanges.push({
+          id,
+          before: before ? { available: !!before.available, reason: before.reason ?? null, valueType: before.valueType } : null,
+          after: after ? { available: !!after.available, reason: after.reason ?? null, valueType: after.valueType } : null
+        });
+      }
+    }
+    const totals = {
+      addedClasses: addedClasses.length,
+      removedClasses: removedClasses.length,
+      changedClasses: changedClasses.length,
+      capabilityChanges: capabilityChanges.length
+    };
+    let remaining = limits.maxDiffItems;
+    const take = (values) => {
+      const result2 = values.slice(0, remaining);
+      remaining -= result2.length;
+      return result2;
+    };
+    const result = {
+      schemaVersion: 1,
+      previousCapturedAt: finiteTimestamp(previous?.capturedAt),
+      currentCapturedAt: finiteTimestamp(current?.capturedAt),
+      addedClasses: take(addedClasses),
+      removedClasses: take(removedClasses),
+      changedClasses: take(changedClasses),
+      capabilityChanges: take(capabilityChanges),
+      totals,
+      truncated: totals.addedClasses + totals.removedClasses + totals.changedClasses + totals.capabilityChanges > limits.maxDiffItems
+    };
+    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.changedClasses.length) {
+      result.changedClasses.pop();
+      result.truncated = true;
+    }
+    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.capabilityChanges.length) {
+      result.capabilityChanges.pop();
+      result.truncated = true;
+    }
+    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.addedClasses.length) {
+      result.addedClasses.pop();
+      result.truncated = true;
+    }
+    while (jsonByteLength(result) > limits.maxSnapshotBytes && result.removedClasses.length) {
+      result.removedClasses.pop();
+      result.truncated = true;
+    }
+    return result;
+  }
+  function appendBoundedSnapshot(history, snapshot, options = {}) {
+    const limits = resolveDevLimits(options);
+    const next = [...Array.isArray(history) ? history : [], snapshot].slice(
+      -limits.maxSnapshots
+    );
+    while (next.length > 0 && next.reduce((total, entry) => total + jsonByteLength(entry), 0) > limits.maxSnapshotHistoryBytes) {
+      next.shift();
+    }
+    return next;
+  }
+  var DEFAULT_SNAPSHOT_LIMITS = Object.freeze({
+    maxSnapshots: DEV_LIMITS.maxSnapshots,
+    maxSnapshotBytes: DEV_LIMITS.maxSnapshotBytes,
+    maxSnapshotHistoryBytes: DEV_LIMITS.maxSnapshotHistoryBytes
+  });
+
+  // src/dev/debug-mode.js
+  var DeveloperModeDisabledError = class extends Error {
+    constructor() {
+      super("Developer Mode is disabled");
+      this.name = "DeveloperModeDisabledError";
+      this.code = "DEVELOPER_MODE_DISABLED";
+    }
+  };
+  function assertEnabled(enabled) {
+    if (!enabled) throw new DeveloperModeDisabledError();
+  }
+  function createDeveloperMode(options = {}) {
+    const root = options.root ?? globalThis;
+    const limits = resolveDevLimits(options.limits);
+    const capabilityDefinitions = Array.isArray(options.capabilityDefinitions) ? options.capabilityDefinitions : [];
+    const allowedNetworkOrigins = Array.isArray(options.allowedNetworkOrigins) ? [...options.allowedNetworkOrigins] : [];
+    const now = typeof options.now === "function" ? options.now : Date.now;
+    let enabled = false;
+    let snapshots = [];
+    let navigation = [];
+    let network = [];
+    let logs = [];
+    function enable() {
+      enabled = true;
+      return getStatus();
+    }
+    function disable({ clearEphemeral = true } = {}) {
+      enabled = false;
+      if (clearEphemeral) {
+        navigation = [];
+        network = [];
+        logs = [];
+      }
+      return getStatus();
+    }
+    function getStatus() {
+      return {
+        enabled,
+        instrumentation: "read-only-on-demand",
+        hooksInstalled: false,
+        snapshotCount: snapshots.length,
+        routeCount: navigation.length,
+        networkCount: network.length,
+        logCount: logs.length
+      };
+    }
+    function discover() {
+      assertEnabled(enabled);
+      const classDiscovery = discoverUTClasses(root, limits);
+      return {
+        ...classDiscovery,
+        capabilities: discoverCapabilities(root, capabilityDefinitions, limits)
+      };
+    }
+    function captureSnapshot(details = {}) {
+      assertEnabled(enabled);
+      const discovery = discover();
+      const snapshot = createWebAppSnapshot(
+        {
+          capturedAt: details.capturedAt ?? now(),
+          extensionVersion: options.extensionVersion,
+          webAppVersion: details.webAppVersion ?? options.webAppVersion,
+          classes: discovery.classes,
+          capabilities: discovery.capabilities,
+          bridgeHealth: details.bridgeHealth,
+          selectors: details.selectors,
+          route: details.route
+        },
+        limits
+      );
+      snapshots = appendBoundedSnapshot(snapshots, snapshot, limits);
+      return sanitizeDiagnosticValue(snapshot, {
+        maxDepth: limits.maxDepth,
+        maxItems: Math.max(limits.maxClasses, limits.maxMethodsPerClass),
+        maxKeys: limits.maxObjectKeys,
+        maxStringLength: limits.maxStringLength
+      });
+    }
+    function compareLatestSnapshots() {
+      if (snapshots.length < 2) return null;
+      return diffWebAppSnapshots(
+        snapshots[snapshots.length - 2],
+        snapshots[snapshots.length - 1],
+        limits
+      );
+    }
+    function recordRoute(input) {
+      if (!enabled) return false;
+      const sanitized = sanitizeRouteMetadata(input);
+      if (!sanitized) return false;
+      navigation = [...navigation, sanitized].slice(-limits.maxRoutes);
+      return true;
+    }
+    function recordNetwork(input) {
+      if (!enabled) return false;
+      const sanitized = sanitizeNetworkMetadata(input, {
+        allowedOrigins: allowedNetworkOrigins
+      });
+      if (!sanitized) return false;
+      network = [...network, sanitized].slice(-limits.maxNetworkRecords);
+      return true;
+    }
+    function recordLog(input) {
+      if (!enabled) return false;
+      const sanitized = sanitizeDiagnosticValue(input, {
+        maxDepth: 5,
+        maxItems: 50,
+        maxKeys: 50,
+        maxStringLength: 750
+      });
+      logs = [...logs, sanitized].slice(-limits.maxLogs);
+      return true;
+    }
+    function exportDiagnostics(details = {}) {
+      return createDiagnosticsExport(
+        {
+          ...details,
+          generatedAt: details.generatedAt ?? now(),
+          extensionVersion: options.extensionVersion,
+          developerMode: getStatus(),
+          latestSnapshot: snapshots.at(-1) ?? null,
+          snapshotDiff: compareLatestSnapshots(),
+          navigation,
+          network,
+          logs
+        },
+        { ...limits, allowedOrigins: allowedNetworkOrigins }
+      );
+    }
+    function clearSnapshots() {
+      snapshots = [];
+    }
+    return Object.freeze({
+      enable,
+      disable,
+      isEnabled: () => enabled,
+      getStatus,
+      discover,
+      captureSnapshot,
+      compareLatestSnapshots,
+      recordRoute,
+      recordNetwork,
+      recordLog,
+      exportDiagnostics,
+      clearSnapshots
+    });
+  }
+
+  // src/ea/controller-adapter.js
+  var requireBridge = () => {
+    const bridge = globalThis.window?.eaData?.grindPilot;
+    if (!bridge) {
+      const error = new Error("GrindPilot EA controller bridge is unavailable");
+      error.code = "EA_BRIDGE_UNAVAILABLE";
+      throw error;
+    }
+    return bridge;
+  };
+  var verifiedValue = (result, operation) => {
+    if (result?.status === "verified") return result.value;
+    const error = new Error(result?.reason || `${operation} was not verified`);
+    error.code = result?.status === "ambiguous" ? "EA_STATE_AMBIGUOUS" : result?.status === "not_applied" ? "EA_OPERATION_NOT_APPLIED" : "EA_OPERATION_UNAVAILABLE";
+    error.evidence = result?.evidence ?? null;
+    error.result = result ?? null;
+    if (result?.status === "not_applied") {
+      error.notApplied = true;
+      error.safeToRetry = true;
+    }
+    throw error;
+  };
+  var ControllerGameVersion = Object.freeze({
+    FC26: "fc26",
+    FC27: "fc27",
+    UNKNOWN: "unknown"
+  });
+  var ControllerGameVersionObservation = Object.freeze({
+    OBSERVED: "observed",
+    UNVERIFIED: "unverified",
+    COMPATIBILITY_DEFAULT: "compatibility_default"
+  });
+  var ownDataProperty = (input, key) => {
+    if (input == null || typeof input !== "object") return { present: false, value: void 0 };
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(input, key);
+    } catch {
+      return { present: true, value: void 0 };
+    }
+    if (!descriptor) return { present: false, value: void 0 };
+    return { present: true, value: "value" in descriptor ? descriptor.value : void 0 };
+  };
+  var boundedScalar = (input, key, maxLength, { allowNumber = false } = {}) => {
+    const property = ownDataProperty(input, key);
+    const value = property.value;
+    if (allowNumber && Number.isSafeInteger(value)) return String(value);
+    if (typeof value !== "string") return null;
+    const normalized = value.trim();
+    return normalized && normalized.length <= maxLength && !/[\u0000-\u001f\u007f]/.test(normalized) ? normalized : null;
+  };
+  var normalizeVersionFields = (input) => {
+    const versionProperty = ownDataProperty(input, "gameVersion");
+    if (!versionProperty.present) {
+      return {
+        gameVersion: ControllerGameVersion.FC26,
+        gameVersionObservation: ControllerGameVersionObservation.COMPATIBILITY_DEFAULT,
+        gameVersionSource: "legacy_bridge_v1"
+      };
+    }
+    const value = typeof versionProperty.value === "string" ? versionProperty.value.trim().toLowerCase() : "";
+    if (![ControllerGameVersion.FC26, ControllerGameVersion.FC27].includes(value)) {
+      return {
+        gameVersion: ControllerGameVersion.UNKNOWN,
+        gameVersionObservation: ControllerGameVersionObservation.UNVERIFIED,
+        gameVersionSource: "none"
+      };
+    }
+    const observation = boundedScalar(input, "gameVersionObservation", 32) === ControllerGameVersionObservation.UNVERIFIED ? ControllerGameVersionObservation.UNVERIFIED : ControllerGameVersionObservation.OBSERVED;
+    const declaredSource = boundedScalar(input, "gameVersionSource", 64);
+    return {
+      gameVersion: value,
+      gameVersionObservation: observation,
+      gameVersionSource: declaredSource === "ea_runtime" ? declaredSource : "main_world_context"
+    };
+  };
+  var normalizeControllerContext = (input) => {
+    let prototype;
+    try {
+      prototype = input != null && typeof input === "object" && !Array.isArray(input) ? Object.getPrototypeOf(input) : void 0;
+    } catch {
+      prototype = void 0;
+    }
+    const context = prototype === Object.prototype || prototype === null ? input : { gameVersion: ControllerGameVersion.UNKNOWN };
+    return Object.freeze({
+      ...normalizeVersionFields(context),
+      route: boundedScalar(context, "route", 512),
+      setId: boundedScalar(context, "setId", 128, { allowNumber: true }),
+      setName: boundedScalar(context, "setName", 240),
+      challengeId: boundedScalar(context, "challengeId", 128, { allowNumber: true }),
+      challengeName: boundedScalar(context, "challengeName", 240),
+      challengeCompleted: ownDataProperty(context, "challengeCompleted").value === true,
+      bridgeReady: ownDataProperty(context, "bridgeReady").value === true
+    });
+  };
+  var ControllerAdapter = class {
+    async health() {
+      return verifiedValue(await requireBridge().getHealth(), "Bridge health check");
+    }
+    async getContext() {
+      return normalizeControllerContext(await requireBridge().getContext());
+    }
+    async readInventory() {
+      return verifiedValue(await requireBridge().readInventory(), "Inventory refresh");
+    }
+    async solveCurrentSbc(options = {}) {
+      return verifiedValue(
+        await requireBridge().solveCurrentSbc(options),
+        "SBC solve"
+      );
+    }
+    async submitCurrentSbc(intent = {}) {
+      return verifiedValue(
+        await requireBridge().submitCurrentSbc(intent),
+        "SBC submission"
+      );
+    }
+    async listOwnedPacks() {
+      const packs = verifiedValue(
+        await requireBridge().listOwnedRewardPacks(),
+        "Owned-pack listing"
+      );
+      return packs.map((pack) => ({ ...pack, packId: String(pack.id), owned: true }));
+    }
+    async claimReward(rewardRef = {}, beforePacks = null) {
+      const value = verifiedValue(
+        await requireBridge().claimCurrentReward({
+          ...rewardRef,
+          beforePacks: Array.isArray(beforePacks) ? beforePacks.map((pack) => ({
+            ...pack,
+            id: String(pack?.packId ?? pack?.id ?? "")
+          })) : null
+        }),
+        "Reward claim"
+      );
+      return {
+        claimed: true,
+        success: true,
+        packId: String(value?.pack?.id ?? ""),
+        rewardRef
+      };
+    }
+    async openOwnedPack({ packId: packId2 }) {
+      const value = verifiedValue(
+        await requireBridge().openOwnedRewardPack({ packId: packId2 }),
+        "Reward-pack opening"
+      );
+      return {
+        opened: true,
+        packId: String(value.packId),
+        items: (value.itemIds ?? []).map((itemId) => ({ itemId }))
+      };
+    }
+    async resolveUnassigned(policy = {}) {
+      return verifiedValue(
+        await requireBridge().resolveUnassigned(policy),
+        "Unassigned resolution"
+      );
+    }
+    async getPlayerPick(pickId = null) {
+      const value = verifiedValue(
+        await requireBridge().readPlayerPick({ pickId }),
+        "Player-pick inspection"
+      );
+      return {
+        ...value,
+        id: value.pickIdentity ?? null,
+        pickId: value.pickIdentity ?? null,
+        offers: Array.isArray(value.offers) ? value.offers : []
+      };
+    }
+    async selectPlayerPick(intent) {
+      const value = verifiedValue(
+        await requireBridge().selectPlayerPick(intent),
+        "Player-pick selection"
+      );
+      return { success: true, ...value };
+    }
+    async organizeIntoSbc(intent = {}) {
+      return verifiedValue(
+        await requireBridge().organizeIntoSbc(intent),
+        "Organizer SBC submission"
+      );
+    }
+    async readSbcChallengeState(query = {}) {
+      return verifiedValue(
+        await requireBridge().readSbcChallengeState(query),
+        "SBC challenge state read"
+      );
+    }
+    async getCapabilityHealth() {
+      return verifiedValue(
+        await requireBridge().getCapabilityHealth(),
+        "Capability health read"
+      );
+    }
+    async readCurrentSbcProject() {
+      return verifiedValue(
+        await requireBridge().readCurrentSbcProject(),
+        "Current SBC project read"
+      );
+    }
+    async findSbcTarget(query = {}) {
+      return verifiedValue(
+        await requireBridge().findSbcTarget(query),
+        "SBC target lookup"
+      );
+    }
+    async readLegacySequences() {
+      return verifiedValue(
+        await requireBridge().readLegacySequences(),
+        "Legacy Sequence read"
+      );
+    }
+  };
+
+  // src/ea/page-storage-area.js
+  var COMMAND_TYPE = "GRINDPILOT_STATE_COMMAND_V2";
+  var DEFAULT_TIMEOUT_MS = 5e3;
+  var STORAGE_KEYS = Object.freeze({
+    activity: "grindpilot.activity.v1",
+    profiles: "grindpilot.profiles.v1",
+    projects: "grindpilot.projects.v1",
+    settings: "grindpilot.settings.v1"
+  });
+  var DIRECT_STORAGE_ACTIONS = /* @__PURE__ */ new Set([
+    "BOOTSTRAP_LOAD",
+    "SETTINGS_SAVE",
+    "ACTIVITY_SAVE",
+    "PROJECTS_SAVE",
+    "PROFILE_LIST",
+    "PROFILE_GET",
+    "PROFILE_PUT",
+    "PROFILE_DELETE"
+  ]);
+  var requestId = () => globalThis.crypto?.randomUUID?.() ?? `gp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  var PageStorageArea = class {
+    constructor({
+      runtime = globalThis.chrome?.runtime,
+      storage = globalThis.chrome?.storage?.local,
+      timeoutMs = DEFAULT_TIMEOUT_MS
+    } = {}) {
+      if (!runtime?.sendMessage) {
+        throw new TypeError("PageStorageArea requires the extension runtime API");
+      }
+      this.runtime = runtime;
+      this.storage = storage?.get && storage?.set && storage?.remove ? storage : null;
+      this.timeoutMs = timeoutMs;
+      this.disposed = false;
+    }
+    command(action, payload = null) {
+      if (this.disposed) return Promise.reject(new Error("GrindPilot state adapter disposed"));
+      if (this.storage && DIRECT_STORAGE_ACTIONS.has(action)) {
+        return this.directCommand(action, payload);
+      }
+      const id = requestId();
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          callback();
+        };
+        const timeoutId = setTimeout(() => finish(() => {
+          const error = new Error(`GrindPilot state command ${action} timed out`);
+          error.code = "GP_STATE_TIMEOUT";
+          reject(error);
+        }), this.timeoutMs);
+        this.runtime.sendMessage(
+          { type: COMMAND_TYPE, requestId: id, action, payload },
+          (response) => finish(() => {
+            const runtimeError = this.runtime?.lastError;
+            if (runtimeError || !response?.ok) {
+              const error = new Error(runtimeError?.message || response?.error?.message || "GrindPilot state command failed");
+              error.code = response?.error?.code || "GP_STATE_FAILED";
+              error.details = response?.error?.details ?? null;
+              reject(error);
+            } else resolve(response.data);
+          })
+        );
+      });
+    }
+    storageCall(method, ...args) {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          callback();
+        };
+        const timeoutId = setTimeout(() => finish(() => {
+          const error = new Error(`GrindPilot storage ${method} timed out`);
+          error.code = "GP_STATE_TIMEOUT";
+          reject(error);
+        }), this.timeoutMs);
+        try {
+          this.storage[method](...args, (result) => finish(() => {
+            const runtimeError = this.runtime?.lastError;
+            if (runtimeError) {
+              const error = new Error(runtimeError.message || `GrindPilot storage ${method} failed`);
+              error.code = "GP_STATE_STORAGE_FAILED";
+              reject(error);
+            } else resolve(result);
+          }));
+        } catch (cause) {
+          finish(() => {
+            const error = new Error(cause?.message || `GrindPilot storage ${method} failed`);
+            error.code = "GP_STATE_STORAGE_FAILED";
+            error.cause = cause;
+            reject(error);
+          });
+        }
+      });
+    }
+    async directCommand(action, payload = null) {
+      const input = payload && typeof payload === "object" ? payload : {};
+      if (action === "BOOTSTRAP_LOAD") {
+        const stored2 = await this.storageCall("get", [
+          STORAGE_KEYS.activity,
+          STORAGE_KEYS.projects,
+          STORAGE_KEYS.settings
+        ]);
+        return {
+          activity: Array.isArray(stored2?.[STORAGE_KEYS.activity]) ? stored2[STORAGE_KEYS.activity] : [],
+          projects: Array.isArray(stored2?.[STORAGE_KEYS.projects]) ? stored2[STORAGE_KEYS.projects] : [],
+          settings: stored2?.[STORAGE_KEYS.settings] && typeof stored2[STORAGE_KEYS.settings] === "object" && !Array.isArray(stored2[STORAGE_KEYS.settings]) ? stored2[STORAGE_KEYS.settings] : {}
+        };
+      }
+      if (action === "SETTINGS_SAVE") {
+        await this.storageCall("set", { [STORAGE_KEYS.settings]: input.value });
+        return true;
+      }
+      if (action === "ACTIVITY_SAVE") {
+        await this.storageCall("set", { [STORAGE_KEYS.activity]: input.value });
+        return true;
+      }
+      if (action === "PROJECTS_SAVE") {
+        await this.storageCall("set", { [STORAGE_KEYS.projects]: input.value });
+        return true;
+      }
+      const stored = await this.storageCall("get", [STORAGE_KEYS.profiles]);
+      const profiles = stored?.[STORAGE_KEYS.profiles] && typeof stored[STORAGE_KEYS.profiles] === "object" && !Array.isArray(stored[STORAGE_KEYS.profiles]) ? structuredClone(stored[STORAGE_KEYS.profiles]) : {};
+      if (action === "PROFILE_LIST") return Object.values(profiles);
+      const id = String(input.id ?? input.profile?.id ?? "").trim();
+      if (action === "PROFILE_GET") return profiles[id] ?? null;
+      if (action === "PROFILE_PUT") {
+        profiles[id] = structuredClone(input.profile);
+        await this.storageCall("set", { [STORAGE_KEYS.profiles]: profiles });
+        return profiles[id];
+      }
+      if (!Object.hasOwn(profiles, id)) return false;
+      delete profiles[id];
+      if (Object.keys(profiles).length) {
+        await this.storageCall("set", { [STORAGE_KEYS.profiles]: profiles });
+      } else {
+        await this.storageCall("remove", [STORAGE_KEYS.profiles]);
+      }
+      return true;
+    }
+    loadBootstrap() {
+      return this.command("BOOTSTRAP_LOAD");
+    }
+    saveSettings(value) {
+      return this.command("SETTINGS_SAVE", { value });
+    }
+    saveActivity(value) {
+      return this.command("ACTIVITY_SAVE", { value });
+    }
+    saveProjects(value) {
+      return this.command("PROJECTS_SAVE", { value });
+    }
+    listProfiles() {
+      return this.command("PROFILE_LIST");
+    }
+    getProfile(id) {
+      return this.command("PROFILE_GET", { id });
+    }
+    putProfile(profile) {
+      return this.command("PROFILE_PUT", { profile });
+    }
+    deleteProfile(id) {
+      return this.command("PROFILE_DELETE", { id });
+    }
+    loadActiveRun(ownerId) {
+      return this.command("RUN_LOAD_ACTIVE", { ownerId });
+    }
+    loadRun(runId, ownerId) {
+      return this.command("RUN_LOAD", { runId, ownerId });
+    }
+    createRun(run, ownerId) {
+      return this.command("RUN_CREATE", { run, ownerId });
+    }
+    saveRun(run, expectedRevision, ownerId) {
+      return this.command("RUN_SAVE", { run, expectedRevision, ownerId });
+    }
+    assertRunOwnership(runId, ownerId) {
+      return this.command("RUN_ASSERT_OWNER", { runId, ownerId });
+    }
+    clearActiveRun(runId, ownerId) {
+      return this.command("RUN_CLEAR", { runId, ownerId });
+    }
+    dispose() {
+      this.disposed = true;
+    }
+  };
+
+  // src/workflow/errors.js
+  var WorkflowError = class extends Error {
+    constructor(message, { code = "WORKFLOW_ERROR", details = null } = {}) {
+      super(message);
+      this.name = "WorkflowError";
+      this.code = code;
+      this.details = details;
+    }
+  };
+  var WorkflowValidationError = class extends WorkflowError {
+    constructor(issues) {
+      const list = Array.isArray(issues) ? issues : [];
+      super(
+        list.length ? `Workflow validation failed: ${list[0].message}` : "Workflow validation failed",
+        { code: "WORKFLOW_VALIDATION_FAILED", details: { issues: list } }
+      );
+      this.name = "WorkflowValidationError";
+      this.issues = list;
+    }
+  };
+  var WorkflowPersistenceError = class extends WorkflowError {
+    constructor(message, details = null) {
+      super(message, { code: "WORKFLOW_PERSISTENCE_FAILED", details });
+      this.name = "WorkflowPersistenceError";
+    }
+  };
+  var WorkflowConflictError = class extends WorkflowError {
+    constructor(message = "Workflow revision conflict", details = null) {
+      super(message, { code: "WORKFLOW_REVISION_CONFLICT", details });
+      this.name = "WorkflowConflictError";
+    }
+  };
+  var WorkflowTimeoutError = class extends WorkflowError {
+    constructor(timeoutMs) {
+      super(`Workflow step timed out after ${timeoutMs} ms`, {
+        code: "STEP_TIMEOUT",
+        details: { timeoutMs }
+      });
+      this.name = "WorkflowTimeoutError";
+      this.timeoutMs = timeoutMs;
+    }
+  };
+
+  // src/ea/workflow-storage-repository.js
+  var STORAGE_KEY = "grindpilot.activeRun.v1";
+  var clone = (value) => value == null ? value : structuredClone(value);
+  var PageWorkflowRepository = class {
+    constructor(storageArea, storageKey = STORAGE_KEY) {
+      const domainApi = storageArea?.loadActiveRun && storageArea?.saveRun;
+      const legacyApi = storageArea?.get && storageArea?.set && storageArea?.remove;
+      if (!domainApi && !legacyApi) {
+        throw new TypeError("PageWorkflowRepository requires a GrindPilot state area");
+      }
+      this.storageArea = storageArea;
+      this.storageKey = storageKey;
+      this.domainApi = Boolean(domainApi);
+      this.ownerId = globalThis.crypto?.randomUUID?.() ?? `workflow-owner-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+    async loadActiveRun() {
+      if (this.domainApi) {
+        return clone(await this.storageArea.loadActiveRun(this.ownerId));
+      }
+      const stored = await this.storageArea.get(this.storageKey);
+      return clone(stored?.[this.storageKey] ?? null);
+    }
+    async loadRun(runId) {
+      if (this.domainApi) {
+        return clone(await this.storageArea.loadRun(runId, this.ownerId));
+      }
+      const run = await this.loadActiveRun();
+      return run && String(run.runId) === String(runId) ? run : null;
+    }
+    async createRun(run) {
+      if (!run?.runId) throw new WorkflowPersistenceError("Run id is required");
+      if (this.domainApi) {
+        return clone(await this.storageArea.createRun(clone(run), this.ownerId));
+      }
+      const existing = await this.loadActiveRun();
+      if (existing && !["completed", "stopped", "failed"].includes(existing.status)) {
+        throw new WorkflowConflictError("A workflow run is already active", {
+          runId: existing.runId
+        });
+      }
+      await this.storageArea.set({ [this.storageKey]: clone(run) });
+      return clone(run);
+    }
+    async saveRun(run, { expectedRevision = null } = {}) {
+      if (this.domainApi) {
+        return clone(
+          await this.storageArea.saveRun(
+            clone(run),
+            expectedRevision,
+            this.ownerId
+          )
+        );
+      }
+      const current = await this.loadActiveRun();
+      if (!current || String(current.runId) !== String(run?.runId)) {
+        throw new WorkflowPersistenceError("Workflow run was not found", {
+          runId: run?.runId ?? null
+        });
+      }
+      if (expectedRevision != null && Number(current.revision) !== Number(expectedRevision)) {
+        throw new WorkflowConflictError("Workflow run revision changed", {
+          runId: run.runId,
+          expectedRevision,
+          actualRevision: current.revision
+        });
+      }
+      await this.storageArea.set({ [this.storageKey]: clone(run) });
+      return clone(run);
+    }
+    async clearActiveRun(runId = null) {
+      if (this.domainApi) {
+        await this.storageArea.clearActiveRun(runId, this.ownerId);
+        return;
+      }
+      const current = await this.loadActiveRun();
+      if (runId == null || String(current?.runId ?? "") === String(runId)) {
+        await this.storageArea.remove(this.storageKey);
+      }
+    }
+    async assertOwnership(runId) {
+      if (!this.domainApi) return true;
+      await this.storageArea.assertRunOwnership(runId, this.ownerId);
+      return true;
+    }
+  };
+
+  // src/inventory/snapshot-store.js
+  var InventoryGenerationConflictError = class extends Error {
+    constructor(expected, actual) {
+      super(`Inventory generation conflict: expected ${expected}, current ${actual}`);
+      this.name = "InventoryGenerationConflictError";
+      this.expectedGeneration = expected;
+      this.actualGeneration = actual;
+    }
+  };
+  var InventoryIdentityConflictError = class extends Error {
+    constructor(itemId) {
+      super(`Owned item ${itemId} appears more than once in the same snapshot`);
+      this.name = "InventoryIdentityConflictError";
+      this.itemId = itemId;
+    }
+  };
+  var freezeSource = (location2, generation, items) => Object.freeze({ location: location2, generation, items: Object.freeze(items) });
+  var normalizeCapacity = (value) => {
+    if (value === null || value === void 0) return null;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new TypeError("storageCapacity must be a non-negative integer or null");
+    }
+    return parsed;
+  };
+  var createEmptyState = () => {
+    const generation = 0;
+    const club = freezeSource(INVENTORY_LOCATIONS.CLUB, generation, []);
+    const storage = freezeSource(INVENTORY_LOCATIONS.SBC_STORAGE, generation, []);
+    const unassigned = freezeSource(INVENTORY_LOCATIONS.UNASSIGNED, generation, []);
+    return Object.freeze({
+      generation,
+      updatedAt: null,
+      storageCapacity: null,
+      club,
+      storage,
+      unassigned,
+      items: Object.freeze([])
+    });
+  };
+  var InventorySnapshotStore = class {
+    #state = createEmptyState();
+    #clock;
+    constructor({ clock = () => (/* @__PURE__ */ new Date()).toISOString() } = {}) {
+      if (typeof clock !== "function") throw new TypeError("clock must be a function");
+      this.#clock = clock;
+    }
+    getSnapshot() {
+      return this.#state;
+    }
+    /**
+     * Build and validate the full next state before publishing it. A malformed
+     * source therefore cannot leave club/storage/unassigned on mixed generations.
+     */
+    replaceSnapshot(input = {}, { expectedGeneration = null } = {}) {
+      const current = this.#state;
+      if (expectedGeneration !== null && Number(expectedGeneration) !== current.generation) {
+        throw new InventoryGenerationConflictError(
+          Number(expectedGeneration),
+          current.generation
+        );
+      }
+      const nextGeneration = current.generation + 1;
+      const normalizeSource = (items, location2) => (Array.isArray(items) ? items : []).map(
+        (item) => normalizeInventoryItem(item, { location: location2 })
+      );
+      const clubItems = normalizeSource(input.club, INVENTORY_LOCATIONS.CLUB);
+      const storageItems = normalizeSource(
+        input.storage,
+        INVENTORY_LOCATIONS.SBC_STORAGE
+      );
+      const unassignedItems = normalizeSource(
+        input.unassigned,
+        INVENTORY_LOCATIONS.UNASSIGNED
+      );
+      const allItems = [...clubItems, ...storageItems, ...unassignedItems];
+      const itemIds = /* @__PURE__ */ new Set();
+      for (const item of allItems) {
+        if (itemIds.has(item.itemId)) {
+          throw new InventoryIdentityConflictError(item.itemId);
+        }
+        itemIds.add(item.itemId);
+      }
+      const club = freezeSource(
+        INVENTORY_LOCATIONS.CLUB,
+        nextGeneration,
+        clubItems
+      );
+      const storage = freezeSource(
+        INVENTORY_LOCATIONS.SBC_STORAGE,
+        nextGeneration,
+        storageItems
+      );
+      const unassigned = freezeSource(
+        INVENTORY_LOCATIONS.UNASSIGNED,
+        nextGeneration,
+        unassignedItems
+      );
+      const next = Object.freeze({
+        generation: nextGeneration,
+        updatedAt: String(this.#clock()),
+        storageCapacity: normalizeCapacity(input.storageCapacity),
+        club,
+        storage,
+        unassigned,
+        items: Object.freeze([...club.items, ...storage.items, ...unassigned.items])
+      });
+      this.#state = next;
+      return next;
+    }
+  };
+
+  // src/inventory/inventory-service.js
+  var InventoryService = class {
+    #store;
+    #duplicates;
+    constructor({ snapshotStore = new InventorySnapshotStore(), duplicateService = new DuplicateService() } = {}) {
+      this.#store = snapshotStore;
+      this.#duplicates = duplicateService;
+    }
+    synchronize(input, options) {
+      return this.#store.replaceSnapshot(input, options);
+    }
+    getSnapshot() {
+      return this.#store.getSnapshot();
+    }
+    getItems(location2 = null) {
+      const snapshot = this.getSnapshot();
+      if (location2 === null) return snapshot.items;
+      if (location2 === "club") return snapshot.club.items;
+      if (location2 === "storage" || location2 === "sbc_storage") {
+        return snapshot.storage.items;
+      }
+      if (location2 === "unassigned") return snapshot.unassigned.items;
+      throw new TypeError(`Unsupported inventory location: ${location2}`);
+    }
+    findByItemId(itemId) {
+      const normalized = normalizeIdentifier(itemId, {
+        required: true,
+        name: "itemId"
+      });
+      return this.getSnapshot().items.find((item) => item.itemId === normalized) ?? null;
+    }
+    findByResourceId(resourceId) {
+      const normalized = normalizeIdentifier(resourceId, {
+        required: true,
+        name: "resourceId"
+      });
+      return Object.freeze(
+        this.getSnapshot().items.filter((item) => item.resourceId === normalized)
+      );
+    }
+    getDuplicateGroups() {
+      return this.#duplicates.group(this.getSnapshot().items);
+    }
+    planUnassignedResolution(policy) {
+      return planUnassignedResolution(this.getSnapshot(), policy);
+    }
+    getStatus() {
+      const snapshot = this.getSnapshot();
+      const capacity = snapshot.storageCapacity;
+      return Object.freeze({
+        generation: snapshot.generation,
+        clubCount: snapshot.club.items.length,
+        storageCount: snapshot.storage.items.length,
+        storageCapacity: capacity,
+        storageFreeSlots: capacity == null ? null : Math.max(0, capacity - snapshot.storage.items.length),
+        unassignedCount: snapshot.unassigned.items.length,
+        duplicateGroupCount: this.getDuplicateGroups().length
+      });
+    }
+  };
+
+  // src/packs/pack-policy.js
+  var PACK_OPEN_MODES = Object.freeze({
+    CURRENT_REWARD: "OPEN_CURRENT_REWARD",
+    MATCHING_PACKS: "OPEN_MATCHING_PACKS",
+    ALL_ALLOWED_PACKS: "OPEN_ALL_ALLOWED_PACKS"
+  });
+  var VALID_MODES = new Set(Object.values(PACK_OPEN_MODES));
+  var PackPolicyError = class extends Error {
+    constructor(code, message, details = {}) {
+      super(message);
+      this.name = "PackPolicyError";
+      this.code = code;
+      this.details = details;
+    }
+  };
+  function stringSet(values, field) {
+    if (values == null) return [];
+    if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !value.trim())) {
+      throw new PackPolicyError("INVALID_PACK_POLICY", `${field} must be an array of non-empty strings`);
+    }
+    return [...new Set(values.map((value) => value.trim()))];
+  }
+  function normalizePackPolicy(input = {}) {
+    if (input == null || typeof input !== "object" || Array.isArray(input)) {
+      throw new PackPolicyError("INVALID_PACK_POLICY", "Pack policy must be an object");
+    }
+    for (const forbidden of ["allowPurchases", "allowStorePacks", "spendCoins", "spendPoints", "useFcPoints"]) {
+      if (input[forbidden] === true) {
+        throw new PackPolicyError(
+          "PURCHASE_FORBIDDEN",
+          "GrindPilot never buys packs or spends coins or FC Points",
+          { field: forbidden }
+        );
+      }
+    }
+    const mode = input.mode ?? PACK_OPEN_MODES.CURRENT_REWARD;
+    if (!VALID_MODES.has(mode)) {
+      throw new PackPolicyError("INVALID_PACK_MODE", `Unsupported pack mode: ${String(mode)}`);
+    }
+    const maxPacks = input.maxPacks ?? (mode === PACK_OPEN_MODES.CURRENT_REWARD ? 1 : 25);
+    if (!Number.isSafeInteger(maxPacks) || maxPacks < 1 || maxPacks > 100) {
+      throw new PackPolicyError("INVALID_PACK_POLICY", "maxPacks must be an integer from 1 to 100");
+    }
+    return Object.freeze({
+      mode,
+      maxPacks,
+      allowedPackIds: stringSet(input.allowedPackIds, "allowedPackIds"),
+      allowedPackTypes: stringSet(input.allowedPackTypes, "allowedPackTypes"),
+      excludedPackIds: stringSet(input.excludedPackIds, "excludedPackIds")
+    });
+  }
+  function packId(pack) {
+    return String(pack?.packId ?? pack?.id ?? "");
+  }
+  function packType(pack) {
+    return String(pack?.packType ?? pack?.type ?? "");
+  }
+  function numericCost(pack, keys) {
+    for (const key of keys) {
+      const value = pack?.[key] ?? pack?.cost?.[key];
+      if (value != null && Number(value) > 0) return Number(value);
+    }
+    return 0;
+  }
+  function assertOwnedFreePack(pack) {
+    const id = packId(pack);
+    if (!id) throw new PackPolicyError("INVALID_PACK", "Pack has no stable identifier");
+    const coinCost = numericCost(pack, ["coins", "coinCost", "coinsCost"]);
+    const pointsCost = numericCost(pack, ["points", "pointCost", "fcPoints", "fcPointsCost"]);
+    const requiresPurchase = pack.purchaseRequired === true || pack.owned === false;
+    const storeOnly = pack.source === "store" && pack.owned !== true && pack.isReward !== true;
+    if (coinCost > 0 || pointsCost > 0 || requiresPurchase || storeOnly) {
+      throw new PackPolicyError("PURCHASE_FORBIDDEN", "Pack is not proven to be owned and free to open", {
+        packId: id,
+        coinCost,
+        pointsCost
+      });
+    }
+    if (pack.owned !== true && pack.isReward !== true && pack.source !== "reward") {
+      throw new PackPolicyError("OWNERSHIP_UNVERIFIED", "Pack ownership could not be verified", { packId: id });
+    }
+    return true;
+  }
+  function getUnassignedCount(inventoryState = {}) {
+    let unresolved;
+    if (Array.isArray(inventoryState.unassigned)) {
+      unresolved = inventoryState.unassigned.length;
+    } else if (Object.hasOwn(inventoryState, "unassignedCount")) {
+      unresolved = Number(inventoryState.unassignedCount);
+    } else if (Object.hasOwn(inventoryState, "unresolvedUnassigned")) {
+      unresolved = Number(inventoryState.unresolvedUnassigned);
+    } else {
+      throw new PackPolicyError("INVENTORY_STATE_UNVERIFIED", "Unassigned state is missing");
+    }
+    if (!Number.isFinite(unresolved) || unresolved < 0) {
+      throw new PackPolicyError("INVALID_INVENTORY_STATE", "Unassigned count is invalid");
+    }
+    return unresolved;
+  }
+  function assertNoUnassigned(inventoryState = {}) {
+    const unresolved = getUnassignedCount(inventoryState);
+    if (unresolved > 0) {
+      throw new PackPolicyError("UNASSIGNED_BLOCKING", "Resolve unassigned items before opening another pack", {
+        unresolved
+      });
+    }
+    return true;
+  }
+  function matchesFilters(pack, policy) {
+    const id = packId(pack);
+    const type = packType(pack);
+    if (policy.excludedPackIds.includes(id)) return false;
+    if (policy.allowedPackIds.length && !policy.allowedPackIds.includes(id)) return false;
+    if (policy.allowedPackTypes.length && !policy.allowedPackTypes.includes(type)) return false;
+    return true;
+  }
+  function selectPacksForPolicy({ packs = [], policy: rawPolicy = {}, currentReward = null } = {}) {
+    if (!Array.isArray(packs)) throw new PackPolicyError("INVALID_PACKS", "packs must be an array");
+    const policy = normalizePackPolicy(rawPolicy);
+    const safe = packs.filter((pack) => {
+      try {
+        assertOwnedFreePack(pack);
+        return matchesFilters(pack, policy);
+      } catch {
+        return false;
+      }
+    });
+    let selected3;
+    if (policy.mode === PACK_OPEN_MODES.CURRENT_REWARD) {
+      const expectedId = String(currentReward?.packId ?? currentReward?.identifiedPackId ?? "");
+      if (!expectedId) {
+        throw new PackPolicyError("REWARD_PACK_UNIDENTIFIED", "The current reward has no verified pack identifier");
+      }
+      selected3 = safe.filter((pack) => packId(pack) === expectedId);
+      if (selected3.length !== 1) {
+        throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "The current reward pack was not uniquely identified", {
+          expectedId,
+          matches: selected3.length
+        });
+      }
+    } else if (policy.mode === PACK_OPEN_MODES.MATCHING_PACKS) {
+      const rewardType = String(currentReward?.packType ?? currentReward?.type ?? "");
+      if (!rewardType) {
+        throw new PackPolicyError("REWARD_PACK_UNIDENTIFIED", "A pack type is required for matching-pack mode");
+      }
+      selected3 = safe.filter((pack) => packType(pack) === rewardType);
+    } else {
+      selected3 = safe;
+    }
+    return selected3.slice(0, policy.maxPacks);
+  }
+
+  // src/packs/pack-service.js
+  var idOf = (pack) => String(pack?.packId ?? pack?.id ?? "");
+  var PackService = class {
+    constructor({ adapter, inventoryService, logger = null } = {}) {
+      if (!adapter?.listOwnedPacks || !adapter?.openOwnedPack) {
+        throw new TypeError("PackService requires listOwnedPacks and openOwnedPack adapter methods");
+      }
+      if (!inventoryService?.getState || !inventoryService?.refresh) {
+        throw new TypeError("PackService requires getState and refresh inventory methods");
+      }
+      this.adapter = adapter;
+      this.inventoryService = inventoryService;
+      this.logger = logger;
+    }
+    async plan({ policy, currentReward } = {}) {
+      assertNoUnassigned(await this.inventoryService.getState());
+      const packs = await this.adapter.listOwnedPacks();
+      const normalizedPolicy = normalizePackPolicy(policy);
+      const selected3 = selectPacksForPolicy({ packs, policy: normalizedPolicy, currentReward });
+      return { policy: normalizedPolicy, packs: selected3.map((pack) => ({ ...pack })) };
+    }
+    async open({ policy, currentReward } = {}) {
+      const plan = await this.plan({ policy, currentReward });
+      return this.openPlan(plan);
+    }
+    async openPlan(plan = {}) {
+      if (!Array.isArray(plan?.packs)) {
+        throw new PackPolicyError("INVALID_PACK_PLAN", "A verified owned-pack plan is required");
+      }
+      const opened = [];
+      for (const pack of plan.packs) {
+        assertNoUnassigned(await this.inventoryService.getState());
+        assertOwnedFreePack(pack);
+        const packId2 = idOf(pack);
+        this.logger?.info?.("pack.open.intent", { packId: packId2 });
+        const response = await this.adapter.openOwnedPack({ packId: packId2 });
+        if (response?.opened !== true || !Array.isArray(response.items)) {
+          throw new PackPolicyError("PACK_OPEN_UNVERIFIED", "Pack opening response was not verifiable", { packId: packId2 });
+        }
+        const inventory = await this.inventoryService.refresh();
+        opened.push({ packId: packId2, itemCount: response.items.length, response });
+        this.logger?.info?.("pack.opened", { packId: packId2, itemCount: response.items.length });
+        let unresolved;
+        try {
+          unresolved = getUnassignedCount(inventory);
+        } catch (error) {
+          return { status: "blocked", reason: error.code ?? "INVENTORY_STATE_UNVERIFIED", opened, inventory };
+        }
+        if (unresolved > 0) {
+          return { status: "blocked", reason: "UNASSIGNED_BLOCKING", opened, inventory };
+        }
+      }
+      return { status: "completed", opened };
+    }
+  };
+
+  // src/packs/reward-service.js
+  var idOf2 = (pack) => String(pack?.packId ?? pack?.id ?? "");
+  var countPacksById = (packs) => {
+    const counts = /* @__PURE__ */ new Map();
+    const packsById = /* @__PURE__ */ new Map();
+    for (const pack of packs) {
+      const id = idOf2(pack);
+      const count = Number(pack?.count ?? 1);
+      if (!id || !Number.isSafeInteger(count) || count < 0) {
+        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot contains an invalid ID or count");
+      }
+      const nextCount = (counts.get(id) ?? 0) + count;
+      if (!Number.isSafeInteger(nextCount)) {
+        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot count exceeds the safe range");
+      }
+      counts.set(id, nextCount);
+      const matches = packsById.get(id) ?? [];
+      matches.push(pack);
+      packsById.set(id, matches);
+    }
+    return { counts, packsById };
+  };
+  function identifyClaimedRewardPack({ claim, packsBefore = [], packsAfter = [] } = {}) {
+    if (!Array.isArray(packsBefore) || !Array.isArray(packsAfter)) {
+      throw new PackPolicyError("INVALID_PACKS", "Pack snapshots must be arrays");
+    }
+    const before = countPacksById(packsBefore);
+    const after = countPacksById(packsAfter);
+    const positiveDeltaIds = Array.from(after.counts.entries()).filter(([id, count]) => count - (before.counts.get(id) ?? 0) > 0).map(([id]) => id);
+    const explicitId = String(claim?.packId ?? claim?.rewardPackId ?? "");
+    if (positiveDeltaIds.length !== 1 || explicitId && positiveDeltaIds[0] !== explicitId) {
+      throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Could not uniquely identify the newly claimed pack", {
+        explicitId: explicitId || null,
+        positiveDeltaIds
+      });
+    }
+    const correlatedId = positiveDeltaIds[0];
+    const matches = after.packsById.get(correlatedId) ?? [];
+    if (!matches.length) {
+      throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Correlated reward pack was not present");
+    }
+    for (const pack of matches) assertOwnedFreePack(pack);
+    return matches[0];
+  }
+  var RewardService = class {
+    constructor({ adapter, logger = null } = {}) {
+      if (!adapter?.listOwnedPacks || !adapter?.claimReward) {
+        throw new TypeError("RewardService requires listOwnedPacks and claimReward adapter methods");
+      }
+      this.adapter = adapter;
+      this.logger = logger;
+    }
+    async claimAndIdentify(rewardRef, packsBefore = null) {
+      const before = Array.isArray(packsBefore) ? packsBefore.map((pack2) => ({ ...pack2 })) : await this.adapter.listOwnedPacks();
+      const claim = await this.adapter.claimReward(rewardRef, before);
+      if (claim?.claimed !== true && claim?.success !== true) {
+        throw new PackPolicyError("REWARD_CLAIM_UNVERIFIED", "Reward claim was not verified", { rewardRef });
+      }
+      const after = await this.adapter.listOwnedPacks();
+      const pack = identifyClaimedRewardPack({ claim, packsBefore: before, packsAfter: after });
+      this.logger?.info?.("reward.claimed", { rewardRef, packId: idOf2(pack) });
+      return { claim, pack, identifiedPackId: idOf2(pack), packType: pack.packType ?? pack.type ?? null };
+    }
+  };
+
+  // src/picks/pick-policy.js
+  var PLAYER_PICK_POLICIES = Object.freeze({
+    PAUSE_FOR_USER: "PAUSE_FOR_USER",
+    HIGHEST_RATING: "HIGHEST_RATING",
+    HIGHEST_VALUE: "HIGHEST_VALUE",
+    PREFER_NON_DUPLICATE: "PREFER_NON_DUPLICATE",
+    PREFER_REQUIRED_SPECIAL: "PREFER_REQUIRED_SPECIAL",
+    CUSTOM_PRIORITY: "CUSTOM_PRIORITY"
+  });
+  var VALID_POLICIES = new Set(Object.values(PLAYER_PICK_POLICIES));
+  var VALID_CRITERIA = /* @__PURE__ */ new Set([
+    "REQUIRED_SPECIAL",
+    "NON_DUPLICATE",
+    "PREFERRED_PLAYER",
+    "PREFERRED_RESOURCE",
+    "PREFERRED_CARD_TYPE",
+    "RATING",
+    "VALUE"
+  ]);
+  var PlayerPickPolicyError = class extends Error {
+    constructor(code, message, details = {}) {
+      super(message);
+      this.name = "PlayerPickPolicyError";
+      this.code = code;
+      this.details = details;
+    }
+  };
+  function strings(value, field) {
+    if (value == null) return [];
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", `${field} must be an array of non-empty strings`);
+    }
+    return [...new Set(value.map((entry) => entry.trim()))];
+  }
+  function normalizePlayerPickPolicy(input = {}) {
+    if (input == null || typeof input !== "object" || Array.isArray(input)) {
+      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", "Player-pick policy must be an object");
+    }
+    const type = input.type ?? PLAYER_PICK_POLICIES.PAUSE_FOR_USER;
+    if (!VALID_POLICIES.has(type)) {
+      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", `Unsupported player-pick policy: ${String(type)}`);
+    }
+    const criteria = input.criteria ?? [];
+    if (!Array.isArray(criteria) || criteria.some((criterion) => !VALID_CRITERIA.has(criterion))) {
+      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", "CUSTOM_PRIORITY contains an unsupported criterion");
+    }
+    if (type === PLAYER_PICK_POLICIES.CUSTOM_PRIORITY && criteria.length === 0) {
+      throw new PlayerPickPolicyError("INVALID_PICK_POLICY", "CUSTOM_PRIORITY requires at least one typed criterion");
+    }
+    return Object.freeze({
+      type,
+      criteria: [...criteria],
+      preferredPlayerIds: strings(input.preferredPlayerIds, "preferredPlayerIds"),
+      preferredResourceIds: strings(input.preferredResourceIds, "preferredResourceIds"),
+      preferredCardTypes: strings(input.preferredCardTypes, "preferredCardTypes"),
+      requiredSpecialTypes: strings(input.requiredSpecialTypes, "requiredSpecialTypes")
+    });
+  }
+  function normalizeOffer(offer, index) {
+    if (offer == null || typeof offer !== "object" || Array.isArray(offer)) {
+      throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", `Offer ${index} is invalid`);
+    }
+    const itemId = String(offer.itemId ?? offer.id ?? "");
+    if (!itemId) throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", `Offer ${index} has no item ID`);
+    const rating = Number(offer.rating);
+    const value = offer.estimatedValue == null && offer.value == null ? null : Number(offer.estimatedValue ?? offer.value);
+    return {
+      ...offer,
+      itemId,
+      resourceId: String(offer.resourceId ?? ""),
+      basePlayerId: String(offer.basePlayerId ?? offer.assetId ?? ""),
+      name: offer.name == null ? null : String(offer.name),
+      cardType: String(offer.cardType ?? ""),
+      rarityName: String(offer.rarityName ?? offer.rarity ?? ""),
+      specialGroups: Array.isArray(offer.specialGroups) ? offer.specialGroups.map(String) : [],
+      isSpecial: offer.isSpecial === true,
+      rating: Number.isFinite(rating) ? rating : null,
+      estimatedValue: Number.isFinite(value) && value >= 0 ? value : null,
+      isDuplicate: offer.isDuplicate === true
+    };
+  }
+  function paused(reason, offers, extra = {}) {
+    return { status: "paused", reason, selectedItemId: null, offers, ...extra };
+  }
+  function uniqueBest(offers, score, reason) {
+    const scored = offers.map((offer) => ({ offer, score: score(offer) }));
+    if (scored.some((entry) => entry.score == null || Number.isNaN(entry.score))) {
+      return paused("INSUFFICIENT_PICK_DATA", offers, { criterion: reason });
+    }
+    const best = Math.max(...scored.map((entry) => entry.score));
+    const winners = scored.filter((entry) => entry.score === best).map((entry) => entry.offer);
+    if (winners.length !== 1) return paused("AMBIGUOUS_PICK", offers, { criterion: reason, candidates: winners.map((o) => o.itemId) });
+    return selected(winners[0], offers, reason);
+  }
+  function selected(offer, offers, reason) {
+    return {
+      status: "selected",
+      reason,
+      selectedItemId: offer.itemId,
+      selected: offer,
+      offers
+    };
+  }
+  function isRequiredSpecial(offer, policy, context) {
+    const required = new Set([
+      ...policy.requiredSpecialTypes,
+      ...Array.isArray(context?.requiredSpecialTypes) ? context.requiredSpecialTypes.map(String) : []
+    ].map((value) => String(value).trim().toLowerCase()).filter(Boolean));
+    return [offer.cardType, offer.rarityName, ...offer.specialGroups || []].map((value) => String(value).trim().toLowerCase()).some((value) => required.has(value));
+  }
+  function criterionScore(criterion, offer, policy, context) {
+    switch (criterion) {
+      case "REQUIRED_SPECIAL":
+        return isRequiredSpecial(offer, policy, context) ? 1 : 0;
+      case "NON_DUPLICATE":
+        return offer.isDuplicate ? 0 : 1;
+      case "PREFERRED_PLAYER":
+        return policy.preferredPlayerIds.includes(offer.basePlayerId) ? 1 : 0;
+      case "PREFERRED_RESOURCE":
+        return policy.preferredResourceIds.includes(offer.resourceId) ? 1 : 0;
+      case "PREFERRED_CARD_TYPE":
+        return policy.preferredCardTypes.includes(offer.cardType) ? 1 : 0;
+      case "RATING":
+        return offer.rating;
+      case "VALUE":
+        return offer.estimatedValue;
+      default:
+        return null;
+    }
+  }
+  function compareTuples2(left, right) {
+    for (let i = 0; i < left.length; i += 1) {
+      if (left[i] !== right[i]) return left[i] > right[i] ? 1 : -1;
+    }
+    return 0;
+  }
+  function decidePlayerPick(rawOffers, rawPolicy = {}, context = {}) {
+    if (!Array.isArray(rawOffers) || rawOffers.length === 0) {
+      throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", "At least one player-pick offer is required");
+    }
+    const existingResourceIds = new Set(
+      (context?.existingResourceIds || []).map(String)
+    );
+    const duplicateResourceIds = new Set(
+      (context?.duplicateResourceIds || []).map(String)
+    );
+    const duplicateItemIds = new Set((context?.duplicateItemIds || []).map(String));
+    const offers = rawOffers.map(normalizeOffer).map((offer) => ({
+      ...offer,
+      isDuplicate: offer.isDuplicate || duplicateItemIds.has(offer.itemId) || offer.resourceId && (existingResourceIds.has(offer.resourceId) || duplicateResourceIds.has(offer.resourceId))
+    }));
+    if (new Set(offers.map((offer) => offer.itemId)).size !== offers.length) {
+      throw new PlayerPickPolicyError("INVALID_PICK_OFFERS", "Player-pick item IDs must be unique");
+    }
+    const policy = normalizePlayerPickPolicy(rawPolicy);
+    switch (policy.type) {
+      case PLAYER_PICK_POLICIES.PAUSE_FOR_USER:
+        return paused("USER_SELECTION_REQUIRED", offers);
+      case PLAYER_PICK_POLICIES.HIGHEST_RATING:
+        return uniqueBest(offers, (offer) => offer.rating, "HIGHEST_RATING");
+      case PLAYER_PICK_POLICIES.HIGHEST_VALUE:
+        return uniqueBest(offers, (offer) => offer.estimatedValue, "HIGHEST_VALUE");
+      case PLAYER_PICK_POLICIES.PREFER_NON_DUPLICATE: {
+        const candidates = offers.filter((offer) => !offer.isDuplicate);
+        if (candidates.length === 1) return selected(candidates[0], offers, "PREFER_NON_DUPLICATE");
+        return paused(candidates.length ? "AMBIGUOUS_PICK" : "NO_NON_DUPLICATE_OPTION", offers, {
+          candidates: candidates.map((offer) => offer.itemId)
+        });
+      }
+      case PLAYER_PICK_POLICIES.PREFER_REQUIRED_SPECIAL: {
+        const candidates = offers.filter((offer) => isRequiredSpecial(offer, policy, context));
+        if (candidates.length === 1) return selected(candidates[0], offers, "PREFER_REQUIRED_SPECIAL");
+        return paused(candidates.length ? "AMBIGUOUS_PICK" : "NO_REQUIRED_SPECIAL_OPTION", offers, {
+          candidates: candidates.map((offer) => offer.itemId)
+        });
+      }
+      case PLAYER_PICK_POLICIES.CUSTOM_PRIORITY: {
+        const ranked = offers.map((offer) => ({
+          offer,
+          tuple: policy.criteria.map((criterion) => criterionScore(criterion, offer, policy, context))
+        }));
+        if (ranked.some((entry) => entry.tuple.some((value) => value == null || Number.isNaN(value)))) {
+          return paused("INSUFFICIENT_PICK_DATA", offers);
+        }
+        ranked.sort((a, b) => compareTuples2(b.tuple, a.tuple));
+        if (ranked.length > 1 && compareTuples2(ranked[0].tuple, ranked[1].tuple) === 0) {
+          return paused("AMBIGUOUS_PICK", offers, { candidates: ranked.filter((entry) => compareTuples2(entry.tuple, ranked[0].tuple) === 0).map((entry) => entry.offer.itemId) });
+        }
+        return selected(ranked[0].offer, offers, "CUSTOM_PRIORITY");
+      }
+      default:
+        return paused("USER_SELECTION_REQUIRED", offers);
+    }
+  }
+
+  // src/picks/player-pick-service.js
+  var pickIdentity = (pick) => String(pick?.pickIdentity ?? pick?.pickId ?? pick?.id ?? "");
+  var offerIdentity = (pick) => {
+    if (pick?.offerIdentity) return String(pick.offerIdentity);
+    if (!Array.isArray(pick?.offers)) return "";
+    return pick.offers.map((offer) => `${String(offer?.itemId ?? offer?.id ?? "")}:${String(offer?.resourceId ?? "")}`).sort().join("|");
+  };
+  var PlayerPickService = class {
+    constructor({ adapter, logger = null } = {}) {
+      if (!adapter?.getPlayerPick || !adapter?.selectPlayerPick) {
+        throw new TypeError("PlayerPickService requires getPlayerPick and selectPlayerPick adapter methods");
+      }
+      this.adapter = adapter;
+      this.logger = logger;
+    }
+    async handle({ pickId, policy, context = {}, execute = false, approved = false, expectedIntent = null } = {}) {
+      const pick = await this.adapter.getPlayerPick(pickId);
+      if (pick?.resolved === true && pick?.pending !== true) {
+        return { status: "completed", reason: "PICK_ALREADY_RESOLVED", selectedItemId: null };
+      }
+      if (!pick || pick?.availability === "unavailable" || !Array.isArray(pick.offers) || !pick.offers.length) {
+        return { status: "paused", reason: "PICK_STATE_UNVERIFIED", selectedItemId: null };
+      }
+      const observedPickIdentity = pickIdentity(pick);
+      const observedOfferIdentity = offerIdentity(pick);
+      if (!observedPickIdentity || !observedOfferIdentity) {
+        return { status: "paused", reason: "PICK_IDENTITY_UNVERIFIED", selectedItemId: null };
+      }
+      if (pickId != null && String(pickId) !== observedPickIdentity) {
+        return { status: "paused", reason: "PICK_IDENTITY_CHANGED", selectedItemId: null };
+      }
+      const decision = decidePlayerPick(pick.offers, policy, context);
+      const intent = decision.selectedItemId ? {
+        pickIdentity: observedPickIdentity,
+        offerIdentity: observedOfferIdentity,
+        selectedItemId: decision.selectedItemId,
+        selectedResourceId: decision.selected?.resourceId || null
+      } : null;
+      if (expectedIntent && (String(expectedIntent.pickIdentity ?? "") !== String(intent?.pickIdentity ?? "") || String(expectedIntent.offerIdentity ?? "") !== String(intent?.offerIdentity ?? "") || String(expectedIntent.selectedItemId ?? "") !== String(intent?.selectedItemId ?? ""))) {
+        return { ...decision, intent, status: "paused", reason: "PICK_INTENT_STALE" };
+      }
+      this.logger?.info?.("player-pick.decision", {
+        pickId,
+        status: decision.status,
+        reason: decision.reason,
+        intendedItemId: decision.selectedItemId
+      });
+      if (decision.status !== "selected" || !execute) return { ...decision, intent };
+      if (!approved) return { ...decision, intent, status: "paused", reason: "DESTRUCTIVE_APPROVAL_REQUIRED" };
+      const current = await this.adapter.getPlayerPick(observedPickIdentity);
+      if (pickIdentity(current) !== observedPickIdentity || offerIdentity(current) !== observedOfferIdentity || !current?.offers?.some((offer) => String(offer?.itemId ?? offer?.id ?? "") === decision.selectedItemId)) {
+        return { ...decision, intent, status: "paused", reason: "PICK_INTENT_STALE" };
+      }
+      const response = await this.adapter.selectPlayerPick({
+        pickId: observedPickIdentity,
+        pickIdentity: observedPickIdentity,
+        offerIdentity: observedOfferIdentity,
+        itemId: decision.selectedItemId,
+        resourceId: decision.selected?.resourceId || null
+      });
+      const responseItemId = String(response?.selectedItemId ?? response?.itemId ?? "");
+      if (response?.success !== true || responseItemId !== decision.selectedItemId) {
+        return { ...decision, intent, status: "paused", reason: "PICK_SELECTION_UNVERIFIED", response };
+      }
+      this.logger?.info?.("player-pick.selected", { pickId, itemId: decision.selectedItemId });
+      return { ...decision, intent, status: "completed", response };
+    }
+    async recover(intent, context = {}) {
+      if (!intent?.pickIdentity || !intent?.selectedItemId) {
+        return { status: "ambiguous", reason: "PICK_INTENT_MISSING" };
+      }
+      if (typeof this.adapter.reconcilePlayerPick === "function") {
+        return this.adapter.reconcilePlayerPick(intent, context);
+      }
+      const current = await this.adapter.getPlayerPick(intent.pickIdentity);
+      if (current?.pending === true && pickIdentity(current) === String(intent.pickIdentity)) {
+        if (offerIdentity(current) === String(intent.offerIdentity)) {
+          return { status: "not_applied", reason: "PICK_STILL_PENDING" };
+        }
+        return { status: "ambiguous", reason: "PICK_OFFERS_CHANGED" };
+      }
+      const items = Array.isArray(context?.inventoryItems) ? context.inventoryItems : [];
+      const beforeItemIds = new Set(
+        (intent.inventoryItemIdsBefore ?? []).map(String)
+      );
+      const selectedObserved = items.some((item) => {
+        const id = String(item?.itemId ?? item?.id ?? "");
+        return id === String(intent.selectedItemId) && !beforeItemIds.has(id);
+      });
+      const resourceCountAfter = intent.selectedResourceId ? items.filter(
+        (item) => String(item?.resourceId ?? "") === String(intent.selectedResourceId)
+      ).length : 0;
+      const resourceDeltaObserved = intent.selectedResourceId && Number.isSafeInteger(intent.selectedResourceCountBefore) && resourceCountAfter > intent.selectedResourceCountBefore;
+      if (selectedObserved || resourceDeltaObserved) {
+        return { status: "completed", result: { selectedItemId: intent.selectedItemId } };
+      }
+      return { status: "ambiguous", reason: "PICK_CONSUMPTION_UNVERIFIED" };
+    }
+  };
+
   // src/profiles/profile-repository.js
   var DEFAULT_STORAGE_KEY = "grindpilot.profiles.v1";
   function clone2(value) {
@@ -3513,7 +6052,7 @@
   };
 
   // src/workflow/serialization.js
-  var isPlainObject = (value) => {
+  var isPlainObject2 = (value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
@@ -3560,7 +6099,7 @@
       if (Array.isArray(entry)) {
         entry.forEach((child, index) => visit(child, `${path}[${index}]`));
       } else {
-        if (!isPlainObject(entry)) {
+        if (!isPlainObject2(entry)) {
           throw new WorkflowError(`${label} contains a non-plain object`, {
             code: "WORKFLOW_NOT_SERIALIZABLE",
             details: { path }
@@ -3577,14 +6116,14 @@
   };
   var stableValue = (value) => {
     if (Array.isArray(value)) return value.map(stableValue);
-    if (isPlainObject(value)) {
+    if (isPlainObject2(value)) {
       const next = {};
       for (const key of Object.keys(value).sort()) next[key] = stableValue(value[key]);
       return next;
     }
     return value;
   };
-  var stableStringify = (value) => JSON.stringify(stableValue(value));
+  var stableStringify2 = (value) => JSON.stringify(stableValue(value));
   var fnv1aHash = (text) => {
     let hash = 2166136261;
     const source = String(text ?? "");
@@ -3651,7 +6190,7 @@
       issues.push({ path, code: "CONDITION_TOO_DEEP", message: "Condition is too deeply nested." });
       return;
     }
-    if (!isPlainObject(operand)) {
+    if (!isPlainObject2(operand)) {
       issues.push({ path, code: "OPERAND_INVALID", message: "Operand must be a typed object." });
       return;
     }
@@ -3684,7 +6223,7 @@
       issues.push({ path, code: "CONDITION_TOO_DEEP", message: "Condition is too deeply nested." });
       return;
     }
-    if (!isPlainObject(condition)) {
+    if (!isPlainObject2(condition)) {
       issues.push({ path, code: "CONDITION_INVALID", message: "Condition must be a typed object." });
       return;
     }
@@ -3739,7 +6278,7 @@
     if (type === OperandType.COUNT) {
       const value = resolveOperand(operand.value, context);
       if (Array.isArray(value) || typeof value === "string") return value.length;
-      if (isPlainObject(value)) return Object.keys(value).length;
+      if (isPlainObject2(value)) return Object.keys(value).length;
       return 0;
     }
     if (type === OperandType.COUNT_IN_RANGE) {
@@ -3827,7 +6366,7 @@
       this.details = details;
     }
   };
-  function isPlainObject2(value) {
+  function isPlainObject3(value) {
     if (value == null || typeof value !== "object" || Array.isArray(value)) return false;
     const prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
@@ -3847,7 +6386,7 @@
     if (Array.isArray(value)) {
       result = value.map((entry, index) => cloneData(entry, `${path}[${index}]`, seen));
     } else {
-      if (!isPlainObject2(value)) throw new ProfileValidationError("INVALID_PROFILE_DATA", `${path} must be a plain object`);
+      if (!isPlainObject3(value)) throw new ProfileValidationError("INVALID_PROFILE_DATA", `${path} must be a plain object`);
       result = {};
       for (const [key, entry] of Object.entries(value)) {
         if (BLOCKED_KEYS.has(key)) throw new ProfileValidationError("INVALID_PROFILE_DATA", `${path} contains a blocked key`);
@@ -3864,25 +6403,25 @@
     return value;
   }
   function validateWorkflow(workflow) {
-    if (!isPlainObject2(workflow) || !Array.isArray(workflow.steps) || workflow.steps.length === 0) {
+    if (!isPlainObject3(workflow) || !Array.isArray(workflow.steps) || workflow.steps.length === 0) {
       throw new ProfileValidationError("INVALID_PROFILE", "workflow.steps must be a non-empty array");
     }
     const ids = /* @__PURE__ */ new Set();
     for (const [index, step2] of workflow.steps.entries()) {
-      if (!isPlainObject2(step2)) throw new ProfileValidationError("INVALID_PROFILE", `workflow step ${index} must be an object`);
+      if (!isPlainObject3(step2)) throw new ProfileValidationError("INVALID_PROFILE", `workflow step ${index} must be an object`);
       validIdentifier(step2.id, `workflow.steps[${index}].id`);
       if (ids.has(step2.id)) throw new ProfileValidationError("INVALID_PROFILE", `Duplicate workflow step ID: ${step2.id}`);
       ids.add(step2.id);
       if (typeof step2.type !== "string" || !step2.type.trim()) {
         throw new ProfileValidationError("INVALID_PROFILE", `workflow.steps[${index}].type is required`);
       }
-      if (step2.config != null && !isPlainObject2(step2.config)) {
+      if (step2.config != null && !isPlainObject3(step2.config)) {
         throw new ProfileValidationError("INVALID_PROFILE", `workflow.steps[${index}].config must be an object`);
       }
     }
   }
   function validateRunLimits(runLimits) {
-    if (!isPlainObject2(runLimits) || !Number.isSafeInteger(runLimits.maxIterations) || runLimits.maxIterations < 1 || runLimits.maxIterations > 1e4) {
+    if (!isPlainObject3(runLimits) || !Number.isSafeInteger(runLimits.maxIterations) || runLimits.maxIterations < 1 || runLimits.maxIterations > 1e4) {
       throw new ProfileValidationError("INVALID_PROFILE", "runLimits.maxIterations must be an integer from 1 to 10000");
     }
     for (const field of ["maxSbcSubmissions", "maxPacksOpened", "maxDurationMinutes"]) {
@@ -3896,7 +6435,7 @@
       throw new ProfileValidationError("INVALID_PROFILE", "stopConditions must be an array");
     }
     for (const [index, condition] of stopConditions.entries()) {
-      if (!isPlainObject2(condition) || typeof condition.type !== "string" || !condition.type.trim()) {
+      if (!isPlainObject3(condition) || typeof condition.type !== "string" || !condition.type.trim()) {
         throw new ProfileValidationError("INVALID_PROFILE", `stopConditions[${index}] must have a typed condition`);
       }
       if (Object.hasOwn(condition, "expression") || Object.hasOwn(condition, "script")) {
@@ -3921,7 +6460,7 @@
     }
   }
   function normalizeProfile(input) {
-    if (!isPlainObject2(input)) throw new ProfileValidationError("INVALID_PROFILE", "Profile must be an object");
+    if (!isPlainObject3(input)) throw new ProfileValidationError("INVALID_PROFILE", "Profile must be an object");
     for (const field of REQUIRED_CONFIG_FIELDS) {
       if (!Object.hasOwn(input, field)) throw new ProfileValidationError("INCOMPLETE_PROFILE", `Missing profile field: ${field}`);
     }
@@ -3937,7 +6476,7 @@
     profile.name = profile.name.trim();
     validateWorkflow(profile.workflow);
     for (const field of ["solverSettings", "fodderPolicy", "duplicatePolicy"]) {
-      if (!isPlainObject2(profile[field])) throw new ProfileValidationError("INVALID_PROFILE", `${field} must be an object`);
+      if (!isPlainObject3(profile[field])) throw new ProfileValidationError("INVALID_PROFILE", `${field} must be an object`);
     }
     profile.packPolicy = { ...normalizePackPolicy(profile.packPolicy) };
     profile.pickPolicy = { ...normalizePlayerPickPolicy(profile.pickPolicy) };
@@ -3998,20 +6537,605 @@
       } catch {
         throw new ProfileValidationError("INVALID_PROFILE_IMPORT", "Profile import is not valid JSON");
       }
-      if (!isPlainObject2(envelope) || envelope.format !== "grindpilot-profile" || envelope.schemaVersion !== PROFILE_SCHEMA_VERSION) {
+      if (!isPlainObject3(envelope) || envelope.format !== "grindpilot-profile" || envelope.schemaVersion !== PROFILE_SCHEMA_VERSION) {
         throw new ProfileValidationError("INVALID_PROFILE_IMPORT", "Profile import envelope is invalid or unsupported");
       }
       return this.save(envelope.profile, { overwrite });
     }
   };
 
+  // src/presentation/product-shell-view-model.js
+  var ACTIVE_RUN_STATUSES = /* @__PURE__ */ new Set([
+    "running",
+    "waiting",
+    "paused",
+    "stopping",
+    "recovery_required"
+  ]);
+  var STEP_LABELS = Object.freeze({
+    SOLVE_SBC: "Build squad",
+    SUBMIT_SBC: "Submit squad",
+    CLAIM_REWARD: "Claim reward",
+    OPEN_REWARD_PACK: "Open reward",
+    HANDLE_PLAYER_PICK: "Choose player",
+    RESOLVE_ITEMS: "Route items",
+    ORGANIZE_ITEMS: "Recycle remaining items"
+  });
+  var connectionFor = (state) => {
+    if (state.bridgeHealth === "healthy") return "connected";
+    if (state.bridgeHealth === "unavailable") return "unavailable";
+    return "connecting";
+  };
+  var compatibilityFor = (gameContext) => {
+    if (gameContext.gameVersion === GameVersion.FC27) {
+      const contextVerified = gameContext.state === "verified";
+      return {
+        gameVersion: GameVersion.FC27,
+        versionState: "observed",
+        contextState: gameContext.state,
+        planningState: "observe_only",
+        gameLabel: "FC 27",
+        title: "FC 27 detected",
+        message: contextVerified ? "This screen is verified, but FC 27 planning is not available in this build. FUT Magic won’t run a plan." : "The game version is observed. FC 27 planning rules are not verified in this build, so FUT Magic won’t run a plan."
+      };
+    }
+    if (gameContext.gameVersion === GameVersion.UNKNOWN) {
+      return {
+        gameVersion: GameVersion.UNKNOWN,
+        versionState: "unknown",
+        contextState: gameContext.state,
+        planningState: "unavailable",
+        gameLabel: "Unknown",
+        title: "Game version not confirmed",
+        message: "FUT Magic can’t verify which game version is open, so planning stays off."
+      };
+    }
+    return null;
+  };
+  var blockerMessage = (blocker = {}) => {
+    if (blocker.message) return String(blocker.message);
+    const messages = {
+      CAPABILITY_UNAVAILABLE: "A required EA capability is not verified right now.",
+      GAME_CONTEXT_UNVERIFIED: "Open a verifiable SBC challenge in EA and try again.",
+      OPEN_PROJECT_REQUIRED: "Open this project's SBC set in EA and try again.",
+      CURRENT_CHALLENGE_NOT_IN_PROJECT: "The open challenge is not part of this project.",
+      CHALLENGE_COMPLETED: "The open challenge is already complete.",
+      UNKNOWN_REQUIREMENTS: "This challenge contains requirements FUT Magic cannot verify safely.",
+      NO_VERIFIED_SOLUTION: "No submit-ready protected squad was found.",
+      SOLUTION_ITEMS_UNOBSERVED: "The solver referenced cards outside the current Club snapshot.",
+      PROTECTED_ITEM_SELECTED: "The proposed squad included a protected card.",
+      ROUTING_CAPABILITY_EVIDENCE_MISSING: "EA did not expose enough move evidence for every proposed card.",
+      ROUTE_ITEM_UNOBSERVED: "A proposed card is no longer in the current Unassigned snapshot.",
+      ROUTE_COVERAGE_MISMATCH: "The route does not account for every Unassigned item exactly once.",
+      NO_SAFE_ROUTE: "No current Unassigned item has a verified safe destination.",
+      ROUTE_TOO_LARGE: "The current Unassigned route is too large for one bounded approval.",
+      REVIEW_INPUT_TOO_LARGE: "This Club snapshot is too large for one bounded protection review."
+    };
+    return messages[String(blocker.code)] || "The preview is blocked safely.";
+  };
+  var PROTECTION_REASON_LABELS = Object.freeze({
+    "locked-item": "EA-locked cards",
+    "protected-item-flag": "EA-protected cards",
+    "protected-item": "Specific cards",
+    "protected-player": "Specific players",
+    "protected-resource": "Specific card versions",
+    "protected-rating": "Rating threshold",
+    "target-project-rating": "Project rating rules",
+    "protected-card-type": "Protected card types",
+    "special-type-not-allowed": "Special-card rules",
+    "starting-squad": "Active squad",
+    favorite: "Favourites",
+    tradable: "Tradable cards"
+  });
+  var publicCardExample = (card = {}) => ({
+    name: card.name == null ? "Unnamed card" : String(card.name),
+    rating: Math.max(0, Number(card.rating || 0)),
+    location: String(card.location || "club")
+  });
+  var protectionPlanViewModel = (plan, state = {}) => {
+    const empty = {
+      status: "idle",
+      observedAt: null,
+      verificationMessage: "Review current protection to see its effect.",
+      uniqueHardProtectedCount: null,
+      analyzedItemCount: null,
+      reasonGroups: [],
+      ratingReserves: [],
+      specialReserves: [],
+      projectSignals: [],
+      preferences: [],
+      evidenceWarnings: [],
+      advancedActive: false
+    };
+    if (!plan) return empty;
+    const preview = plan.preview || {};
+    const conservation = preview.softConservation || {};
+    const verificationState = String(preview.verificationState || "unverified").toLowerCase();
+    const blocked2 = plan.state !== "ready";
+    const warnings = [
+      ...preview.evidenceWarnings || preview.warnings || [],
+      ...(plan.blockers || []).map(blockerMessage)
+    ].map(String);
+    const preferenceInput = preview.preferences || conservation.preferences;
+    const preferences = Array.isArray(preferenceInput) ? preferenceInput.map((entry, index) => ({
+      id: String(entry.id || `preference-${index + 1}`),
+      label: String(entry.label || "Local squad preference"),
+      enabled: entry.enabled !== false
+    })) : [
+      { id: "duplicates", label: "Duplicates", enabled: preferenceInput?.preferDuplicates !== false },
+      { id: "sbc-storage", label: "Cards from SBC Storage", enabled: preferenceInput?.preferSbcStorage !== false },
+      { id: "untradeables", label: "Untradeable cards", enabled: preferenceInput?.preferUntradeables !== false }
+    ];
+    const draft = state.draft || {};
+    const advancedActive = Boolean(
+      (draft.protectedItemIds || []).length || (draft.protectedPlayerIds || []).length || (draft.protectedResourceIds || []).length || (draft.protectedRatings || []).length || (draft.protectedCardTypes || []).length || Array.isArray(draft.allowedSpecialTypes) || Object.keys(draft.minimumReserveByRating || {}).length || Object.keys(draft.specialReserveByCardType || {}).length || draft.protectTradables === true
+    );
+    return {
+      status: blocked2 ? "blocked" : verificationState === "verified" ? "ready" : "unverified",
+      observedAt: Number.isFinite(Number(preview.observedAt)) ? Number(preview.observedAt) : Number.isFinite(Date.parse(String(preview.observedAt || ""))) ? Date.parse(String(preview.observedAt)) : Number(plan.createdAt || 0) || null,
+      verificationMessage: blocked2 ? "Current impact is unavailable. Your configured rules still apply to future previews." : verificationState === "verified" ? "Based on the latest verified Club snapshot." : Number(preview.uniqueHardProtectedCount || 0) > 0 ? "At least the shown exclusions are verified, but EA did not expose every flag needed to prove the full count." : "EA did not expose every flag needed to verify current exclusions.",
+      uniqueHardProtectedCount: preview.uniqueHardProtectedCount == null ? null : Math.max(0, Number(preview.uniqueHardProtectedCount)),
+      analyzedItemCount: preview.analyzedItemCount == null ? null : Math.max(0, Number(preview.analyzedItemCount)),
+      reasonGroups: (preview.reasonGroups || []).map((group, index) => ({
+        code: `reason-${index + 1}`,
+        label: PROTECTION_REASON_LABELS[String(group.code)] || "Additional protection rule",
+        count: Math.max(0, Number(group.itemCount ?? group.count ?? 0)),
+        examples: (group.examples || []).slice(0, 5).map(publicCardExample)
+      })),
+      ratingReserves: (preview.ratingReserves || conservation.ratingReserves || []).map((entry) => ({
+        rating: Math.max(0, Number(entry.rating || 0)),
+        minimum: Math.max(0, Number(entry.minimum ?? entry.reserved ?? entry.count ?? 0)),
+        observedCount: entry.observedCount == null ? null : Math.max(0, Number(entry.observedCount))
+      })),
+      specialReserves: (preview.specialReserves || conservation.specialReserves || []).map((entry) => ({
+        cardType: String(entry.cardType || "special card"),
+        minimum: Math.max(0, Number(entry.minimum ?? entry.reserved ?? entry.count ?? 0)),
+        observedCount: entry.observedCount == null ? null : Math.max(0, Number(entry.observedCount))
+      })),
+      projectSignals: (preview.projectSignals || []).map((entry) => ({
+        name: String(entry.name || "Active project"),
+        hardExclusions: (entry.hardExclusions || []).map(String),
+        conservationPreferences: (entry.conservationPreferences || []).map(String),
+        unknownRequirementCount: Math.max(0, Number(entry.unknownRequirementCount || 0))
+      })),
+      preferences: preferences.slice(0, 3),
+      evidenceWarnings: warnings,
+      advancedActive: Boolean(preview.advancedActive || advancedActive)
+    };
+  };
+  var duplicateRoutePlanViewModel = (plan, notice) => {
+    if (!plan) return notice == null ? null : {
+      id: null,
+      state: "blocked",
+      status: "expired",
+      totalCount: 0,
+      safeCount: 0,
+      toClubCount: 0,
+      toStorageCount: 0,
+      attentionCount: 0,
+      cards: [],
+      explanations: [],
+      blockers: [],
+      canApprove: false,
+      approvalLabel: "Preview again",
+      notice: String(notice)
+    };
+    const preview = plan.preview || {};
+    const safeCount = Math.max(0, Number(preview.safeCount || 0));
+    return {
+      id: String(plan.id),
+      state: String(plan.state || "blocked"),
+      status: String(preview.status || plan.state || "blocked"),
+      createdAt: Number(plan.createdAt || 0),
+      totalCount: Math.max(0, Number(preview.totalCount || 0)),
+      safeCount,
+      toClubCount: Math.max(0, Number(preview.toClubCount || 0)),
+      toStorageCount: Math.max(0, Number(preview.toStorageCount || 0)),
+      attentionCount: Math.max(0, Number(preview.attentionCount || 0)),
+      cards: (preview.cards || []).slice(0, 100).map((card) => ({
+        name: card.name == null ? null : String(card.name),
+        rating: Number(card.rating || 0),
+        isSpecial: Boolean(card.isSpecial),
+        isTradable: Boolean(card.isTradable),
+        action: String(card.action || "PAUSE"),
+        destination: String(card.destination || "unassigned"),
+        reason: String(card.reason || "Kept for your decision")
+      })),
+      explanations: (plan.explanation || []).slice(0, 4).map(String),
+      blockers: (plan.blockers || []).map((blocker) => ({
+        code: String(blocker.code || "BLOCKED"),
+        message: blockerMessage(blocker)
+      })),
+      canApprove: plan.state === "ready" && preview.status === "ready" && preview.safetyBoundary === "SAFE_ITEM_MOVES_ONLY" && (preview.cards || []).length === Number(preview.totalCount || 0) && Number(preview.totalCount || 0) <= 100 && safeCount > 0,
+      approvalLabel: `Move ${safeCount} safe item${safeCount === 1 ? "" : "s"}`,
+      notice: notice == null ? null : String(notice)
+    };
+  };
+  var ROUTER_REASON_COPY = Object.freeze({
+    UNASSIGNED_CLEAR: "There is nothing to route right now.",
+    EXACT_DUPLICATE_STORAGE_MOVE_VERIFIED: "This exact duplicate has a verified SBC Storage destination.",
+    UNIQUE_CLUB_MOVE_VERIFIED: "EA verified that this card can return to Club.",
+    TRADABLE_DUPLICATE_STORAGE_UNAVAILABLE: "SBC Storage has no verified space. This tradable duplicate stays Unassigned for your decision.",
+    UNTRADEABLE_DUPLICATE_NO_SAFE_DESTINATION: "This untradeable duplicate has no verified Club or SBC Storage destination.",
+    DUPLICATE_IDENTITY_UNVERIFIED: "The exact card version could not be verified, so no destination was inferred.",
+    CLUB_MOVE_EVIDENCE_UNVERIFIED: "EA did not expose the per-card evidence needed to verify a Club move.",
+    STORAGE_MOVE_EVIDENCE_UNVERIFIED: "EA did not expose the per-card evidence needed to verify an SBC Storage move.",
+    TRADABILITY_EVIDENCE_UNVERIFIED: "EA did not expose enough tradability evidence for a safe routing choice.",
+    STORAGE_CAPACITY_UNVERIFIED: "Current SBC Storage capacity could not be verified.",
+    ITEM_EXPLICITLY_NOT_MOVABLE: "EA reports that this card cannot move right now.",
+    ROUTE_EVIDENCE_MISSING: "The current Unassigned route could not be observed completely.",
+    ROUTE_EVIDENCE_CONFLICT: "Current Unassigned evidence does not describe one coherent route.",
+    INVENTORY_SNAPSHOT_INVALID: "The current Club snapshot is incomplete or inconsistent.",
+    INPUT_LIMIT_EXCEEDED: "The current inventory exceeds this bounded local Router review.",
+    GAME_CONTEXT_UNVERIFIED: "The current EA game context is not verified for FC 26 routing.",
+    READ_CAPABILITY_UNAVAILABLE: "Current Club and Unassigned reads are unavailable.",
+    MOVE_CAPABILITY_UNAVAILABLE: "EA item-move capability is not currently verified.",
+    ACTIVITY_GUARD_NOT_IDLE: "Finish, stop, or recover the active run before routing items.",
+    ACTIVITY_GUARD_UNVERIFIED: "Activity Guard could not verify that routing is currently idle."
+  });
+  var routerRecommendationViewModel = (recommendation, notice) => {
+    if (!recommendation) return notice == null ? null : {
+      status: "expired",
+      kind: "pause",
+      title: "Recommendation out of date",
+      reason: String(notice),
+      evidence: "Nothing moved. Refresh the Router recommendation from current evidence.",
+      observedAt: 0,
+      card: null,
+      destination: null,
+      readOnly: true
+    };
+    const outcome2 = recommendation.outcome || {};
+    const internalKind = String(outcome2.kind || "PAUSE");
+    const kind = {
+      KEEP: "keep",
+      MOVE_TO_CLUB: "move_to_club",
+      MOVE_TO_SBC_STORAGE: "move_to_sbc_storage",
+      RESERVE: "reserve",
+      PAUSE: "pause",
+      ASK_USER: "ask_user"
+    }[internalKind] || "pause";
+    const status = {
+      READY: "ready",
+      ATTENTION: "attention",
+      CLEAR: "clear",
+      BLOCKED: "blocked"
+    }[String(recommendation.state || "BLOCKED")] || "blocked";
+    const display = outcome2.display || null;
+    const cardName = display?.name ? String(display.name) : "this card";
+    const title = kind === "move_to_club" ? `Move ${cardName} to Club` : kind === "move_to_sbc_storage" ? `Move ${cardName} to SBC Storage` : kind === "ask_user" ? "Choose what to do in EA" : kind === "reserve" ? `Reserve ${cardName}` : status === "clear" ? "Unassigned is clear" : "Routing paused";
+    const reasonCode = String(outcome2.reasonCode || "ROUTE_EVIDENCE_CONFLICT");
+    const evidence = status === "ready" ? "Checked the complete bounded Unassigned snapshot, exact card-version identity, destination evidence, EA capabilities, and Activity Guard." : status === "clear" ? "Checked the complete bounded Unassigned snapshot." : "The Router stopped at the first unverified or attention-required boundary.";
+    return {
+      status,
+      kind,
+      title,
+      reason: ROUTER_REASON_COPY[reasonCode] || ROUTER_REASON_COPY.ROUTE_EVIDENCE_CONFLICT,
+      evidence,
+      observedAt: Number(recommendation.observedAt || 0),
+      card: display ? {
+        name: display.name == null ? null : String(display.name),
+        rating: Math.max(0, Number(display.rating || 0)),
+        isSpecial: Boolean(display.isSpecial),
+        isTradable: display.isTradable == null ? null : display.isTradable === true
+      } : null,
+      destination: outcome2.destination == null ? null : String(outcome2.destination),
+      readOnly: true
+    };
+  };
+  var projectPlanViewModel = (plan, notice) => {
+    if (!plan) return null;
+    const preview = plan.preview || {};
+    return {
+      id: String(plan.id),
+      state: String(plan.state || "blocked"),
+      status: String(preview.status || plan.state || "blocked"),
+      createdAt: Number(plan.createdAt || 0),
+      challengeName: preview.challengeName == null ? null : String(preview.challengeName),
+      targetRating: preview.targetRating == null ? null : Number(preview.targetRating),
+      selectedCount: Math.max(0, Number(preview.selectedCount || 0)),
+      cards: (preview.cards || []).slice(0, 11).map((card) => ({
+        name: card.name == null ? null : String(card.name),
+        rating: Number(card.rating || 0),
+        location: String(card.location || "club"),
+        isSpecial: Boolean(card.isSpecial),
+        isDuplicate: Boolean(card.isDuplicate),
+        isTradable: Boolean(card.isTradable)
+      })),
+      ratingRange: preview.ratingRange ? { min: Number(preview.ratingRange.min), max: Number(preview.ratingRange.max) } : null,
+      specialCount: Math.max(0, Number(preview.specialCount || 0)),
+      duplicateCount: Math.max(0, Number(preview.duplicateCount || 0)),
+      storageCount: Math.max(0, Number(preview.storageCount || 0)),
+      protectedCount: Math.max(0, Number(preview.protectedCount || 0)),
+      selectedProtectedCount: preview.selectedProtectedCount == null ? null : Math.max(0, Number(preview.selectedProtectedCount)),
+      explanations: (plan.explanation || []).slice(0, 6).map(String),
+      blockers: (plan.blockers || []).map((blocker) => ({
+        code: String(blocker.code || "BLOCKED"),
+        message: blockerMessage(blocker)
+      })),
+      canApprove: plan.state === "ready" && preview.status === "ready" && preview.selectedProtectedCount != null && Number(preview.selectedProtectedCount) === 0,
+      approvalLabel: "Build & submit squad",
+      notice: notice == null ? null : String(notice)
+    };
+  };
+  var projectViewModel = (project, storedProject, observedAt, plan, planNotice) => {
+    const total = Number(project.totalSquads || 0) || null;
+    const completed2 = Math.max(0, Number(project.completedSquads || 0));
+    const fallbackProgress = Number(storedProject?.completionProgress);
+    const progress = total ? Math.min(1, completed2 / total) : Number.isFinite(fallbackProgress) ? Math.min(1, Math.max(0, fallbackProgress)) : null;
+    const protectionSummary = [];
+    if (project.protectedRatings?.atOrAbove) {
+      protectionSummary.push(`${project.protectedRatings.atOrAbove}+ cards excluded`);
+    }
+    const exactRatings = project.protectedRatings?.exact || storedProject?.protectedRatings?.exact || [];
+    if (exactRatings.length) protectionSummary.push(`Exact ratings ${exactRatings.join(", ")} excluded`);
+    const ratingReserves = Object.entries(
+      project.protectedRatings?.reserveByRating || storedProject?.protectedRatings?.reserveByRating || {}
+    );
+    if (ratingReserves.length) {
+      protectionSummary.push(`Try to keep ${ratingReserves.map(([rating, count]) => `${count} × ${rating}`).join(" · ")}`);
+    }
+    if ((project.remainingSpecials || []).length) {
+      protectionSummary.push(`Try to keep ${(project.remainingSpecials || []).map((entry) => `${entry.remaining} × ${String(entry.cardType || "special").toUpperCase()}`).join(" · ")}`);
+    }
+    if (!protectionSummary.length) protectionSummary.push("No additional project protection or reserves");
+    return {
+      id: String(project.id),
+      name: String(project.name || "Untitled project"),
+      state: progress === 1 ? "complete" : "active",
+      completedSquads: completed2,
+      totalSquads: total,
+      progress,
+      requiredSquadsRemaining: Math.max(0, Number(project.requiredSquadsRemaining || 0)),
+      remainingRatings: (project.remainingRatings || []).map((entry) => ({
+        rating: Number(entry.rating),
+        needed: Math.max(0, Number(entry.remaining || 0)),
+        exactRatingInClub: Math.max(0, Number(entry.clubCount || 0))
+      })),
+      remainingSpecials: (project.remainingSpecials || []).map((entry) => ({
+        type: String(entry.cardType || "special"),
+        needed: Math.max(0, Number(entry.remaining || 0))
+      })),
+      protectionSummary: protectionSummary.slice(0, 4),
+      source: project.sourceSetId ? "ea_import" : "manual",
+      unknownRequirementCount: (storedProject?.sourceChallenges || []).reduce(
+        (sum, challenge) => sum + (challenge.unknownRequirements?.length || 0),
+        0
+      ),
+      preview: projectPlanViewModel(plan, planNotice),
+      planNotice: planNotice == null ? null : String(planNotice),
+      observedAt
+    };
+  };
+  var buildRun = (state) => {
+    if (!ACTIVE_RUN_STATUSES.has(String(state.runStatus || "idle"))) return null;
+    const timeline = Array.isArray(state.timeline) ? state.timeline : [];
+    const currentIndex = timeline.findIndex((entry) => entry.active);
+    const current = currentIndex >= 0 ? timeline[currentIndex] : null;
+    const next = currentIndex >= 0 ? timeline.slice(currentIndex + 1).find((entry) => entry.status === "pending") : timeline.find((entry) => entry.status === "pending");
+    const status = String(state.runStatus);
+    const intervention = state.pauseReason || state.error ? {
+      title: status === "recovery_required" ? "Needs review" : "Run paused",
+      message: String(state.pauseReason || state.error)
+    } : null;
+    const guard = status === "recovery_required" ? { state: "recovery", label: "Recovery", reason: intervention?.message || null } : status === "paused" ? { state: "caution", label: "Caution", reason: intervention?.message || null } : { state: "normal", label: "Normal", reason: null };
+    return {
+      title: String(state.runName || "FUT Magic run"),
+      modeLabel: String(state.runModeLabel || "Approved plan"),
+      status,
+      progress: {
+        current: Math.max(0, Number(state.iterations || 0)),
+        total: Math.max(0, Number(state.maxIterations || 0)) || null,
+        label: "cycles"
+      },
+      currentStep: current ? { label: STEP_LABELS[current.type] || String(current.type), status: current.status } : null,
+      nextStep: next ? { label: STEP_LABELS[next.type] || String(next.type) } : null,
+      timeline: timeline.map((entry) => ({
+        label: STEP_LABELS[entry.type] || String(entry.type),
+        status: String(entry.status || "pending"),
+        active: Boolean(entry.active)
+      })),
+      guard,
+      intervention,
+      canPause: status === "running" || status === "waiting",
+      canResume: status === "paused",
+      canStop: !["stopped", "completed", "failed"].includes(status)
+    };
+  };
+  var buildClubHealth = (state, observedAt) => {
+    const inventory = state.inventory || {};
+    const buckets = state.inventoryBuckets || {};
+    const ratingBand = (labels) => labels.reduce((sum, label) => {
+      const entry = buckets[label] || {};
+      return {
+        club: sum.club + Number(entry.club || 0),
+        storage: sum.storage + Number(entry.storage || 0)
+      };
+    }, { club: 0, storage: 0 });
+    return {
+      observedAt,
+      available: Boolean(state.inventoryAvailable),
+      clubCount: state.inventoryAvailable ? Number(inventory.clubCount || 0) : null,
+      unassignedCount: state.inventoryAvailable ? Number(inventory.unassignedCount || 0) : null,
+      duplicateGroupCount: state.inventoryAvailable ? Number(inventory.duplicateGroupCount || 0) : null,
+      storage: {
+        used: state.inventoryAvailable ? Number(inventory.storageCount || 0) : null,
+        capacity: state.inventoryAvailable ? Number(inventory.storageCapacity || 0) || null : null,
+        free: state.inventoryAvailable && inventory.storageFreeSlots != null ? Number(inventory.storageFreeSlots) : null
+      },
+      ratingBands: [
+        { label: "90+ cards", ...ratingBand(["90", "91", "92", "93", "94+"]) },
+        { label: "87–89 cards", ...ratingBand(["87", "88", "89"]) },
+        { label: "85–86 cards", ...ratingBand(["85", "86"]) }
+      ],
+      protectedCount: state.fodderReviewPlan?.preview?.uniqueHardProtectedCount == null ? null : Number(state.fodderReviewPlan.preview.uniqueHardProtectedCount)
+    };
+  };
+  var goalActions = (state, activeProject, compatibility) => {
+    const unassignedCount = Number(state.inventory?.unassignedCount || 0);
+    const actions = [
+      {
+        id: "complete-sbc",
+        label: "Complete an SBC",
+        description: state.currentContext?.challengeName ? `Continue ${state.currentContext.challengeName}` : "Open an SBC in EA to continue",
+        enabled: Boolean(state.currentContext?.challengeId),
+        command: activeProject ? { type: "PREVIEW_SBC_PROJECT", projectId: activeProject.id } : { type: "OPEN_LEGACY_UI", section: "SBC Solver" },
+        plan: "free"
+      },
+      {
+        id: "grind-upgrades",
+        label: "Grind upgrades",
+        description: "Build a bounded local recipe",
+        enabled: true,
+        command: { type: "OPEN_LEGACY_UI", section: "Workflows" },
+        plan: "free"
+      },
+      {
+        id: "clear-duplicates",
+        label: "Clear duplicates",
+        description: unassignedCount > 0 ? `${unassignedCount} items need attention` : "Review the safe routing flow",
+        enabled: Boolean(state.inventoryAvailable),
+        disabledReason: "Current Unassigned data is unavailable",
+        command: state.inventoryAvailable ? { type: "PREVIEW_CLEAR_DUPLICATES" } : null,
+        plan: "free"
+      },
+      {
+        id: "protect-cards",
+        label: "Protect my cards",
+        description: state.fodderReviewPlan?.preview?.uniqueHardProtectedCount == null ? "Review exclusions and local squad preferences" : `${Number(state.fodderReviewPlan.preview.uniqueHardProtectedCount)} verified exclusions in the latest snapshot`,
+        enabled: true,
+        command: { type: "PREVIEW_FODDER_REVIEW" },
+        plan: "free"
+      },
+      {
+        id: "plan-evolution",
+        label: "Plan an Evolution",
+        description: "Live Evolution data is not available in this build",
+        enabled: false,
+        disabledReason: "Live Evolution data is not available in this build",
+        command: null,
+        plan: "pro"
+      },
+      {
+        id: "optimize-club",
+        label: "Optimize my club",
+        description: "Club-wide planning is coming later",
+        enabled: false,
+        disabledReason: "Club optimization is not implemented yet",
+        command: null,
+        plan: "pro"
+      }
+    ];
+    if (!compatibility) return actions;
+    const disabledReason = compatibility.gameVersion === GameVersion.FC27 ? "FC 27 planning is not verified in this build" : "Confirm the game version before planning";
+    const compatibilityGated = /* @__PURE__ */ new Set([
+      "complete-sbc",
+      "grind-upgrades",
+      "clear-duplicates",
+      "protect-cards"
+    ]);
+    return actions.map((action) => compatibilityGated.has(action.id) ? { ...action, enabled: false, disabledReason, command: null } : action);
+  };
+  var buildProductShellViewModel = (state = {}, { now = Date.now() } = {}) => {
+    const storedProjects = new Map(
+      (state.projects || []).map((project) => [String(project.id), project])
+    );
+    const projects = (state.targetDashboard || []).map((project) => projectViewModel(
+      project,
+      storedProjects.get(String(project.id)),
+      now,
+      state.sbcPlanPreviews?.[String(project.id)],
+      state.sbcPlanNotices?.[String(project.id)]
+    ));
+    const activeProject = projects.find((project) => project.state === "active") || null;
+    const run = buildRun(state);
+    const unassignedCount = Number(state.inventory?.unassignedCount || 0);
+    const runtimeContext = state.gameContext || {};
+    const gameContext = createGameContext({
+      gameVersion: runtimeContext.gameVersion ?? state.gameVersion ?? GameVersion.UNKNOWN,
+      state: runtimeContext.state ?? state.gameContextState ?? (state.bridgeHealth === "healthy" && state.currentContext?.challengeId ? "verified" : "unverified"),
+      challengeKind: runtimeContext.challengeKind,
+      gameVersionObservation: runtimeContext.gameVersionObservation,
+      gameVersionSource: runtimeContext.gameVersionSource,
+      route: runtimeContext.route ?? state.currentContext?.route,
+      setId: runtimeContext.setId ?? state.currentContext?.setId,
+      setName: runtimeContext.setName ?? state.currentContext?.setName,
+      challengeId: runtimeContext.challengeId ?? state.currentContext?.challengeId,
+      challengeName: runtimeContext.challengeName ?? state.currentContext?.challengeName,
+      observedAt: Number(runtimeContext.observedAt ?? state.contextObservedAt ?? now),
+      evidence: runtimeContext.evidence ?? null
+    });
+    const compatibility = compatibilityFor(gameContext);
+    let notice = null;
+    if (run?.intervention) {
+      notice = { tone: "warning", ...run.intervention };
+    } else if (unassignedCount > 0) {
+      notice = {
+        tone: "warning",
+        title: `${unassignedCount} items need attention`,
+        message: "Unassigned items block the next pack until they are routed safely."
+      };
+    } else if (state.error) {
+      notice = { tone: "error", title: "FUT Magic is limited", message: String(state.error) };
+    }
+    return {
+      protocolVersion: 1,
+      revision: Math.max(0, Number(state.productRevision || 0)),
+      observedAt: now,
+      brand: { name: "FUT Magic", paidName: "FUT Magic Pro", plan: "free" },
+      connection: {
+        state: connectionFor(state),
+        label: state.bridgeHealth === "healthy" ? "EA connected" : state.bridgeHealth === "unavailable" ? "Limited" : "Connecting"
+      },
+      context: gameContext,
+      compatibility,
+      notice,
+      run,
+      projects,
+      activeProject,
+      clubHealth: buildClubHealth(state, now),
+      duplicateRoute: duplicateRoutePlanViewModel(
+        state.duplicateRoutePlan,
+        state.duplicateRouteNotice
+      ),
+      routerRecommendation: routerRecommendationViewModel(
+        state.routerRecommendation,
+        state.routerRecommendationNotice
+      ),
+      protection: protectionPlanViewModel(state.fodderReviewPlan, state),
+      actions: goalActions(state, activeProject, compatibility),
+      legacyAvailable: true,
+      legal: {
+        disclaimer: "Unofficial. Not affiliated with or endorsed by Electronic Arts.",
+        license: "GPL-3.0-only",
+        sourceUrl: "https://github.com/Matchekk/Matchek-s-FUT-Magic",
+        licenseUrl: "../LICENSE",
+        privacyUrl: "../PRIVACY.md",
+        noticesUrl: "../THIRD_PARTY_NOTICES.md",
+        warranty: "No warranty. Redistribution and modification are permitted under GPLv3."
+      }
+    };
+  };
+
   // src/ui/grind-panel.js
   var css = `
-:host{all:initial;color-scheme:dark;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+:host{all:initial;--fm-bg-primary:#0b1020;--fm-bg-secondary:#121a2e;--fm-bg-elevated:#1e2b4d;--fm-text-primary:#e6edf5;--fm-text-secondary:#a7b2c9;--fm-text-muted:#7f8ba3;--fm-accent-primary:#00e6ff;--fm-accent-secondary:#26ffc2;--fm-focus:#7af4ff;--fm-destructive:#ff7f8f;--fm-border-subtle:#2a3858;color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 *{box-sizing:border-box}.launcher{position:fixed;right:18px;top:45%;z-index:2147483600;width:46px;height:46px;border:0;border-radius:15px;background:linear-gradient(145deg,#75bfff,#1e70d2);color:#fff;font-weight:900;box-shadow:0 10px 32px #0008;cursor:pointer}
 .panel{position:fixed;z-index:2147483599;right:18px;top:72px;width:min(960px,calc(100vw - 36px));height:min(760px,calc(100vh - 100px));display:grid;grid-template-columns:170px 1fr;background:#10140ff2;backdrop-filter:blur(18px) saturate(140%);border:1px solid #4f6043;border-radius:18px;box-shadow:0 24px 80px #000c;overflow:hidden;color:#edf5e7}.hidden{display:none!important}
 aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overflow:auto}.brand{padding:4px 8px 15px;font-size:17px;font-weight:800;color:#75bfff}.brand small{display:block;color:#85917e;font-size:10px;font-weight:600;margin-top:3px}.nav{display:block;width:100%;border:0;background:transparent;color:#b7c2b1;text-align:left;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:12px}.nav:hover,.nav.active{background:#263747;color:#fff}.main{padding:18px;overflow:auto}.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.top h2{font-size:18px;margin:0}.close{border:0;background:#2d3529;color:#dce6d6;width:31px;height:31px;border-radius:9px;cursor:pointer}.view{display:none}.view.active{display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.card{background:#1a2118;border:1px solid #36432f;border-radius:12px;padding:12px;margin-bottom:10px}.metric{font-size:24px;font-weight:800;color:#75bfff}.label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#8f9b89}.controls{display:flex;gap:8px;flex-wrap:wrap;margin:13px 0}button.action{border:1px solid #53684a;background:#263420;color:#edf5e7;padding:8px 12px;border-radius:9px;cursor:pointer}button.primary{background:#2f8ee5;color:#fff;border-color:#63b0f5;font-weight:800}button.danger{background:#3a211f;border-color:#79413b}button:disabled{opacity:.42;cursor:not-allowed}.form{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:11px}.field{display:flex;flex-direction:column;gap:5px}.field.full{grid-column:1/-1}label{font-size:11px;color:#9da996}input,select,textarea{width:100%;border:1px solid #46543f;background:#11160f;color:#f4f8f0;border-radius:8px;padding:8px;font:inherit;font-size:12px}textarea{min-height:90px;resize:vertical}.hint{font-size:11px;color:#87927f;line-height:1.45}.banner{border-radius:10px;padding:9px 11px;margin-bottom:12px;background:#263747;color:#d7e7f4;font-size:12px}.banner.warn{background:#3d321d;color:#ffe3a3}.banner.error{background:#45201e;color:#ffc0b8}.log{display:grid;grid-template-columns:72px 92px 1fr;gap:8px;border-bottom:1px solid #293226;padding:7px 2px;font-size:11px}.muted{color:#86907f}.section-title{margin:18px 0 8px;font-size:13px;color:#c9d7c1}.empty{padding:25px;text-align:center;color:#778270;border:1px dashed #3e4939;border-radius:10px}.workflow-step{border-left:3px solid #2f8ee5;background:#151d20;padding:10px;margin:9px 0;border-radius:8px}.nested{margin:8px 0 12px 20px;padding-left:10px;border-left:1px dashed #526474}.requirement-row input{max-width:150px}.timeline{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.timeline span{padding:6px 9px;border-radius:20px;background:#252d25;color:#899487;font-size:11px}.timeline .done{color:#bfffc4}.timeline .active{background:#244a6d;color:#fff}.bucket-table{width:100%;border-collapse:collapse;font-size:11px}.bucket-table th,.bucket-table td{padding:7px;border-bottom:1px solid #303a2c;text-align:right}.bucket-table th:first-child,.bucket-table td:first-child{text-align:left}.health{display:grid;grid-template-columns:minmax(130px,1fr) 110px 2fr;gap:8px;padding:7px;border-bottom:1px solid #303a2c;font-size:11px}@media(max-width:680px){.panel{grid-template-columns:1fr;top:12px;height:calc(100vh - 24px)}aside{display:flex;gap:3px;overflow:auto;border-right:0;border-bottom:1px solid #36432f;padding:8px}.brand{display:none}.nav{white-space:nowrap;width:auto}.form{grid-template-columns:1fr}.health{grid-template-columns:1fr}}
 .easy-hero{background:linear-gradient(145deg,#20394f,#182719);border:1px solid #4b7798;border-radius:16px;padding:18px;margin-bottom:14px}.easy-hero h3{font-size:22px;line-height:1.1;letter-spacing:-.02em;margin:0 0 7px}.easy-hero p{color:#b8c8b4;font-size:13px;line-height:1.5;margin:0}.easy-actions{display:grid;grid-template-columns:1fr;gap:10px;margin-top:16px}.easy-actions .action{min-height:48px;font-size:14px}.easy-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}.easy-step{background:#171e16;border:1px solid #344230;border-radius:11px;padding:11px}.easy-step b{display:block;color:#75bfff;margin-bottom:3px}.easy-step span{font-size:11px;color:#9ba897;line-height:1.35}.easy-status{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.easy-status span{padding:6px 9px;border-radius:999px;background:#253025;color:#b9c7b4;font-size:11px}button.action,.launcher,.close{transition:transform 100ms ease-out,filter 120ms ease-out}button.action:active,.launcher:active,.close:active{transform:scale(.97)}details{margin:12px 0}summary{cursor:pointer;color:#b8c8b4;font-size:12px}@media(max-width:680px){.easy-steps{grid-template-columns:1fr}}@media(prefers-reduced-motion:reduce){button.action,.launcher,.close{transition:none!important;transform:none!important}}@media(prefers-reduced-transparency:reduce){.panel{background:#10140f;backdrop-filter:none}}
+/* FUT Magic outer-shell migration. Inner legacy forms remain intentionally dense. */
+.launcher{width:48px;height:48px;border:1px solid #00e6ff55;border-radius:13px;background:var(--fm-bg-secondary);color:var(--fm-accent-primary);box-shadow:0 12px 32px #02050dcc}
+.panel{grid-template-columns:180px 1fr;background:#0b1020f5;border-color:#00e6ff38;border-radius:16px;box-shadow:0 28px 80px #02050de0;color:var(--fm-text-primary)}
+aside{background:var(--fm-bg-secondary);border-color:var(--fm-border-subtle)}.brand{color:var(--fm-accent-primary);font-weight:700;letter-spacing:-.015em}.brand small{color:var(--fm-text-muted);letter-spacing:.08em}.nav{min-height:44px;border-left:2px solid transparent;color:var(--fm-text-secondary);border-radius:8px}.nav:hover{background:#1e2b4d99;color:var(--fm-text-primary)}.nav.active{background:var(--fm-bg-elevated);border-left-color:var(--fm-accent-primary);color:var(--fm-text-primary)}
+.main{scroll-padding-block:16px}.top h2{font-size:20px;line-height:1.2;letter-spacing:-.02em}.close{width:44px;height:44px;border:1px solid var(--fm-border-subtle);background:var(--fm-bg-elevated);color:var(--fm-text-primary);font-size:20px}.card,.easy-step{background:var(--fm-bg-secondary);border-color:var(--fm-border-subtle)}.metric,.easy-step b{color:var(--fm-accent-primary);font-variant-numeric:tabular-nums}.label,.hint,.muted,.easy-step span{color:var(--fm-text-muted)}
+button.action{min-height:44px;border-color:var(--fm-border-subtle);background:var(--fm-bg-elevated);color:var(--fm-text-primary)}button.primary{background:var(--fm-accent-primary);border-color:var(--fm-accent-primary);color:#07111c}button.danger{background:#321a2a;border-color:#7c354b;color:#ffd8df}input,select,textarea{min-height:44px;border-color:var(--fm-border-subtle);background:var(--fm-bg-primary);color:var(--fm-text-primary)}label,summary{color:var(--fm-text-secondary)}.banner{background:var(--fm-bg-elevated);color:var(--fm-text-primary)}.workflow-step{border-left-color:var(--fm-accent-primary);background:var(--fm-bg-secondary)}.timeline span,.easy-status span{background:var(--fm-bg-secondary);color:var(--fm-text-secondary)}.timeline .done{color:var(--fm-accent-secondary)}.timeline .active{background:var(--fm-bg-elevated)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--fm-focus);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important}}
+@media(prefers-reduced-transparency:reduce){.panel{background:var(--fm-bg-primary);backdrop-filter:none}}
+@media(prefers-contrast:more){.panel,.card,input,select,textarea,button{border-color:#7183a8}.nav.active{outline:1px solid var(--fm-accent-primary)}}
+@media(forced-colors:active){.nav.active{border-left-color:Highlight}}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0 0 0 0)!important;white-space:nowrap!important;border:0!important}
 `;
   var sections = [
     "Easy Loop",
@@ -4039,6 +7163,17 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
   var selected2 = (actual, value) => actual === value ? " selected" : "";
   var checked = (value) => value ? " checked" : "";
   var splitList = (value) => String(value || "").split(",").map((entry) => entry.trim()).filter(Boolean);
+  var legacyFocusableSelector = "button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary,a[href]";
+  var associateLegacyLabels = (root) => {
+    let index = 0;
+    root.querySelectorAll(".field > label:not([for])").forEach((label) => {
+      if (label.querySelector("input,select,textarea")) return;
+      const control = [...label.parentElement.children].find((node) => node !== label && node.matches?.("input,select,textarea"));
+      if (!control) return;
+      if (!control.id) control.id = `fut-magic-legacy-field-${index += 1}`;
+      label.setAttribute("for", control.id);
+    });
+  };
   var workflowStepControls = (step2, path, index) => {
     const attrs = `data-wf-path="${encodePath(path)}" data-wf-index="${index}"`;
     const target = step2.config?.target || {};
@@ -4057,7 +7192,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     } else if (step2.type === "PAUSE") {
       config = `<div class="field"><label>Pause reason</label><input data-wf-field="pauseReason" ${attrs} value="${escapeHtml(step2.config?.reason || "")}"></div>`;
     }
-    return `<div class="workflow-step"><div class="controls"><select data-wf-field="type" ${attrs}>${["SOLVE_SBC", "SUBMIT_SBC", "CLAIM_REWARD", "OPEN_REWARD_PACK", "RESOLVE_ITEMS", "ORGANIZE_ITEMS", "HANDLE_PLAYER_PICK", "DELAY", "CONDITIONAL", "LOOP", "PAUSE"].map((value) => `<option${selected2(step2.type, value)}>${value}</option>`).join("")}</select><button class="action" data-wf-action="up" ${attrs}>↑</button><button class="action" data-wf-action="down" ${attrs}>↓</button><button class="action" data-wf-action="duplicate" ${attrs}>Duplicate</button><button class="action danger" data-wf-action="delete" ${attrs}>Delete</button></div><div class="hint">${escapeHtml(step2.id)}</div>${config}<div class="form"><div class="field"><label>Timeout ms</label><input type="number" min="100" data-wf-field="timeoutMs" ${attrs} value="${escapeHtml(step2.timeoutMs || 12e4)}"></div><div class="field"><label>Retry attempts</label><input type="number" min="1" max="10" data-wf-field="retryAttempts" ${attrs} value="${escapeHtml(step2.retryPolicy?.maxAttempts || 1)}"></div><div class="field"><label>On failure</label><select data-wf-field="onFailure" ${attrs}>${["PAUSE", "STOP", "SKIP"].map((value) => `<option${selected2(step2.onFailure, value)}>${value}</option>`).join("")}</select></div></div></div>`;
+    return `<div class="workflow-step"><div class="controls"><select aria-label="Step type" data-wf-field="type" ${attrs}>${["SOLVE_SBC", "SUBMIT_SBC", "CLAIM_REWARD", "OPEN_REWARD_PACK", "RESOLVE_ITEMS", "ORGANIZE_ITEMS", "HANDLE_PLAYER_PICK", "DELAY", "CONDITIONAL", "LOOP", "PAUSE"].map((value) => `<option${selected2(step2.type, value)}>${value}</option>`).join("")}</select><button class="action" aria-label="Move step up" data-wf-action="up" ${attrs}>↑</button><button class="action" aria-label="Move step down" data-wf-action="down" ${attrs}>↓</button><button class="action" data-wf-action="duplicate" ${attrs}>Duplicate step</button><button class="action danger" data-wf-action="delete" ${attrs}>Delete step</button></div><div class="hint">${escapeHtml(step2.id)}</div>${config}<div class="form"><div class="field"><label>Timeout ms</label><input type="number" min="100" data-wf-field="timeoutMs" ${attrs} value="${escapeHtml(step2.timeoutMs || 12e4)}"></div><div class="field"><label>Retry attempts</label><input type="number" min="1" max="10" data-wf-field="retryAttempts" ${attrs} value="${escapeHtml(step2.retryPolicy?.maxAttempts || 1)}"></div><div class="field"><label>On failure</label><select data-wf-field="onFailure" ${attrs}>${["PAUSE", "STOP", "SKIP"].map((value) => `<option${selected2(step2.onFailure, value)}>${value}</option>`).join("")}</select></div></div></div>`;
   };
   var renderWorkflowSteps = (steps = [], path = []) => {
     const rows = steps.map((step2, index) => {
@@ -4071,8 +7206,8 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     }).join("");
     return rows || '<div class="empty">No steps in this branch.</div>';
   };
-  var ratingRequirementRows = (requirements = []) => requirements.map((entry) => `<div class="controls requirement-row" data-rating-row><input aria-label="Rating" type="number" min="1" max="99" data-rating="rating" value="${escapeHtml(entry.rating)}"><input aria-label="Count" type="number" min="1" data-rating="count" value="${escapeHtml(entry.count)}"><input aria-label="Completed" type="number" min="0" data-rating="completed" value="${escapeHtml(entry.completed)}"><button class="action danger" data-remove-row>×</button></div>`).join("");
-  var specialRequirementRows = (requirements = []) => requirements.map((entry) => `<div class="controls requirement-row" data-special-row><input aria-label="Card type" data-special="cardType" value="${escapeHtml(entry.cardType)}"><input aria-label="Count" type="number" min="1" data-special="count" value="${escapeHtml(entry.count)}"><input aria-label="Completed" type="number" min="0" data-special="completed" value="${escapeHtml(entry.completed)}"><label><input type="checkbox" data-special="perRemainingSquad"${checked(entry.perRemainingSquad)}> per squad</label><button class="action danger" data-remove-row>×</button></div>`).join("");
+  var ratingRequirementRows = (requirements = []) => requirements.map((entry) => `<div class="controls requirement-row" data-rating-row><input aria-label="Rating" type="number" min="1" max="99" data-rating="rating" value="${escapeHtml(entry.rating)}"><input aria-label="Count" type="number" min="1" data-rating="count" value="${escapeHtml(entry.count)}"><input aria-label="Completed" type="number" min="0" data-rating="completed" value="${escapeHtml(entry.completed)}"><button class="action danger" aria-label="Remove rating requirement" data-remove-row>×</button></div>`).join("");
+  var specialRequirementRows = (requirements = []) => requirements.map((entry) => `<div class="controls requirement-row" data-special-row><input aria-label="Card type" data-special="cardType" value="${escapeHtml(entry.cardType)}"><input aria-label="Count" type="number" min="1" data-special="count" value="${escapeHtml(entry.count)}"><input aria-label="Completed" type="number" min="0" data-special="completed" value="${escapeHtml(entry.completed)}"><label><input type="checkbox" data-special="perRemainingSquad"${checked(entry.perRemainingSquad)}> per squad</label><button class="action danger" aria-label="Remove special-card requirement" data-remove-row>×</button></div>`).join("");
   var renderProjectEditor = (project = {}) => `<section class="card project-editor" data-project-id="${escapeHtml(project.id || "")}"><div class="form"><div class="field"><label>Name</label><input data-project-field="name" value="${escapeHtml(project.name || "")}" placeholder="Target SBC"></div><div class="field"><label><input type="checkbox" data-project-field="active"${checked(project.active !== false)}> Active</label></div><div class="field"><label>Priority</label><input type="number" min="0" data-project-field="priority" value="${escapeHtml(project.priority ?? 50)}"></div><div class="field"><label>Squads remaining</label><input type="number" min="0" data-project-field="requiredSquadsRemaining" value="${escapeHtml(project.requiredSquadsRemaining ?? 0)}"></div><div class="field"><label>Hard protect at/above</label><input type="number" min="1" max="99" data-project-field="atOrAbove" value="${escapeHtml(project.protectedRatings?.atOrAbove ?? "")}"></div><div class="field"><label>Hard exact ratings (comma-separated)</label><input data-project-field="exact" value="${escapeHtml((project.protectedRatings?.exact || []).join(", "))}"></div><div class="field"><label>Soft rating reserves (e.g. 89:3, 90:2)</label><input data-project-field="reserveByRating" value="${escapeHtml(Object.entries(project.protectedRatings?.reserveByRating || {}).map(([rating, count]) => `${rating}:${count}`).join(", "))}"></div><div class="field"><label>Protected player IDs</label><input data-project-field="protectedPlayerIds" value="${escapeHtml((project.protectedPlayerIds || []).join(", "))}"></div><div class="field"><label>Protected resource IDs</label><input data-project-field="protectedResourceIds" value="${escapeHtml((project.protectedResourceIds || []).join(", "))}"></div><div class="field"><label>Completion</label><input type="number" min="0" max="1" step="0.01" data-project-field="completionProgress" value="${escapeHtml(project.completionProgress ?? 0)}"></div></div><div class="section-title">Rating requirements · Rating / Count / Completed</div><div data-rating-rows>${ratingRequirementRows(project.ratingRequirements)}</div><button class="action" data-add-rating-row>Add rating requirement</button><div class="section-title">Special requirements · Type / Count / Completed</div><div data-special-rows>${specialRequirementRows(project.specialCardRequirements)}</div><button class="action" data-add-special-row>Add special requirement</button><div class="controls"><button class="action primary" data-save-project>Save project</button>${project.sourceSetId ? `<button class="action" data-sync-project="${escapeHtml(project.id)}">Sync with current SBC</button>` : ""}${project.id ? `<button class="action danger" data-remove-project="${escapeHtml(project.id)}">Remove</button>` : ""}</div>${project.sourceSetId ? `<div class="hint">Source set ${escapeHtml(project.sourceSetId)} · ${escapeHtml((project.sourceChallengeIds || []).length)} mapped challenges</div>` : ""}</section>`;
   var parseReserveMap = (value) => Object.fromEntries(
     splitList(value).map((entry) => entry.split(":").map((part) => part.trim())).filter(([rating, count]) => Number.isInteger(Number(rating)) && Number(count) > 0).map(([rating, count]) => [String(Number(rating)), Math.trunc(Number(count))])
@@ -4110,12 +7245,14 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     };
   };
   var GrindPanel = class {
-    constructor(runtime) {
+    constructor(runtime, { legacyOnly = true } = {}) {
       this.runtime = runtime;
+      this.legacyOnly = legacyOnly;
       this.host = document.createElement("grindpilot-panel");
       this.shadow = this.host.attachShadow({ mode: "open" });
       this.state = runtime.getState();
       this.activeSection = "Easy Loop";
+      this.previouslyFocused = null;
       this.renderShell();
       document.documentElement.appendChild(this.host);
       this.unsubscribe = runtime.subscribe((state) => {
@@ -4125,45 +7262,110 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       this.renderViews();
     }
     renderShell() {
-      this.shadow.innerHTML = `<style>${css}</style><button class="launcher" title="GrindPilot FC26">GP</button><section class="panel hidden"><aside><div class="brand">GrindPilot FC26<small>ONE SBC GRIND MANAGER</small></div>${sections.map((name) => `<button class="nav${name === this.activeSection ? " active" : ""}" data-section="${name}">${name}</button>`).join("")}</aside><main class="main"><div class="top"><h2></h2><button class="close" title="Close">×</button></div><div class="content"></div></main></section>`;
+      this.shadow.innerHTML = `<style>${css}</style><button class="launcher${this.legacyOnly ? " hidden" : ""}" aria-label="Open FUT Magic legacy tools">FM</button><section class="panel hidden" role="dialog" aria-modal="true" aria-labelledby="legacy-panel-brand legacy-panel-section"><aside><div class="brand" id="legacy-panel-brand">FUT Magic<small>ADVANCED · LEGACY TOOLS</small></div>${sections.map((name) => `<button class="nav${name === this.activeSection ? " active" : ""}" data-section="${name}"${name === this.activeSection ? ' aria-current="page"' : ""}>${name}</button>`).join("")}</aside><main class="main"><div class="top"><h2 id="legacy-panel-section"></h2><button class="close" aria-label="Close legacy tools">×</button></div><div class="content"></div></main></section>`;
       this.shadow.querySelector(".launcher").addEventListener("click", () => this.toggle(true));
       this.shadow.querySelector(".close").addEventListener("click", () => this.toggle(false));
+      this.shadow.querySelector(".panel").addEventListener("keydown", (event) => this.handleDialogKeydown(event));
       this.shadow.querySelectorAll(".nav").forEach((node) => node.addEventListener("click", () => {
         this.activeSection = node.dataset.section;
-        this.shadow.querySelectorAll(".nav").forEach((entry) => entry.classList.toggle("active", entry === node));
+        this.shadow.querySelectorAll(".nav").forEach((entry) => {
+          entry.classList.toggle("active", entry === node);
+          if (entry === node) entry.setAttribute("aria-current", "page");
+          else entry.removeAttribute("aria-current");
+        });
         this.renderViews();
       }));
     }
+    handleDialogKeydown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.toggle(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...this.shadow.querySelectorAll(
+        ".panel button:not(:disabled),.panel input:not(:disabled),.panel select:not(:disabled),.panel textarea:not(:disabled),.panel summary,.panel a[href]"
+      )].filter((node) => node.getClientRects().length > 0);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && this.shadow.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && this.shadow.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
     toggle(open) {
-      this.shadow.querySelector(".panel").classList.toggle("hidden", !open);
-      this.shadow.querySelector(".launcher").classList.toggle("hidden", open);
-      if (open) this.runtime.refreshStatus?.();
+      const panel = this.shadow.querySelector(".panel");
+      if (open && panel.classList.contains("hidden")) {
+        this.previouslyFocused = document.activeElement;
+      }
+      panel.classList.toggle("hidden", !open);
+      this.shadow.querySelector(".launcher").classList.toggle("hidden", this.legacyOnly || open);
+      if (this.runtime.state.legacyPanelOpen !== open) {
+        this.runtime.state.legacyPanelOpen = open;
+        this.runtime.emit();
+      }
+      if (open) {
+        this.runtime.refreshStatus?.();
+        queueMicrotask(() => this.shadow.querySelector(".close")?.focus());
+      } else {
+        this.previouslyFocused?.focus?.();
+        this.previouslyFocused = null;
+      }
+    }
+    openSection(section = "Easy Loop") {
+      if (sections.includes(section)) this.activeSection = section;
+      this.shadow.querySelectorAll(".nav").forEach((entry) => {
+        const active = entry.dataset.section === this.activeSection;
+        entry.classList.toggle("active", active);
+        if (active) entry.setAttribute("aria-current", "page");
+        else entry.removeAttribute("aria-current");
+      });
+      this.renderViews();
+      this.toggle(true);
     }
     banner() {
       const reason = this.state.pauseReason || this.state.error;
-      if (reason) return `<div class="banner ${this.state.error ? "error" : "warn"}">${escapeHtml(reason)}</div>`;
-      return `<div class="banner">GrindPilot is ${escapeHtml(this.state.bridgeHealth === "healthy" ? "ready" : this.state.bridgeHealth || "checking")}</div>`;
+      if (reason) return `<div class="banner ${this.state.error ? "error" : "warn"}" role="${this.state.error ? "alert" : "status"}" aria-atomic="true">${escapeHtml(reason)}</div>`;
+      return `<div class="banner">FUT Magic is ${escapeHtml(this.state.bridgeHealth === "healthy" ? "ready" : this.state.bridgeHealth || "checking")}</div>`;
     }
     renderViews() {
       const content = this.shadow.querySelector(".content");
+      const previousFocusable = [...content.querySelectorAll(legacyFocusableSelector)];
+      const previousFocusIndex = content.contains(this.shadow.activeElement) ? previousFocusable.indexOf(this.shadow.activeElement) : -1;
+      const previousSelection = previousFocusIndex >= 0 && "selectionStart" in this.shadow.activeElement ? { start: this.shadow.activeElement.selectionStart, end: this.shadow.activeElement.selectionEnd } : null;
       this.shadow.querySelector(".top h2").textContent = this.activeSection;
       const render = this[`render${this.activeSection.replaceAll(" ", "")}`]?.bind(this) ?? (() => "");
       content.innerHTML = this.banner() + render();
+      associateLegacyLabels(content);
       this.bindViewActions(content);
+      if (previousFocusIndex >= 0) {
+        queueMicrotask(() => {
+          const nextFocusable = [...content.querySelectorAll(legacyFocusableSelector)];
+          const target = nextFocusable[Math.min(previousFocusIndex, nextFocusable.length - 1)];
+          target?.focus?.({ preventScroll: true });
+          if (Number.isInteger(previousSelection?.start) && target && "setSelectionRange" in target) {
+            target.setSelectionRange(previousSelection.start, previousSelection.end);
+          }
+        });
+      }
     }
     renderEasyLoop() {
       const s = this.state;
       const count = Number(s.unassignedCount || 0);
       const runActive = !["idle", "completed", "stopped", "failed"].includes(String(s.runStatus || "idle"));
       const storageFull = Number(s.storageCount || 0) >= Number(s.storageCapacity || 100);
-      const nextTitle = count > 0 ? `Organize ${count} item${count === 1 ? "" : "s"}` : "Quick Open the next pack";
+      const nextTitle = count > 0 ? `Organize ${count} item${count === 1 ? "" : "s"}` : "Open the next pack safely";
       const nextBody = count > 0 ? storageFull ? "SBC Storage is full. Every remaining card will be used directly in 10x85." : "Safe cards go to Club or SBC Storage. Anything left is recycled in 10x85." : "Open exactly one owned pack. Purchases are always blocked.";
       const icons = { completed: "✓", running: "→", waiting: "→", paused: "!", failed: "×", pending: "○" };
       const timeline = (s.timeline || []).map((entry) => `<span class="${entry.status === "completed" ? "done" : entry.active ? "active" : ""}">${icons[entry.status] || "○"} ${escapeHtml(entry.type.replaceAll("_", " "))}</span>`).join("");
       const analytics = s.analytics || {};
       const consumed = analytics.ratingFlow?.consumed || {};
       const received = analytics.ratingFlow?.received || {};
-      return `<section class="easy-hero"><h3>${escapeHtml(nextTitle)}</h3><p>${escapeHtml(nextBody)}</p><div class="easy-status"><span>Storage ${escapeHtml(`${s.storageCount || 0}/${s.storageCapacity || 100}`)}</span><span>${escapeHtml(count)} unassigned</span><span>${escapeHtml(s.packsOpened || 0)} packs opened</span></div><div class="easy-actions"><button class="action ${count > 0 ? "primary" : ""}" data-action="recycle-cards"${count < 1 || runActive ? " disabled" : ""}>Organize now</button><button class="action ${count < 1 ? "primary" : ""}" data-action="quick-open"${count > 0 || runActive ? " disabled" : ""}>Quick Open one pack</button></div></section><div class="easy-steps"><div class="easy-step"><b>1 · Quick Open</b><span>Open one owned pack.</span></div><div class="easy-step"><b>2 · Organize</b><span>Move safe cards and recycle leftovers.</span></div><div class="easy-step"><b>3 · Repeat</b><span>Continue until your target SBC is finished.</span></div></div>${timeline ? `<details><summary>Current run</summary><div class="timeline">${timeline}</div></details>` : ""}<details><summary>Run details</summary><div class="grid">${[
+      return `<section class="easy-hero"><h3>${escapeHtml(nextTitle)}</h3><p>${escapeHtml(nextBody)}</p><div class="easy-status"><span>Storage ${escapeHtml(`${s.storageCount || 0}/${s.storageCapacity || 100}`)}</span><span>${escapeHtml(count)} unassigned</span><span>${escapeHtml(s.packsOpened || 0)} packs opened</span></div><div class="easy-actions"><button class="action ${count > 0 ? "primary" : ""}" data-action="recycle-cards"${count < 1 || runActive ? " disabled" : ""}>Route &amp; recycle</button><button class="action ${count < 1 ? "primary" : ""}" data-action="quick-open"${count > 0 || runActive ? " disabled" : ""}>Open one safely</button></div></section><div class="easy-steps"><div class="easy-step"><b>1 · Open safely</b><span>Open one owned pack.</span></div><div class="easy-step"><b>2 · Route &amp; recycle</b><span>Move safe cards and recycle leftovers.</span></div><div class="easy-step"><b>3 · Repeat</b><span>Continue until your target SBC is finished.</span></div></div>${timeline ? `<details><summary>Current run</summary><div class="timeline">${timeline}</div></details>` : ""}<details><summary>Run details</summary><div class="grid">${[
         ["Status", s.runStatus || "idle"],
         ["Step", s.currentStep || "—"],
         ["Iterations", `${s.iterations || 0}/${s.maxIterations || 0}`],
@@ -4180,24 +7382,24 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       return this.renderEasyLoop();
     }
     renderSBCSolver() {
-      return `<div class="card"><p>Der bewährte AutoPilot-Solver bleibt der Produktionsstandard.</p><p class="hint">Solve Squad, Multi Solve und Solve Entire Set bleiben in den vorhandenen SBC-Ansichten erreichbar. GrindPilot ergänzt diese Funktionen um persistente Workflows und Schutzrichtlinien.</p><button class="action" data-action="legacy-sequence">Open legacy sequence planner</button></div>`;
+      return `<div class="card"><p>The proven local AutoPilot solver remains the production engine.</p><p class="hint">Solve Squad, Multi Solve and Solve Entire Set remain available in their existing SBC surfaces while FUT Magic adds persistent runs and protection.</p><button class="action" data-action="legacy-sequence">Open legacy sequence planner</button></div>`;
     }
     renderWorkflows() {
       const cfg = this.state.draft || {};
       const templates = this.state.workflowTemplates || [];
       const legacy = this.state.legacySequences || [];
       const workflow = this.state.workflowDraft || { steps: [] };
-      return `<div class="form"><div class="field"><label>Mode</label><select data-field="mode"><option${selected2(cfg.mode, "REVIEW")}>REVIEW</option><option${selected2(cfg.mode, "ASSISTED")}>ASSISTED</option><option${selected2(cfg.mode, "AUTO")}>AUTO</option></select></div><div class="field"><label>Iterations (hard limit)</label><input data-field="maxIterations" type="number" min="1" max="1000" value="${escapeHtml(cfg.maxIterations || 1)}"></div><div class="field"><label>Template</label><select data-template-select>${templates.map((entry) => `<option value="${escapeHtml(entry.id)}">${escapeHtml(entry.name)}</option>`).join("")}</select></div><div class="field"><label>Player pick policy</label><select data-field="pickMode"><option${selected2(cfg.pickMode, "PAUSE_FOR_USER")}>PAUSE_FOR_USER</option><option${selected2(cfg.pickMode, "HIGHEST_RATING")}>HIGHEST_RATING</option><option${selected2(cfg.pickMode, "HIGHEST_VALUE")}>HIGHEST_VALUE</option><option${selected2(cfg.pickMode, "PREFER_NON_DUPLICATE")}>PREFER_NON_DUPLICATE</option><option${selected2(cfg.pickMode, "PREFER_REQUIRED_SPECIAL")}>PREFER_REQUIRED_SPECIAL</option><option${selected2(cfg.pickMode, "CUSTOM_PRIORITY")}>CUSTOM_PRIORITY</option></select></div><div class="field"><label>Custom priority criteria</label><input data-field="pickCriteria" value="${escapeHtml((cfg.pickPolicy?.criteria || []).join(", "))}" placeholder="NON_DUPLICATE, REQUIRED_SPECIAL, RATING, VALUE"></div><div class="field"><label>Reward packs</label><select data-field="packMode"><option${selected2(cfg.packMode, "OPEN_CURRENT_REWARD")}>OPEN_CURRENT_REWARD</option><option${selected2(cfg.packMode, "OPEN_MATCHING_PACKS")}>OPEN_MATCHING_PACKS</option><option${selected2(cfg.packMode, "OPEN_ALL_ALLOWED_PACKS")}>OPEN_ALL_ALLOWED_PACKS</option></select></div><div class="field"><label>Max packs per pack step</label><input data-field="maxPacks" type="number" min="1" max="100" value="${escapeHtml(cfg.maxPacks || 1)}"></div></div><div class="controls"><button class="action" data-action="apply-template">Use template</button><button class="action" data-wf-add="${encodePath([])}">Add Step</button><button class="action" data-action="save-workflow">Save workflow</button><button class="action primary" data-action="start">Start workflow</button></div><div class="section-title">${escapeHtml(workflow.name || "Workflow")} · ordered typed steps</div>${renderWorkflowSteps(workflow.steps, [])}<div class="section-title">Legacy Sequence migration</div><div class="controls"><button class="action" data-action="refresh-legacy">Find legacy plans</button><select data-legacy-select>${legacy.map((plan) => `<option value="${escapeHtml(plan.id)}">${escapeHtml(plan.name)}</option>`).join("")}</select><button class="action" data-action="import-legacy">Import Legacy Sequence</button></div><p class="hint">Specific set/challenge targets are verified by stable EA IDs. GrindPilot pauses and asks you to open the target when safe controller navigation is unavailable.</p>`;
+      return `<div class="form"><div class="field"><label>Mode</label><select data-field="mode"><option${selected2(cfg.mode, "REVIEW")}>REVIEW</option><option${selected2(cfg.mode, "ASSISTED")}>ASSISTED</option><option${selected2(cfg.mode, "AUTO")}>AUTO</option></select></div><div class="field"><label>Iterations (hard limit)</label><input data-field="maxIterations" type="number" min="1" max="1000" value="${escapeHtml(cfg.maxIterations || 1)}"></div><div class="field"><label>Template</label><select data-template-select>${templates.map((entry) => `<option value="${escapeHtml(entry.id)}">${escapeHtml(entry.name)}</option>`).join("")}</select></div><div class="field"><label>Player pick policy</label><select data-field="pickMode"><option${selected2(cfg.pickMode, "PAUSE_FOR_USER")}>PAUSE_FOR_USER</option><option${selected2(cfg.pickMode, "HIGHEST_RATING")}>HIGHEST_RATING</option><option${selected2(cfg.pickMode, "HIGHEST_VALUE")}>HIGHEST_VALUE</option><option${selected2(cfg.pickMode, "PREFER_NON_DUPLICATE")}>PREFER_NON_DUPLICATE</option><option${selected2(cfg.pickMode, "PREFER_REQUIRED_SPECIAL")}>PREFER_REQUIRED_SPECIAL</option><option${selected2(cfg.pickMode, "CUSTOM_PRIORITY")}>CUSTOM_PRIORITY</option></select></div><div class="field"><label>Custom priority criteria</label><input data-field="pickCriteria" value="${escapeHtml((cfg.pickPolicy?.criteria || []).join(", "))}" placeholder="NON_DUPLICATE, REQUIRED_SPECIAL, RATING, VALUE"></div><div class="field"><label>Reward packs</label><select data-field="packMode"><option${selected2(cfg.packMode, "OPEN_CURRENT_REWARD")}>OPEN_CURRENT_REWARD</option><option${selected2(cfg.packMode, "OPEN_MATCHING_PACKS")}>OPEN_MATCHING_PACKS</option><option${selected2(cfg.packMode, "OPEN_ALL_ALLOWED_PACKS")}>OPEN_ALL_ALLOWED_PACKS</option></select></div><div class="field"><label>Max packs per pack step</label><input data-field="maxPacks" type="number" min="1" max="100" value="${escapeHtml(cfg.maxPacks || 1)}"></div></div><div class="controls"><button class="action" data-action="apply-template">Use template</button><button class="action" data-wf-add="${encodePath([])}">Add Step</button><button class="action" data-action="save-workflow">Save workflow</button><button class="action primary" data-action="start">Start workflow</button></div><div class="section-title">${escapeHtml(workflow.name || "Workflow")} · ordered typed steps</div>${renderWorkflowSteps(workflow.steps, [])}<div class="section-title">Legacy Sequence migration</div><div class="controls"><button class="action" data-action="refresh-legacy">Find legacy plans</button><select aria-label="Legacy sequence plan" data-legacy-select>${legacy.map((plan) => `<option value="${escapeHtml(plan.id)}">${escapeHtml(plan.name)}</option>`).join("")}</select><button class="action" data-action="import-legacy">Import Legacy Sequence</button></div><p class="hint">Specific set/challenge targets are verified by stable EA IDs. FUT Magic pauses and asks you to open the target when safe controller navigation is unavailable.</p>`;
     }
     renderProfiles() {
-      return `<div class="controls"><button class="action" data-action="save-profile">Save current profile</button><button class="action" data-action="export-profile">Export</button><label class="action">Import<input data-action="import-profile" type="file" accept="application/json" hidden></label></div>${(this.state.profiles || []).length ? (this.state.profiles || []).map((p) => `<div class="card"><b>${escapeHtml(p.name)}</b><div class="hint">${escapeHtml(p.id)}</div><button class="action" data-load-profile="${escapeHtml(p.id)}">Load</button></div>`).join("") : '<div class="empty">No saved grind profiles yet.</div>'}`;
+      return `<div class="controls"><button class="action" data-action="save-profile">Save current profile</button><button class="action" data-action="export-profile">Export</button><button class="action" data-import-profile-trigger>Import</button><input class="sr-only" aria-label="Choose a FUT Magic profile to import" data-action="import-profile" type="file" accept="application/json"></div>${(this.state.profiles || []).length ? (this.state.profiles || []).map((p) => `<div class="card"><b>${escapeHtml(p.name)}</b><div class="hint">${escapeHtml(p.id)}</div><button class="action" data-load-profile="${escapeHtml(p.id)}">Load</button></div>`).join("") : '<div class="empty">No saved grind profiles yet.</div>'}`;
     }
     renderInventory() {
       const i = this.state.inventory || {};
       const buckets = this.state.inventoryBuckets || {};
       const cfg = this.state.draft || {};
       const targets = (this.state.projects || []).filter((project) => project.active !== false && project.sourceSetId && project.completionProgress < 1);
-      return `<div class="grid"><div class="card"><div class="label">Club</div><div class="metric">${i.clubCount || 0}</div></div><div class="card"><div class="label">SBC Storage</div><div class="metric">${i.storageCount || 0}</div></div><div class="card"><div class="label">Free slots</div><div class="metric">${i.storageFreeSlots ?? "?"}</div></div><div class="card"><div class="label">Unassigned</div><div class="metric">${i.unassignedCount || 0}</div></div></div><div class="card"><div class="field"><label>Organizer fallback SBC</label><select data-organizer-target><option value="">Auto: 85x10, otherwise highest priority</option>${targets.map((project) => `<option value="${escapeHtml(project.id)}"${selected2(String(cfg.organizerTargetProjectId || ""), String(project.id))}>${escapeHtml(project.name)}</option>`).join("")}</select></div><div class="controls"><button class="action" data-action="save-organizer">Save target</button><button class="action" data-action="quick-open"${Number(i.unassignedCount || 0) > 0 ? " disabled" : ""}>Quick Open</button><button class="action primary" data-action="recycle-cards"${Number(i.unassignedCount || 0) < 1 ? " disabled" : ""}>Organize</button><button class="action" data-action="inventory">Synchronize</button></div><p class="hint">Normal cards go to Club. Duplicates use only verified free SBC Storage slots. If Storage is full, every remaining card becomes mandatory in the selected SBC; if that exact squad is impossible, no submit occurs.</p></div><table class="bucket-table"><thead><tr><th>Rating</th><th>Club</th><th>Storage</th><th>Unassigned</th></tr></thead><tbody>${Object.entries(buckets).map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td>${value.club}</td><td>${value.storage}</td><td>${value.unassigned}</td></tr>`).join("")}</tbody></table>`;
+      return `<div class="grid"><div class="card"><div class="label">Club</div><div class="metric">${i.clubCount || 0}</div></div><div class="card"><div class="label">SBC Storage</div><div class="metric">${i.storageCount || 0}</div></div><div class="card"><div class="label">Free slots</div><div class="metric">${i.storageFreeSlots ?? "?"}</div></div><div class="card"><div class="label">Unassigned</div><div class="metric">${i.unassignedCount || 0}</div></div></div><div class="card"><div class="field"><label>Fallback recycling project</label><select data-organizer-target><option value="">Auto: 85x10, otherwise highest priority</option>${targets.map((project) => `<option value="${escapeHtml(project.id)}"${selected2(String(cfg.organizerTargetProjectId || ""), String(project.id))}>${escapeHtml(project.name)}</option>`).join("")}</select></div><div class="controls"><button class="action" data-action="save-organizer">Save target</button><button class="action" data-action="quick-open"${Number(i.unassignedCount || 0) > 0 ? " disabled" : ""}>Open safely</button><button class="action primary" data-action="recycle-cards"${Number(i.unassignedCount || 0) < 1 ? " disabled" : ""}>Route &amp; recycle</button><button class="action" data-action="inventory">Synchronize</button></div><p class="hint">Normal cards go to Club. Duplicates use only verified free SBC Storage slots. If Storage is full, every remaining card becomes mandatory in the selected SBC; if that exact squad is impossible, no submit occurs.</p></div><table class="bucket-table"><caption class="sr-only">Inventory rating buckets</caption><thead><tr><th scope="col">Rating</th><th scope="col">Club</th><th scope="col">Storage</th><th scope="col">Unassigned</th></tr></thead><tbody>${Object.entries(buckets).map(([label, value]) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${value.club}</td><td>${value.storage}</td><td>${value.unassigned}</td></tr>`).join("")}</tbody></table>`;
     }
     renderProtectedCards() {
       const cfg = this.state.draft || {};
@@ -4219,7 +7421,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     renderDeveloper() {
       const d = this.state.diagnostics || {};
       const health = this.state.capabilityHealth || [];
-      return `<div class="form"><div class="field"><label><input data-field="developerMode" type="checkbox" ${d.enabled ? "checked" : ""}> Developer Mode</label></div></div><div class="section-title">Capability Health</div>${health.map((entry) => `<div class="health"><b>${escapeHtml(entry.id)}</b><span>${escapeHtml(entry.status)}</span><span class="hint">${escapeHtml(JSON.stringify(entry.evidence || {}))}</span></div>`).join("") || '<div class="empty">Refresh to inspect safe capabilities.</div>'}<div class="controls"><button class="action" data-action="refresh">Refresh health</button><button class="action" data-action="diagnostic-snapshot">Take snapshot</button><button class="action" data-action="diagnostic-export">Export diagnostics</button></div><textarea readonly>${escapeHtml(JSON.stringify(d.latest || d, null, 2))}</textarea><p class="hint">Instrumentation remains dormant while Developer Mode is disabled. Export is redacted and excludes request bodies, headers and credentials. UNVERIFIED means capability presence was observed without dispatching a destructive operation.</p>`;
+      return `<div class="form"><div class="field"><label><input data-field="developerMode" type="checkbox" ${d.enabled ? "checked" : ""}> Developer Mode</label></div></div><div class="section-title">Capability Health</div>${health.map((entry) => `<div class="health"><b>${escapeHtml(entry.id)}</b><span>${escapeHtml(entry.status)}</span><span class="hint">${escapeHtml(JSON.stringify(entry.evidence || {}))}</span></div>`).join("") || '<div class="empty">Refresh to inspect safe capabilities.</div>'}<div class="controls"><button class="action" data-action="refresh">Refresh health</button><button class="action" data-action="diagnostic-snapshot">Take snapshot</button><button class="action" data-action="diagnostic-export">Export diagnostics</button></div><label class="sr-only" for="fut-magic-diagnostics-output">Latest redacted diagnostic snapshot</label><textarea id="fut-magic-diagnostics-output" readonly>${escapeHtml(JSON.stringify(d.latest || d, null, 2))}</textarea><p class="hint">Instrumentation remains dormant while Developer Mode is disabled. Export is redacted and excludes request bodies, headers and credentials. UNVERIFIED means capability presence was observed without dispatching a destructive operation.</p>`;
     }
     readDraft(root) {
       const get = (name) => root.querySelector(`[data-field="${name}"]`);
@@ -4227,6 +7429,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       return { ...this.state.draft || {}, mode: get("mode")?.value || "REVIEW", maxIterations: Number(get("maxIterations")?.value || 1), storageCapacity: Number(get("storageCapacity")?.value || this.state.storageCapacity || 100), packMode: get("packMode")?.value || "OPEN_CURRENT_REWARD", maxPacks: Number(get("maxPacks")?.value || 1), pickMode, pickPolicy: { ...this.state.draft?.pickPolicy || {}, type: pickMode, criteria: splitList(get("pickCriteria")?.value) }, workflow: this.state.workflowDraft || this.state.draft?.workflow };
     }
     bindViewActions(root) {
+      root.querySelector("[data-import-profile-trigger]")?.addEventListener("click", () => root.querySelector('[data-action="import-profile"]')?.click());
       root.querySelectorAll("[data-action]").forEach((node) => node.addEventListener(node.tagName === "INPUT" ? "change" : "click", async () => {
         const action = node.dataset.action;
         try {
@@ -4338,18 +7541,79 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
   var normalizeText = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
   var isIdleStatus = (status) => ["idle", "completed", "stopped", "failed"].includes(String(status || "idle"));
   var surfaceCss = `
-.grindpilot-pack-action-row{display:flex!important;align-items:stretch!important;gap:8px!important}
+.grindpilot-pack-action-row{display:flex!important;align-items:stretch!important;gap:8px!important;width:100%!important;max-width:640px!important;margin-inline:auto!important}
 .grindpilot-pack-action-row>.grindpilot-native-open-peer,
 .grindpilot-pack-action-row>.grindpilot-quick-open-native{flex:1 1 0!important;width:auto!important;min-width:0!important;margin-left:0!important;margin-right:0!important}
-.grindpilot-quick-open-native,.grindpilot-organize-native{cursor:pointer}
-.grindpilot-quick-open-native:disabled,.grindpilot-organize-native:disabled{cursor:not-allowed!important;opacity:.45!important}
-.grindpilot-organize-native{width:auto!important;min-width:92px!important;padding-left:14px!important;padding-right:14px!important;margin-left:auto!important;margin-right:8px!important;white-space:nowrap!important}
+.fut-magic-contextual{
+  --fm-bg-primary:#0B1020;
+  --fm-bg-secondary:#121A2E;
+  --fm-bg-elevated:#1E2B4D;
+  --fm-text-primary:#E6EDF5;
+  --fm-text-secondary:#A7B2C9;
+  --fm-text-on-accent:#07121B;
+  --fm-accent-primary:#00E6FF;
+  --fm-accent-secondary:#26FFC2;
+  --fm-destructive:#FF7185;
+  --fm-border-subtle:rgb(167 178 201 / 16%);
+  --fm-border-strong:rgb(0 230 255 / 42%);
+  --fm-focus-ring:#6AEEFF;
+  --fm-radius-sm:0.5rem;
+  --fm-control-min-size:2.75rem;
+  position:relative!important;
+  display:inline-flex!important;
+  align-items:center!important;
+  justify-content:center!important;
+  gap:7px!important;
+  min-height:var(--fm-control-min-size)!important;
+  overflow:hidden!important;
+  border:1px solid var(--fm-border-subtle)!important;
+  border-radius:var(--fm-radius-sm)!important;
+  background:var(--fm-bg-secondary)!important;
+  color:var(--fm-text-primary)!important;
+  box-shadow:none!important;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;
+  font-size:13px!important;
+  font-weight:600!important;
+  line-height:1.2!important;
+  letter-spacing:0!important;
+  text-transform:none!important;
+  cursor:pointer!important;
+  touch-action:manipulation!important;
+  transition:transform 80ms ease-out,background-color 120ms ease-out,border-color 120ms ease-out,color 120ms ease-out!important;
+}
+.fm-context-icon{display:block;width:15px;height:15px;flex:0 0 15px;color:var(--fm-accent-primary)}
+.fm-context-icon .secondary{color:var(--fm-accent-secondary)}
+.fut-magic-contextual:hover{background:var(--fm-bg-elevated)!important;border-color:var(--fm-border-strong)!important}
+.fut-magic-contextual:active{transform:scale(.975)!important;transition-duration:60ms!important}
+.fut-magic-contextual:focus-visible{outline:2px solid var(--fm-focus-ring)!important;outline-offset:2px!important}
+.fut-magic-contextual[aria-busy="true"],.fut-magic-contextual:disabled{cursor:not-allowed!important;opacity:.68!important;transform:none!important}
+.grindpilot-quick-open-native{border-color:rgba(0,230,255,.38)!important}
+.grindpilot-organize-native{width:auto!important;min-width:104px!important;padding-left:12px!important;padding-right:12px!important;margin-left:auto!important;margin-right:8px!important;white-space:nowrap!important}
+.grindpilot-organize-native::before{background:var(--fm-accent-secondary)}
+.fut-magic-open-panel-native{width:auto!important;min-width:108px!important;padding-left:12px!important;padding-right:12px!important;white-space:nowrap!important;background:transparent!important}
+@media(prefers-reduced-motion:reduce){.fut-magic-contextual{transition:color 100ms ease-out,background-color 100ms ease-out!important;transform:none!important}}
+@media(prefers-reduced-transparency:reduce){.fut-magic-contextual{background:var(--fm-bg-secondary)!important}}
+@media(prefers-contrast:more){.fut-magic-contextual{border-color:var(--fm-text-primary)!important}.fut-magic-contextual:focus-visible{outline-width:3px!important}}
+@media(forced-colors:active){.fut-magic-contextual{border:1px solid ButtonText!important;background:ButtonFace!important;color:ButtonText!important}.fm-context-icon{color:Highlight!important}.fut-magic-contextual:focus-visible{outline-color:Highlight!important}}
 `;
-  var createNativePeer = (peer, { className, label, title }) => {
+  var contextualIcons = Object.freeze({
+    spark: '<svg class="fm-context-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 1.5c0 3-1.5 4.5-4.5 4.5C6.5 6 8 7.5 8 10.5 8 7.5 9.5 6 12.5 6 9.5 6 8 4.5 8 1.5Z" fill="currentColor"/></svg>',
+    route: '<svg class="fm-context-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4h5a3 3 0 0 1 3 3v5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path class="secondary" d="m7.8 9.4 2.7 2.7 2.7-2.7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    brand: '<svg class="fm-context-icon" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d="m8.5 23-2-14 13.5-3-1 4-8 1.8 1 8.6c4 .3 7.9-1 10.7-3.8" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/><path class="secondary" d="M6.5 24.5c6.8 1.7 14.4.1 19.4-5.8m-2.8-.7 3.1.1-.6 3" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+  });
+  var setVisibleLabel = (button, label) => {
+    const node = button.querySelector(".fm-context-label");
+    if (node && node.textContent !== label) node.textContent = label;
+  };
+  var createNativePeer = (peer, { className, label, title, icon }) => {
     const button = (peer?.ownerDocument || document).createElement("button");
     button.type = "button";
-    button.className = `${peer?.className || ""} ${className}`.trim();
-    button.textContent = label;
+    button.className = `${peer?.className || ""} fut-magic-contextual ${className}`.trim();
+    if (contextualIcons[icon]) button.insertAdjacentHTML("beforeend", contextualIcons[icon]);
+    const labelNode = button.ownerDocument.createElement("span");
+    labelNode.className = "fm-context-label";
+    labelNode.textContent = label;
+    button.appendChild(labelNode);
     button.setAttribute("aria-label", label);
     button.title = title;
     return button;
@@ -4419,7 +7683,10 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         this.scheduleSync();
       });
       this.installStyles();
-      this.observer = MutationObserver ? new MutationObserver(() => this.scheduleSync()) : null;
+      this.observer = MutationObserver ? new MutationObserver((records) => {
+        const relevant = records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) => node.nodeType === 1));
+        if (relevant) this.scheduleSync();
+      }) : null;
       this.observer?.observe(root.documentElement || root, { childList: true, subtree: true });
       this.scheduleSync();
     }
@@ -4433,7 +7700,8 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     scheduleSync() {
       if (this.syncQueued) return;
       this.syncQueued = true;
-      queueMicrotask(() => {
+      const schedule = globalThis.requestAnimationFrame || ((callback) => setTimeout(callback, 16));
+      schedule(() => {
         this.syncQueued = false;
         this.sync();
       });
@@ -4441,6 +7709,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     sync() {
       this.mountQuickOpenButtons();
       this.mountOrganizeButton();
+      this.mountOpenPanelButton();
       void this.refreshPackBindings();
     }
     mountQuickOpenButtons() {
@@ -4457,11 +7726,13 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         openButton.classList.add("grindpilot-native-open-peer");
         const quickOpen = createNativePeer(openButton, {
           className: "grindpilot-quick-open-native",
-          label: "Quick Open",
-          title: `Quick Open ${packName}`
+          label: "Open safely",
+          title: `Open owned ${packName} safely with FUT Magic`,
+          icon: "spark"
         });
         quickOpen.dataset.packName = packName;
         quickOpen.disabled = true;
+        quickOpen.setAttribute("aria-label", "Open safely with FUT Magic unavailable: checking owned pack");
         quickOpen.addEventListener("click", async (event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -4469,10 +7740,12 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
           if (!packId2 || quickOpen.disabled) return;
           quickOpen.disabled = true;
           try {
+            quickOpen.setAttribute("aria-busy", "true");
             await this.runtime.quickOpenPack({ packId: packId2 });
           } catch (error) {
             this.runtime.reportUiError(error);
           } finally {
+            quickOpen.removeAttribute("aria-busy");
             this.scheduleSync();
           }
         });
@@ -4484,7 +7757,11 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       const buttons = [...this.root.querySelectorAll(".grindpilot-quick-open-native")];
       if (!buttons.length) return;
       const ready = Number(this.state.unassignedCount || 0) === 0 && isIdleStatus(this.state.runStatus);
-      for (const button of buttons) button.disabled = true;
+      for (const button of buttons) {
+        button.disabled = true;
+        const reason = Number(this.state.unassignedCount || 0) > 0 ? "resolve Unassigned items first" : !isIdleStatus(this.state.runStatus) ? "finish or stop the active run first" : "checking owned pack";
+        button.setAttribute("aria-label", `Open safely with FUT Magic unavailable: ${reason}`);
+      }
       if (!ready) return;
       let packs;
       try {
@@ -4504,11 +7781,13 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         if (ids.length !== 1) {
           delete button.dataset.packId;
           button.title = `${button.dataset.packName}: owned pack could not be identified uniquely`;
+          button.setAttribute("aria-label", "Open safely with FUT Magic unavailable: owned pack could not be identified uniquely");
           continue;
         }
         button.dataset.packId = ids[0];
         button.disabled = false;
-        button.title = `Quick Open ${button.dataset.packName}`;
+        button.title = `Open owned ${button.dataset.packName} safely with FUT Magic`;
+        button.setAttribute("aria-label", "Open safely with FUT Magic");
       }
     }
     mountOrganizeButton() {
@@ -4521,7 +7800,8 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       const organize = createNativePeer(menu, {
         className: "grindpilot-organize-native",
         label: "Organize",
-        title: "Move safe cards, then recycle every remaining card in 10x85"
+        title: "Organize with FUT Magic: move safe cards, then use remaining cards only in a verified SBC",
+        icon: "route"
       });
       organize.addEventListener("click", async (event) => {
         event.preventDefault();
@@ -4529,10 +7809,12 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         if (organize.disabled) return;
         organize.disabled = true;
         try {
+          organize.setAttribute("aria-busy", "true");
           await this.runtime.recycleCards();
         } catch (error) {
           this.runtime.reportUiError(error);
         } finally {
+          organize.removeAttribute("aria-busy");
           this.scheduleSync();
         }
       });
@@ -4543,18 +7825,288 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       const organize = this.root.querySelector(".grindpilot-organize-native");
       if (!organize) return;
       const count = Number(this.state.unassignedCount || 0);
-      const label = count > 0 ? `Organize (${count})` : "Organize";
-      if (organize.textContent !== label) organize.textContent = label;
-      if (organize.getAttribute("aria-label") !== label) organize.setAttribute("aria-label", label);
-      organize.disabled = count < 1 || !isIdleStatus(this.state.runStatus);
-      organize.title = count > 0 ? `Organize ${count} item${count === 1 ? "" : "s"}: Club/Storage first, then 10x85` : "No unassigned items";
+      const runIdle = isIdleStatus(this.state.runStatus);
+      const label = count < 1 ? "Organize · No items" : !runIdle ? "Organize · Run active" : `Organize (${count})`;
+      setVisibleLabel(organize, label);
+      organize.disabled = count < 1 || !runIdle;
+      organize.setAttribute("aria-label", count < 1 ? "Organize with FUT Magic unavailable: no Unassigned items" : !runIdle ? "Organize with FUT Magic unavailable: finish or stop the active run first" : `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic`);
+      organize.title = count > 0 && runIdle ? `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic: Club/Storage first, then only a verified SBC` : count < 1 ? "No Unassigned items" : "Finish or stop the active run first";
+    }
+    mountOpenPanelButton() {
+      if (this.root.querySelector(".fut-magic-open-panel-native")) return;
+      const menu = findItemsMenu(this.root);
+      if (!menu?.parentElement) return;
+      const open = createNativePeer(menu, {
+        className: "fut-magic-open-panel-native",
+        label: "Open FUT Magic",
+        title: "Review this context in FUT Magic",
+        icon: "brand"
+      });
+      open.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        open.disabled = true;
+        open.setAttribute("aria-busy", "true");
+        try {
+          await this.runtime.openSidePanel();
+        } catch (error) {
+          this.runtime.reportUiError(error);
+        } finally {
+          if (open.isConnected) {
+            open.disabled = false;
+            open.removeAttribute("aria-busy");
+          }
+        }
+      });
+      menu.parentElement.insertBefore(open, menu);
     }
     dispose() {
       this.packRefreshToken += 1;
       this.observer?.disconnect();
       this.unsubscribe?.();
-      this.root.querySelectorAll(".grindpilot-quick-open-native,.grindpilot-organize-native").forEach((node) => node.remove());
+      this.root.querySelectorAll(".grindpilot-quick-open-native,.grindpilot-organize-native,.fut-magic-open-panel-native").forEach((node) => node.remove());
       this.root.getElementById("grindpilot-ea-surface-styles")?.remove();
+    }
+  };
+
+  // src/ui/run-hud.js
+  var css2 = `
+:host{
+  all:initial;
+  color-scheme:dark;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --fm-bg-primary:#0B1020;
+  --fm-bg-secondary:#121A2E;
+  --fm-bg-elevated:#1E2B4D;
+  --fm-bg-overlay:rgb(11 16 32 / 92%);
+  --fm-text-primary:#E6EDF5;
+  --fm-text-secondary:#A7B2C9;
+  --fm-text-muted:#7F8BA4;
+  --fm-text-on-accent:#07121B;
+  --fm-accent-primary:#00E6FF;
+  --fm-accent-secondary:#26FFC2;
+  --fm-accent-violet:#7B61FF;
+  --fm-positive:#26FFC2;
+  --fm-warning:#FFCA67;
+  --fm-destructive:#FF7185;
+  --fm-border-subtle:rgb(167 178 201 / 16%);
+  --fm-border-strong:rgb(0 230 255 / 42%);
+  --fm-focus-ring:#6AEEFF;
+  --fm-shadow-high:0 1rem 2.5rem rgb(2 6 18 / 42%);
+  --fm-radius-sm:0.5rem;
+  --fm-radius-md:0.75rem;
+  --fm-radius-lg:1rem;
+  --fm-radius-pill:999px;
+  --fm-control-min-size:2.75rem;
+  --fm-material-blur:18px;
+}
+*{box-sizing:border-box}
+.hud{
+  position:fixed;
+  z-index:2147483598;
+  right:12px;
+  top:12px;
+  width:min(312px,calc(100vw - 24px));
+  padding:15px;
+  overflow:hidden;
+  color:var(--fm-text-primary);
+  background:var(--fm-bg-overlay);
+  -webkit-backdrop-filter:blur(var(--fm-material-blur)) saturate(125%);
+  backdrop-filter:blur(var(--fm-material-blur)) saturate(125%);
+  border:1px solid var(--fm-border-subtle);
+  border-radius:var(--fm-radius-lg);
+  box-shadow:var(--fm-shadow-high);
+  opacity:1;
+  transform:translateY(0);
+  transition:opacity 160ms ease-out,transform 260ms cubic-bezier(.2,.8,.2,1);
+}
+.hidden{display:none}
+.top,.row,.actions,.brand-lockup,.status,.guard-status,.top-actions{display:flex;align-items:center}
+.top,.row{justify-content:space-between;gap:10px}
+.top-actions{flex:0 0 auto;gap:7px}
+.brand-lockup{min-width:0;gap:8px}
+.brand-symbol{display:block;flex:0 0 auto;width:22px;height:22px;color:var(--fm-accent-primary)}
+.brand-symbol .trajectory{color:var(--fm-accent-secondary)}
+.brand-symbol .spark{color:var(--fm-text-primary)}
+.brand{font-size:14px;font-weight:700;letter-spacing:-.015em;white-space:nowrap}
+.status{flex:0 0 auto;gap:6px;color:var(--fm-text-secondary);font-size:11px;font-weight:600;line-height:16px}
+.dot{width:7px;height:7px;border:1px solid currentColor;border-radius:50%;background:currentColor;box-shadow:0 0 0 2px rgba(38,255,194,.08)}
+.status.normal{color:var(--fm-positive)}
+.status.elevated,.status.caution{color:var(--fm-warning)}
+.status.paused{color:var(--fm-text-primary)}
+.status.recovery{color:var(--fm-destructive)}
+.title{min-width:0;margin-top:14px;font-size:15px;font-weight:700;line-height:20px;letter-spacing:-.012em}
+.title>span:first-child{min-width:0;overflow-wrap:anywhere}
+.meta,.eyebrow{color:var(--fm-text-secondary);font-size:12px;line-height:17px}
+.title .meta{flex:0 0 auto;font-variant-numeric:tabular-nums}
+.progress{height:4px;margin:10px 0 13px;overflow:hidden;background:var(--fm-bg-elevated);border-radius:var(--fm-radius-pill)}
+.bar{height:100%;background:linear-gradient(90deg,var(--fm-accent-primary),var(--fm-accent-secondary));border-radius:inherit;transform-origin:left;transition:transform 280ms cubic-bezier(.2,.8,.2,1)}
+.progress-copy{margin:9px 0 13px;font-variant-numeric:tabular-nums}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:.025em}
+.next{margin-top:2px;font-size:14px;font-weight:500;line-height:20px;overflow-wrap:anywhere}
+.next+.meta{margin-top:2px;overflow-wrap:anywhere}
+.guard{margin-top:12px;padding-top:11px;border-top:1px solid var(--fm-border-subtle)}
+.guard-status{gap:6px;color:var(--fm-text-primary);font-size:12px;font-weight:600;line-height:17px}
+.guard-mark{width:6px;height:6px;border-radius:2px;background:currentColor;transform:rotate(45deg)}
+.guard-status.normal{color:var(--fm-text-secondary)}
+.guard-status.elevated,.guard-status.caution{color:var(--fm-warning)}
+.guard-status.paused{color:var(--fm-text-primary)}
+.guard-status.recovery{color:var(--fm-destructive)}
+.intervention{margin-top:10px;padding:9px 10px;border-left:2px solid currentColor;border-radius:0 8px 8px 0;background:rgba(242,196,109,.07);color:var(--fm-warning);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.intervention.recovery{background:rgba(255,126,135,.07);color:var(--fm-destructive)}
+.intervention-title{display:block;margin-bottom:2px;color:var(--fm-text-primary);font-weight:600}
+.actions{justify-content:flex-start;gap:7px;margin-top:13px;flex-wrap:wrap}
+.button{
+  flex:0 0 auto;
+  min-width:var(--fm-control-min-size);
+  min-height:var(--fm-control-min-size);
+  padding:0 12px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:7px;
+  border:1px solid var(--fm-border-subtle);
+  border-radius:var(--fm-radius-md);
+  background:var(--fm-bg-secondary);
+  color:var(--fm-text-primary);
+  font:600 13px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  cursor:pointer;
+  touch-action:manipulation;
+  transition:transform 90ms ease-out,background-color 130ms ease-out,border-color 130ms ease-out,color 130ms ease-out;
+}
+.button:hover{background:var(--fm-bg-elevated);border-color:var(--fm-border-strong)}
+.button:active{transform:scale(.975);transition-duration:60ms}
+.button:focus-visible{outline:2px solid var(--fm-focus-ring);outline-offset:2px}
+.button[aria-busy="true"],.button:disabled{cursor:wait;opacity:.68}
+.button.primary{margin-left:auto;border-color:transparent;background:var(--fm-accent-primary);color:var(--fm-text-on-accent)}
+.button.primary:hover{background:var(--fm-accent-secondary)}
+.button.stop{border-color:rgba(255,126,135,.32);background:transparent;color:var(--fm-destructive)}
+.button.stop:hover{background:rgba(255,126,135,.09);border-color:rgba(255,126,135,.55)}
+.button-icon{width:15px;height:15px;flex:0 0 auto}
+.compact{width:min(300px,calc(100vw - 24px));padding:10px 11px}
+.compact .compact-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:700;line-height:18px}
+.compact .brand-lockup{flex:1 1 auto}
+.compact .brand-symbol{width:20px;height:20px}
+.compact .status{margin-left:auto}
+.compact .button{flex:0 0 44px;width:44px;padding:0}
+.compact .top{gap:8px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+@media(max-width:290px){.hud{right:8px;top:8px;width:calc(100vw - 16px)}.button{padding:0 11px}}
+@media(prefers-reduced-motion:reduce){.hud,.button{transition:opacity 120ms ease-out!important;transform:none!important}.bar{transition:none!important}}
+@media(prefers-reduced-transparency:reduce){.hud{background:var(--fm-bg-primary);-webkit-backdrop-filter:none;backdrop-filter:none}}
+@media(prefers-contrast:more){.hud{background:var(--fm-bg-primary);border-color:var(--fm-text-secondary)}.button{border-color:var(--fm-text-secondary)}.meta,.eyebrow,.status{color:var(--fm-text-primary)}}
+@media(forced-colors:active){.hud,.button,.progress{border:1px solid CanvasText}.bar,.dot,.guard-mark{background:Highlight}.button:focus-visible{outline-color:Highlight}.intervention{border-color:Highlight}}
+`;
+  var escapeHtml2 = (value) => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  var brandSymbol = () => `
+  <svg class="brand-symbol" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+    <path d="m8.5 23-2-14 13.5-3-1 4-8 1.8 1 8.6c4 .3 7.9-1 10.7-3.8" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+    <path class="trajectory" d="M6.5 24.5c6.8 1.7 14.4.1 19.4-5.8" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round"/>
+    <path class="trajectory" d="m23.1 18 3.1.1-.6 3" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+    <path class="spark" d="M25 5.3c0 2-1 3-3 3 2 0 3 1 3 3 0-2 1-3 3-3-2 0-3-1-3-3Z" fill="currentColor"/>
+  </svg>`;
+  var openPanelIcon = () => `
+  <svg class="button-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+    <path d="M4 3.5h12v13H4zM11.5 3.5v13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+  </svg>`;
+  var chevronIcon = (expanded) => `
+  <svg class="button-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+    <path d="m6 ${expanded ? 12 : 8} 4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+  var activityGuardPresentation = (run) => {
+    if (run.guard.state === "recovery") return { state: "recovery", label: "Recovery" };
+    if (run.status === "paused") return { state: "paused", label: "Paused" };
+    if (["waiting", "stopping"].includes(run.status)) return { state: "elevated", label: "Elevated" };
+    if (run.guard.state === "caution") return { state: "caution", label: "Caution" };
+    return { state: "normal", label: "Normal" };
+  };
+  var runStatusLabel = (status) => {
+    const labels = {
+      recovery_required: "Needs review",
+      stopping: "Stopping safely",
+      waiting: "Waiting",
+      paused: "Run paused",
+      running: "Running"
+    };
+    return labels[String(status)] || String(status || "Active").replaceAll("_", " ");
+  };
+  var RunHud = class {
+    constructor(runtime) {
+      this.runtime = runtime;
+      this.host = document.createElement("fut-magic-run-hud");
+      this.shadow = this.host.attachShadow({ mode: "open" });
+      this.shadow.innerHTML = `<style>${css2}</style><span class="sr-only" aria-live="polite" aria-atomic="true"></span><div data-hud-mount></div>`;
+      this.liveRegion = this.shadow.querySelector('[aria-live="polite"]');
+      this.mount = this.shadow.querySelector("[data-hud-mount]");
+      this.lastAnnouncement = "";
+      this.collapsed = false;
+      document.documentElement.appendChild(this.host);
+      this.unsubscribe = runtime.subscribe((state) => this.render(state));
+    }
+    render(state) {
+      const focusedCommand = this.shadow.activeElement?.dataset?.command || null;
+      const run = buildProductShellViewModel(state).run;
+      if (!run || state.legacyPanelOpen) {
+        this.mount.innerHTML = '<section class="hud hidden"></section>';
+        this.liveRegion.textContent = "";
+        this.lastAnnouncement = "";
+        return;
+      }
+      const total = run.progress.total || 0;
+      const current = run.progress.current || 0;
+      const ratio = total ? Math.min(1, current / total) : 0;
+      const statusLabel = runStatusLabel(run.status);
+      const guard = activityGuardPresentation(run);
+      const compact = this.collapsed && guard.state === "normal";
+      const announcement = `FUT Magic run status ${statusLabel}. Safety status ${guard.label}. ${run.currentStep?.label || run.nextStep?.label || "Preparing next step"}.`;
+      if (announcement !== this.lastAnnouncement) {
+        this.liveRegion.textContent = announcement;
+        this.lastAnnouncement = announcement;
+      }
+      const progressMarkup = total ? `<div class="progress" role="progressbar" aria-label="Run progress" aria-valuemin="0" aria-valuenow="${current}" aria-valuemax="${total}" aria-valuetext="${current} of ${total} cycles"><div class="bar" style="transform:scaleX(${ratio})"></div></div>` : `<div class="meta progress-copy" role="status">${current} cycles completed · Total not set</div>`;
+      const interventionTitle = guard.state === "recovery" ? "Action not verified" : /player|choice/i.test(`${run.currentStep?.label || ""} ${run.intervention?.message || ""}`) ? "Player choice needed" : "Your input is needed";
+      const panelLabel = guard.state === "recovery" ? "Review in panel" : "Open panel";
+      this.mount.innerHTML = compact ? `<section class="hud compact" aria-label="Active FUT Magic run"><div class="top"><div class="brand-lockup">${brandSymbol()}<span class="compact-title">${escapeHtml2(run.title)}</span></div><span class="status normal" aria-label="Run status: ${escapeHtml2(statusLabel)}"><span class="dot" aria-hidden="true"></span>${escapeHtml2(statusLabel)}</span><button class="button" data-command="expand" aria-label="Expand run HUD">${chevronIcon(false)}</button></div></section>` : `<section class="hud" aria-label="Active FUT Magic run"><div class="top"><div class="brand-lockup">${brandSymbol()}<div class="brand">FUT Magic</div></div><div class="top-actions"><div class="status ${escapeHtml2(guard.state)}" aria-label="Run status: ${escapeHtml2(statusLabel)}"><span class="dot" aria-hidden="true"></span>${escapeHtml2(statusLabel)}</div>${guard.state === "normal" ? `<button class="button" data-command="collapse" aria-label="Collapse run HUD">${chevronIcon(true)}</button>` : ""}</div></div><div class="row title"><span>${escapeHtml2(run.title)}</span><span class="meta">${escapeHtml2(total ? `${current} / ${total}` : current)}</span></div>${progressMarkup}<div class="eyebrow">${run.currentStep ? "Now" : "Next"}</div><div class="next">${escapeHtml2(run.currentStep?.label || run.nextStep?.label || "Preparing the next safe step")}</div>${run.nextStep && run.currentStep ? `<div class="meta">Next: ${escapeHtml2(run.nextStep.label)}</div>` : ""}<div class="row guard"><span class="meta">Activity Guard</span><span class="guard-status ${escapeHtml2(guard.state)}"><span class="guard-mark" aria-hidden="true"></span>${escapeHtml2(guard.label)}</span></div>${run.intervention ? `<div class="intervention ${escapeHtml2(guard.state)}" role="status" aria-live="polite"><span class="intervention-title">${escapeHtml2(interventionTitle)}</span>${escapeHtml2(run.intervention.message)}</div>` : ""}<div class="actions">${run.canPause ? '<button class="button" data-command="pause">Pause</button>' : ""}${run.canResume ? '<button class="button" data-command="resume">Resume</button>' : ""}${run.canStop ? '<button class="button stop" data-command="stop">Stop</button>' : ""}<button class="button primary" data-command="open" aria-label="${escapeHtml2(panelLabel)}" title="${escapeHtml2(panelLabel)}">${openPanelIcon()}<span>${escapeHtml2(panelLabel)}</span></button></div></section>`;
+      this.shadow.querySelectorAll("[data-command]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const command = button.dataset.command;
+          if (command === "collapse") {
+            this.collapsed = true;
+            this.render(this.runtime.getState());
+            return;
+          }
+          if (command === "expand") {
+            this.collapsed = false;
+            this.render(this.runtime.getState());
+            return;
+          }
+          button.disabled = true;
+          button.setAttribute("aria-busy", "true");
+          try {
+            if (command === "pause") await this.runtime.pause();
+            else if (command === "resume") await this.runtime.resume();
+            else if (command === "stop") await this.runtime.stop();
+            else await this.runtime.openSidePanel();
+          } catch (error) {
+            this.runtime.reportUiError(error);
+          } finally {
+            if (button.isConnected) {
+              button.disabled = false;
+              button.removeAttribute("aria-busy");
+            }
+          }
+        });
+      });
+      if (focusedCommand) {
+        const equivalentCommand = focusedCommand === "collapse" && compact ? "expand" : focusedCommand === "expand" && !compact ? "collapse" : focusedCommand === "pause" && run.canResume ? "resume" : focusedCommand === "resume" && run.canPause ? "pause" : focusedCommand;
+        const focusTarget = this.shadow.querySelector(`[data-command="${equivalentCommand}"]`) || this.shadow.querySelector('[data-command="open"]');
+        focusTarget?.focus({ preventScroll: true });
+      }
+    }
+    dispose() {
+      this.unsubscribe?.();
+      this.host.remove();
     }
   };
 
@@ -4646,7 +8198,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     return Math.max(minimum, Math.min(maximum, Math.trunc(numeric)));
   };
   var normalizeRetryPolicy = (value) => {
-    const raw = isPlainObject(value) ? value : {};
+    const raw = isPlainObject2(value) ? value : {};
     const retryableCodes = Array.isArray(raw.retryableCodes) ? Array.from(
       new Set(raw.retryableCodes.map(normalizeText2).filter(Boolean))
     ).slice(0, 50) : [];
@@ -4686,7 +8238,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
     );
   };
   var normalizeStepConfig = (type, value, context, path) => {
-    const raw = isPlainObject(value) ? cloneSerializable(value) : {};
+    const raw = isPlainObject2(value) ? cloneSerializable(value) : {};
     if (type === WorkflowStepType.CONDITIONAL) {
       const conditionResult = validateCondition(raw.condition);
       if (!conditionResult.ok) {
@@ -4771,7 +8323,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         message: `Workflow nesting may not exceed ${MAX_WORKFLOW_DEPTH} levels.`
       });
     }
-    if (!isPlainObject(value)) {
+    if (!isPlainObject2(value)) {
       context.issues.push({
         path,
         code: "STEP_INVALID",
@@ -4833,8 +8385,8 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
   }
   var validateWorkflowDefinition = (value) => {
     const issues = [];
-    const raw = isPlainObject(value) ? value : {};
-    if (!isPlainObject(value)) {
+    const raw = isPlainObject2(value) ? value : {};
+    if (!isPlainObject2(value)) {
       issues.push({ path: "workflow", code: "WORKFLOW_INVALID", message: "Workflow must be an object." });
     }
     const id = normalizeText2(raw.id);
@@ -4858,7 +8410,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       description: normalizeText2(raw.description),
       version: clampInteger(raw.version, 1, Number.MAX_SAFE_INTEGER, 1),
       steps,
-      metadata: isPlainObject(raw.metadata) ? cloneSerializable(raw.metadata) : {}
+      metadata: isPlainObject2(raw.metadata) ? cloneSerializable(raw.metadata) : {}
     };
     try {
       assertSerializable(normalized, "Workflow definition");
@@ -4878,7 +8430,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
   };
   var hashWorkflowDefinition = (value) => {
     const normalized = normalizeWorkflowDefinition(value);
-    return `wf-${fnv1aHash(stableStringify(normalized))}`;
+    return `wf-${fnv1aHash(stableStringify2(normalized))}`;
   };
   var createAutoApproval = (workflow) => {
     const normalized = normalizeWorkflowDefinition(workflow);
@@ -5461,7 +9013,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
             stepId: node.step.id,
             type: node.step.type,
             preparedAt: this.now(),
-            ...isPlainObject(prepared) ? cloneSerializable(prepared) : {}
+            ...isPlainObject2(prepared) ? cloneSerializable(prepared) : {}
           };
           assertSerializable(node.intent, "Workflow step intent");
           this._record("STEP_INTENT_PREPARED", {
@@ -5619,7 +9171,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         node: cloneSerializable(node),
         ...extra
       });
-      return isPlainObject(context) ? context : {};
+      return isPlainObject2(context) ? context : {};
     }
     _completeNode(node, result) {
       node.status = StepStatus.COMPLETED;
@@ -5951,6 +9503,9 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       this.drivePromise = null;
       this.inventoryRefreshPromise = null;
       this.inventoryAvailable = false;
+      this.sbcPlanCache = /* @__PURE__ */ new Map();
+      this.duplicateRoutePlanCache = /* @__PURE__ */ new Map();
+      this.duplicateRouteApprovalInFlight = false;
       this.wakeTimer = null;
       this.config = this.defaultConfig();
       this.state = {
@@ -5982,6 +9537,23 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         timeline: [],
         capabilityHealth: [],
         analytics: summarizeRunAnalytics(null),
+        currentContext: null,
+        contextObservedAt: null,
+        inventoryAvailable: false,
+        gameVersion: GameVersion.UNKNOWN,
+        gameVersionObservation: "unverified",
+        gameVersionSource: "none",
+        runName: null,
+        runModeLabel: null,
+        productRevision: 0,
+        legacyPanelOpen: false,
+        sbcPlanPreviews: {},
+        sbcPlanNotices: {},
+        duplicateRoutePlan: null,
+        duplicateRouteNotice: null,
+        routerRecommendation: null,
+        routerRecommendationNotice: null,
+        fodderReviewPlan: null,
         pauseReason: null,
         error: null
       };
@@ -6034,8 +9606,130 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         stopConditions: []
       };
     }
+    createFodderPolicy() {
+      return new FodderPolicy({
+        protectRatingAtOrAbove: this.config.protectRatingAtOrAbove,
+        protectedCardTypes: this.config.protectedCardTypes,
+        allowedSpecialTypes: this.config.allowedSpecialTypes,
+        protectedItemIds: this.config.protectedItemIds || [],
+        protectedPlayerIds: this.config.protectedPlayerIds || [],
+        protectedResourceIds: this.config.protectedResourceIds || [],
+        protectedRatings: this.config.protectedRatings || [],
+        protectStartingSquad: this.config.protectStartingSquad === true,
+        protectFavorites: this.config.protectFavorites === true,
+        protectTradables: this.config.protectTradables === true,
+        preferUntradeables: this.config.preferUntradeables !== false,
+        preferDuplicates: this.config.preferDuplicates !== false,
+        preferSbcStorage: this.config.preferSbcStorage !== false,
+        minimumReserveByRating: this.config.minimumReserveByRating || {},
+        specialReserveByCardType: this.config.specialReserveByCardType || {}
+      }, { targetProjects: this.targets });
+    }
     domainLogger() {
       return { info: (action, data) => this.logger.info(action, action, data), warn: (action, data) => this.logger.warn(action, action, data) };
+    }
+    invalidateRouterRecommendation(message = null) {
+      const hadRecommendation = Boolean(this.state.routerRecommendation);
+      this.state.routerRecommendation = null;
+      if (hadRecommendation && message) {
+        this.state.routerRecommendationNotice = String(message);
+      }
+    }
+    invalidateDuplicateRoutePreview(message = null) {
+      const hadPreview = Boolean(this.state.duplicateRoutePlan);
+      this.duplicateRoutePlanCache?.clear?.();
+      this.state.duplicateRoutePlan = null;
+      if (hadPreview && message) {
+        this.state.duplicateRouteNotice = String(message);
+      }
+    }
+    invalidateGameSemanticPlans(message = null) {
+      const hadSbcPreviews = this.sbcPlanCache.size > 0 || Object.keys(this.state.sbcPlanPreviews || {}).length > 0;
+      this.sbcPlanCache.clear();
+      this.state.sbcPlanPreviews = {};
+      if (hadSbcPreviews && message) {
+        this.state.sbcPlanNotices = Object.fromEntries(
+          Object.keys(this.state.sbcPlanNotices || {}).map((key) => [key, String(message)])
+        );
+      }
+      this.state.fodderReviewPlan = null;
+      this.invalidateDuplicateRoutePreview(message);
+      this.invalidateRouterRecommendation(message);
+    }
+    async refreshGameContext() {
+      const previous = this.state.currentContext || null;
+      let observed = null;
+      try {
+        const raw = await this.adapter.getContext();
+        let gameVersion = GameVersion.UNKNOWN;
+        try {
+          gameVersion = normalizeGameVersion(raw?.gameVersion);
+        } catch {
+        }
+        observed = {
+          route: raw?.route == null ? null : String(raw.route),
+          setId: raw?.setId == null ? null : String(raw.setId),
+          setName: raw?.setName == null ? null : String(raw.setName),
+          challengeId: raw?.challengeId == null ? null : String(raw.challengeId),
+          challengeName: raw?.challengeName == null ? null : String(raw.challengeName),
+          challengeKind: raw?.challengeKind == null ? null : String(raw.challengeKind),
+          gameVersion,
+          gameVersionObservation: ["observed", "compatibility_default"].includes(raw?.gameVersionObservation) ? raw.gameVersionObservation : gameVersion === GameVersion.UNKNOWN ? "unverified" : "observed",
+          gameVersionSource: raw?.gameVersionSource == null ? "none" : String(raw.gameVersionSource)
+        };
+      } catch {
+        observed = {
+          gameVersion: GameVersion.UNKNOWN,
+          gameVersionObservation: "unverified",
+          gameVersionSource: "none"
+        };
+      }
+      this.state.currentContext = observed;
+      this.state.gameVersion = observed.gameVersion;
+      this.state.gameVersionObservation = observed.gameVersionObservation;
+      this.state.gameVersionSource = observed.gameVersionSource;
+      this.state.contextObservedAt = Date.now();
+      const beforeKey = previous && JSON.stringify([
+        previous.gameVersion,
+        previous.gameVersionObservation,
+        previous.gameVersionSource,
+        previous.challengeKind,
+        previous.setId,
+        previous.challengeId
+      ]);
+      const afterKey = JSON.stringify([
+        observed.gameVersion,
+        observed.gameVersionObservation,
+        observed.gameVersionSource,
+        observed.challengeKind,
+        observed.setId,
+        observed.challengeId
+      ]);
+      if (beforeKey && beforeKey !== afterKey) {
+        this.invalidateGameSemanticPlans(
+          "The observed EA game context changed. Preview again before approving anything."
+        );
+      }
+      return this.currentGameContext();
+    }
+    currentRouterActivityGuard() {
+      const run = this.engine?.getSnapshot?.();
+      if (!run || [RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(run.status)) {
+        return {
+          state: RouterActivityGuardState.IDLE,
+          evidence: { runStatus: run?.status || "idle" }
+        };
+      }
+      if (Object.values(RunStatus).includes(run.status)) {
+        return {
+          state: RouterActivityGuardState.NON_IDLE,
+          evidence: { runStatus: run.status, currentStep: run.nodes?.[run.cursor]?.step?.type || null }
+        };
+      }
+      return {
+        state: RouterActivityGuardState.UNKNOWN,
+        evidence: { runStatus: String(run.status || "unknown") }
+      };
     }
     async initialize() {
       await this.loadPersistentState();
@@ -6050,6 +9744,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       if (this.enableUi) {
         this.panel = new GrindPanel(this);
         this.surfaceActions = new EaSurfaceActions(this);
+        this.runHud = new RunHud(this);
       }
       this.emit();
     }
@@ -6080,7 +9775,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
           execute: async ({ run, step: step2 }) => {
             const target = step2?.config?.target || { kind: "CURRENT_OPEN_SBC" };
             const context = await this.adapter.getContext();
-            if (target.kind === "SPECIFIC_CHALLENGE" && String(context?.challengeId ?? "") !== String(target.challengeId ?? "")) {
+            if (target.kind === "SPECIFIC_CHALLENGE" && (String(context?.challengeId ?? "") !== String(target.challengeId ?? "") || target.setId != null && String(context?.setId ?? "") !== String(target.setId ?? ""))) {
               return {
                 status: "paused",
                 code: "SBC_TARGET_NOT_OPEN",
@@ -6097,20 +9792,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
               };
             }
             await this.refreshInventory();
-            const policy = new FodderPolicy({
-              protectRatingAtOrAbove: this.config.protectRatingAtOrAbove,
-              protectedCardTypes: this.config.protectedCardTypes,
-              protectedItemIds: this.config.protectedItemIds || [],
-              protectedPlayerIds: this.config.protectedPlayerIds || [],
-              protectedResourceIds: this.config.protectedResourceIds || [],
-              protectStartingSquad: this.config.protectStartingSquad === true,
-              protectFavorites: this.config.protectFavorites === true,
-              protectTradables: this.config.protectTradables === true,
-              preferUntradeables: this.config.preferUntradeables !== false,
-              preferDuplicates: this.config.preferDuplicates !== false,
-              preferSbcStorage: this.config.preferSbcStorage !== false,
-              minimumReserveByRating: this.config.minimumReserveByRating || {}
-            }, { targetProjects: this.targets });
+            const policy = this.createFodderPolicy();
             const inventoryItems = this.inventory.getSnapshot().items;
             const analysis = policy.analyze(inventoryItems);
             this.currentProtectedItemIds = analysis.protectedItemIds;
@@ -6131,12 +9813,28 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
                 ...step2?.config?.solverSettings || {}
               }
             });
+            if (target.kind === "SPECIFIC_CHALLENGE" && (String(solved?.challengeId ?? "") !== String(target.challengeId ?? "") || target.setId != null && String(solved?.setId ?? "") !== String(target.setId ?? ""))) {
+              const error = new Error("The solved squad no longer matches the approved SBC challenge");
+              error.code = "SBC_TARGET_CHANGED_DURING_SOLVE";
+              throw error;
+            }
             const explanation = policy.explainSelection(
               solved.solutionIds,
               inventoryItems
             );
             const selectedIds = new Set((solved.solutionIds ?? []).map(String));
             const selectedItems = inventoryItems.filter((item) => selectedIds.has(String(item.itemId))).map((item) => ({ itemId: item.itemId, rating: item.rating }));
+            const protectedIds = new Set(analysis.protectedItemIds.map(String));
+            if ([...selectedIds].some((id) => protectedIds.has(id))) {
+              const error = new Error("The solved squad contains a protected card");
+              error.code = "PROTECTED_ITEM_SELECTED";
+              throw error;
+            }
+            if (selectedIds.size !== 11 || selectedItems.length !== 11) {
+              const error = new Error("The solved squad is not a verified 11-card Club selection");
+              error.code = "SOLUTION_ITEMS_UNOBSERVED";
+              throw error;
+            }
             this.state.protectedCardsSaved = analysis.protectedItemIds.length;
             this.state.solveDetails = explanation;
             this.logger.info("Solve", "Verified squad solution", {
@@ -6323,25 +10021,64 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         },
         [WorkflowStepType.RESOLVE_ITEMS]: {
           prepare: async ({ step: step2 }) => {
-            await this.refreshInventory();
-            const plan = this.inventory.planUnassignedResolution({
+            const approvedBoundary = Array.isArray(step2?.config?.approvedRouteActions);
+            if (approvedBoundary) await this.refreshStatus();
+            else await this.refreshInventory();
+            const resolutionPolicy = approvedBoundary ? { ...step2.config.resolutionPolicy } : {
               preferSbcStorage: this.config.preferSbcStorage !== false,
               tradableWhenStorageUnavailable: "SAFE_HOLD",
               untradeableWhenStorageUnavailable: "PAUSE"
-            });
+            };
+            const plan = this.inventory.planUnassignedResolution(resolutionPolicy);
+            const currentRouteActions = canonicalDuplicateRouteActions(plan.actions);
+            const currentUnassignedItemIds = this.inventory.getSnapshot().unassigned.items.map((item) => String(item.itemId)).sort();
+            if (approvedBoundary) {
+              const capabilities = buildRuntimeCapabilityRegistry(this.state.capabilityHealth).require([
+                ...DUPLICATE_ROUTE_READ_CAPABILITIES,
+                ...DUPLICATE_ROUTE_MOVE_CAPABILITIES
+              ]);
+              if (!capabilities.ok) {
+                const error = new Error(
+                  "A required EA item-move capability changed after approval"
+                );
+                error.code = "DUPLICATE_CAPABILITY_CHANGED";
+                error.notApplied = true;
+                error.safeToRetry = false;
+                throw error;
+              }
+              const approvedRouteActions = canonicalDuplicateRouteActions(
+                step2.config.approvedRouteActions
+              );
+              const expectedUnassignedItemIdsBefore = [
+                ...step2.config.expectedUnassignedItemIdsBefore || []
+              ].map(String).sort();
+              if (JSON.stringify(currentRouteActions) !== JSON.stringify(approvedRouteActions) || JSON.stringify(currentUnassignedItemIds) !== JSON.stringify(expectedUnassignedItemIdsBefore)) {
+                const error = new Error(
+                  "Unassigned items or their safe destinations changed after approval"
+                );
+                error.code = "DUPLICATE_PLAN_STALE";
+                error.notApplied = true;
+                error.safeToRetry = false;
+                throw error;
+              }
+            }
             const allowPartial = step2?.config?.allowPartial === true;
-            const expectedActions = allowPartial ? plan.actions.filter(
+            const expectedActions = approvedBoundary ? canonicalDuplicateRouteActions(step2.config.approvedActions || []) : allowPartial ? plan.actions.filter(
               (action) => ["SEND_TO_CLUB", "MOVE_TO_SBC_STORAGE"].includes(action.type)
             ) : plan.actions;
             return {
               plan,
               expectedActions,
               allowPartial,
-              allowUnresolved: step2?.config?.allowUnresolved === true
+              allowUnresolved: step2?.config?.allowUnresolved === true,
+              approvedBoundary,
+              expectedUnassignedItemIdsBefore: approvedBoundary ? [...step2.config.expectedUnassignedItemIdsBefore] : null,
+              expectedRemainingItemIdsAfter: approvedBoundary ? [...step2.config.expectedRemainingItemIdsAfter] : null,
+              actionSetFingerprint: approvedBoundary ? String(step2.config.actionSetFingerprint || "") : null
             };
           },
           execute: async ({ intent }) => {
-            if (intent?.plan?.requiresUserAction && !intent?.allowPartial) {
+            if (intent?.plan?.requiresUserAction && !intent?.allowPartial && !intent?.approvedBoundary) {
               return {
                 status: "paused",
                 code: "UNASSIGNED_USER_ACTION_REQUIRED",
@@ -6352,7 +10089,10 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
             const result = await this.adapter.resolveUnassigned({
               storageCapacity: this.state.storageCapacity,
               expectedActions: intent.expectedActions,
-              allowPartial: intent.allowPartial === true
+              allowPartial: intent.allowPartial === true,
+              expectedUnassignedItemIdsBefore: intent.expectedUnassignedItemIdsBefore,
+              expectedRemainingItemIdsAfter: intent.expectedRemainingItemIdsAfter,
+              actionSetFingerprint: intent.actionSetFingerprint
             });
             await this.refreshInventory();
             if (result.unresolvedUnassigned > 0 && !intent?.allowUnresolved) {
@@ -6385,12 +10125,38 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
                 (action) => byLocation.unassigned.has(String(action.itemId))
               ).length;
               if (atDestination === actions.length) {
+                if (Array.isArray(intent.expectedRemainingItemIdsAfter)) {
+                  const expectedRemaining = new Set(
+                    intent.expectedRemainingItemIdsAfter.map(String)
+                  );
+                  if (!sameStringSet(byLocation.unassigned, expectedRemaining)) {
+                    return recovery(
+                      "ambiguous",
+                      null,
+                      "Moved items reached their destinations, but the remaining Unassigned set changed"
+                    );
+                  }
+                }
                 return recovery("completed", {
                   movedToClub: actions.filter((action) => action.to === "club").map((action) => action.itemId),
                   movedToStorage: actions.filter((action) => action.to === "sbc_storage").map((action) => action.itemId)
                 });
               }
-              if (stillUnassigned === actions.length) return recovery("not_applied");
+              if (stillUnassigned === actions.length) {
+                if (Array.isArray(intent.expectedUnassignedItemIdsBefore)) {
+                  const expectedBefore = new Set(
+                    intent.expectedUnassignedItemIdsBefore.map(String)
+                  );
+                  if (!sameStringSet(byLocation.unassigned, expectedBefore)) {
+                    return recovery(
+                      "ambiguous",
+                      null,
+                      "Approved items remain, but the complete Unassigned set changed"
+                    );
+                  }
+                }
+                return recovery("not_applied");
+              }
               return recovery("ambiguous", null, "Unassigned resolution is partial or items are missing");
             } catch (error) {
               return recovery("ambiguous", null, error?.message || "Unassigned post-state is unavailable");
@@ -6574,8 +10340,622 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       });
       if (!updated) return null;
       this.state.projects = this.targets.list();
+      let items = [];
+      try {
+        items = this.inventory.getSnapshot().items;
+      } catch {
+      }
+      this.state.targetDashboard = this.targets.getDashboard(items);
       await this.storage.saveProjects(this.state.projects);
       return updated;
+    }
+    currentGameContext({ requireSbcTarget = false } = {}) {
+      const observed = this.state.currentContext || {};
+      let gameVersion = GameVersion.UNKNOWN;
+      try {
+        gameVersion = normalizeGameVersion(observed.gameVersion ?? this.state.gameVersion);
+      } catch {
+      }
+      const verified = this.state.bridgeHealth === "healthy" && gameVersion === GameVersion.FC26 && ["observed", "compatibility_default"].includes(
+        observed.gameVersionObservation ?? this.state.gameVersionObservation
+      ) && (!requireSbcTarget || Boolean(observed.setId) && Boolean(observed.challengeId));
+      return createGameContext({
+        gameVersion,
+        state: verified ? "verified" : "unverified",
+        challengeKind: observed.challengeKind,
+        gameVersionObservation: observed.gameVersionObservation ?? this.state.gameVersionObservation,
+        gameVersionSource: observed.gameVersionSource ?? this.state.gameVersionSource,
+        route: observed.route,
+        setId: observed.setId,
+        setName: observed.setName,
+        challengeId: observed.challengeId,
+        challengeName: observed.challengeName,
+        observedAt: Number(this.state.contextObservedAt || Date.now())
+      });
+    }
+    currentSbcGameContext() {
+      return this.currentGameContext({ requireSbcTarget: true });
+    }
+    async requireFc26PlanningContext({ requireSbcTarget = false } = {}) {
+      await this.refreshGameContext();
+      const context = this.currentGameContext({ requireSbcTarget });
+      if (context.gameVersion !== GameVersion.FC26 || context.state !== "verified") {
+        const error = new Error(context.gameVersion === GameVersion.FC27 ? "FC 27 planning is observe-only in this build" : "The active EA game version could not be verified for planning");
+        error.code = context.gameVersion === GameVersion.FC27 ? "GAME_VERSION_UNSUPPORTED" : "GAME_CONTEXT_UNVERIFIED";
+        throw error;
+      }
+      return context;
+    }
+    buildDuplicateRouteEvidence() {
+      const inventorySnapshot = this.inventory.getSnapshot();
+      const policy = {
+        ...DUPLICATE_ROUTE_POLICY,
+        preferSbcStorage: this.config.preferSbcStorage !== false
+      };
+      const resolutionPlan = this.inventory.planUnassignedResolution(policy);
+      const capabilityRegistry = buildRuntimeCapabilityRegistry(this.state.capabilityHealth);
+      if (!this.inventoryAvailable) {
+        capabilityRegistry.declare("ea.inventory.read", {
+          state: "unavailable",
+          reason: "A current Club snapshot is unavailable"
+        });
+        capabilityRegistry.declare("ea.unassigned.read", {
+          state: "unavailable",
+          reason: "A current Unassigned snapshot is unavailable"
+        });
+      }
+      const capabilitySnapshot = capabilityRegistry.snapshot();
+      const gameContext = this.currentGameContext();
+      const summary = summarizeDuplicateRoute({ plan: resolutionPlan, inventorySnapshot });
+      const fingerprints = buildDuplicateRouteFingerprints({
+        gameContext,
+        inventorySnapshot,
+        capabilitySnapshot,
+        policy,
+        routeActions: summary.routeActions
+      });
+      return {
+        inventorySnapshot,
+        policy,
+        resolutionPlan,
+        summary,
+        capabilityRegistry,
+        capabilitySnapshot,
+        gameContext,
+        fingerprints
+      };
+    }
+    async previewDuplicateRoute() {
+      await this.refreshStatus();
+      const evidence = this.buildDuplicateRouteEvidence();
+      const protectionPolicy = this.createFodderPolicy();
+      const protectionAnalysis = protectionPolicy.analyze(evidence.inventorySnapshot.items);
+      const routerRecommendation = recommendRouterNextAction({
+        inventorySnapshot: evidence.inventorySnapshot,
+        routeSummary: evidence.summary,
+        capabilitySnapshot: evidence.capabilitySnapshot,
+        gameContext: evidence.gameContext,
+        activityGuard: this.currentRouterActivityGuard(),
+        protectionAnalysis: {
+          protectedItemIds: [...protectionAnalysis.protectedItemIds].map(String).sort(),
+          reasonsByItemId: protectionAnalysis.reasonsByItemId,
+          activeTargetProjectIds: [...protectionAnalysis.activeTargetProjectIds].map(String).sort()
+        },
+        conservationPolicy: protectionPolicy.toSolverConservationPolicy(),
+        duplicatePolicy: evidence.policy,
+        observedAt: Number(evidence.inventorySnapshot.updatedAt || this.state.contextObservedAt || Date.now())
+      });
+      const strategy = async () => {
+        const { summary, fingerprints } = evidence;
+        const blockers = [...summary.blockers];
+        if (summary.totalCount > 0 && summary.safeCount === 0) {
+          blockers.push({
+            code: "NO_SAFE_ROUTE",
+            message: "No current Unassigned item has a verified safe destination."
+          });
+        }
+        const requiredCapabilities = summary.safeCount > 0 ? [...DUPLICATE_ROUTE_READ_CAPABILITIES, ...DUPLICATE_ROUTE_MOVE_CAPABILITIES] : DUPLICATE_ROUTE_READ_CAPABILITIES;
+        return {
+          requiredCapabilities,
+          blockers,
+          fingerprints,
+          explanation: [
+            "Only the listed moves to Club or SBC Storage can run.",
+            "SBC submission, pack opening, and quicksell are outside this plan."
+          ],
+          preview: {
+            ...summary,
+            status: blockers.length ? "blocked" : summary.status,
+            safetyBoundary: "SAFE_ITEM_MOVES_ONLY"
+          },
+          steps: blockers.length || summary.safeCount === 0 ? [] : [{
+            type: "CALL_EXISTING_SERVICE",
+            service: "workflow",
+            command: "RESOLVE_APPROVED_UNASSIGNED",
+            approvedActions: summary.approvedActions,
+            routeActions: summary.routeActions,
+            expectedUnassignedItemIdsBefore: summary.expectedUnassignedItemIdsBefore,
+            expectedRemainingItemIdsAfter: summary.expectedRemainingItemIdsAfter,
+            actionSetFingerprint: summary.actionSetFingerprint
+          }]
+        };
+      };
+      strategy.requiredCapabilities = DUPLICATE_ROUTE_READ_CAPABILITIES;
+      const compiler = new PlanCompiler({
+        capabilityRegistry: evidence.capabilityRegistry,
+        entitlementService: new EntitlementService({ plan: ProductPlan.FREE }),
+        strategies: { [GoalKind.CLEAR_DUPLICATES]: strategy },
+        compilerVersion: 2
+      });
+      const goal = createGoal({
+        kind: GoalKind.CLEAR_DUPLICATES,
+        intent: "Preview one bounded safe route for current Unassigned items",
+        inputs: { policyVersion: evidence.policy.schemaVersion },
+        createdAt: 0
+      });
+      const plan = await compiler.compile(goal, evidence.gameContext);
+      this.duplicateRoutePlanCache.clear();
+      this.duplicateRoutePlanCache.set(plan.id, plan);
+      this.state.duplicateRoutePlan = plan;
+      this.state.duplicateRouteNotice = null;
+      this.state.routerRecommendation = routerRecommendation;
+      this.state.routerRecommendationNotice = null;
+      this.logger.info("Duplicate Preview", plan.state === "ready" ? "Built a safe duplicate route preview; no cards were changed" : "Duplicate route preview blocked safely", {
+        planId: plan.id,
+        safeMoves: plan.preview?.safeCount || 0,
+        attention: plan.preview?.attentionCount || 0,
+        blockerCodes: plan.blockers.map((blocker) => blocker.code),
+        routerState: routerRecommendation.state,
+        routerKind: routerRecommendation.outcome.kind,
+        routerReason: routerRecommendation.outcome.reasonCode
+      });
+      this.emit();
+      return plan;
+    }
+    buildFodderReviewEvidence() {
+      const inventorySnapshot = this.inventory.getSnapshot();
+      const items = inventorySnapshot.items || [];
+      const verifiedWhenComplete = (field) => items.length > 0 && items.every((item) => item?.[field] === true) ? "verified" : "unverified";
+      const startingSquadState = verifiedWhenComplete("hasStartingSquadEvidence");
+      const sourceEvidence = {
+        schemaVersion: 1,
+        fields: {
+          locked: verifiedWhenComplete("hasLockedEvidence"),
+          protected: verifiedWhenComplete("hasProtectedEvidence"),
+          favorite: verifiedWhenComplete("hasFavoriteEvidence"),
+          special: verifiedWhenComplete("hasSpecialEvidence"),
+          tradability: verifiedWhenComplete("hasTradabilityEvidence"),
+          startingSquad: startingSquadState
+        },
+        activeSquadProtection: {
+          state: startingSquadState,
+          mode: "per_item_flag"
+        },
+        loansIncluded: false
+      };
+      const capabilityRegistry = buildRuntimeCapabilityRegistry(this.state.capabilityHealth);
+      if (!this.inventoryAvailable) {
+        capabilityRegistry.declare("ea.inventory.read", {
+          state: "unavailable",
+          reason: "A current Club snapshot is unavailable"
+        });
+      }
+      return {
+        inventorySnapshot,
+        policy: this.createFodderPolicy(),
+        targetProjects: this.targets,
+        capabilityRegistry,
+        capabilitySnapshot: capabilityRegistry.snapshot(),
+        gameContext: this.currentGameContext(),
+        sourceEvidence
+      };
+    }
+    async previewFodderReview() {
+      await this.refreshStatus();
+      const evidence = this.buildFodderReviewEvidence();
+      const strategy = async () => buildFodderReview(evidence);
+      strategy.requiredCapabilities = FODDER_REVIEW_CAPABILITIES;
+      const compiler = new PlanCompiler({
+        capabilityRegistry: evidence.capabilityRegistry,
+        entitlementService: new EntitlementService({ plan: ProductPlan.FREE }),
+        strategies: { [GoalKind.OPTIMIZE_FODDER]: strategy },
+        compilerVersion: 2
+      });
+      const goal = createGoal({
+        kind: GoalKind.OPTIMIZE_FODDER,
+        intent: "Review current card protection and local squad preferences",
+        inputs: { scope: "current_inventory", reviewSchemaVersion: 1 },
+        createdAt: 0
+      });
+      const plan = await compiler.compile(goal, evidence.gameContext);
+      this.state.fodderReviewPlan = plan;
+      this.logger.info("Card protection", plan.state === "ready" ? "Reviewed current protection; no cards were changed" : "Protection review is unavailable with current evidence", {
+        planId: plan.id,
+        verificationState: plan.preview?.verificationState || "blocked",
+        protectedCount: plan.preview?.uniqueHardProtectedCount ?? null,
+        blockerCodes: plan.blockers.map((blocker) => blocker.code)
+      });
+      this.emit();
+      return plan;
+    }
+    async approveDuplicateRoute(planId) {
+      if (this.duplicateRouteApprovalInFlight) {
+        const error = new Error("A duplicate-route approval is already being checked");
+        error.code = "DUPLICATE_APPROVAL_IN_FLIGHT";
+        throw error;
+      }
+      this.duplicateRouteApprovalInFlight = true;
+      try {
+        const expected = this.duplicateRoutePlanCache.get(String(planId || ""));
+        if (!expected || expected.id !== String(planId || "") || expected.state !== "ready" || expected.preview?.safeCount <= 0 || expected.preview?.safetyBoundary !== "SAFE_ITEM_MOVES_ONLY") {
+          const error = new Error("Preview the safe duplicate route again before approving it");
+          error.code = "DUPLICATE_PLAN_NOT_APPROVABLE";
+          throw error;
+        }
+        const active = this.engine.getSnapshot();
+        if (active && ![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(active.status)) {
+          const error = new Error("Finish or stop the active run before moving these items");
+          error.code = "WORKFLOW_ALREADY_ACTIVE";
+          throw error;
+        }
+        await this.refreshStatus();
+        const current = this.buildDuplicateRouteEvidence();
+        const comparison = compareDuplicateRouteFingerprints(
+          expected.fingerprints,
+          current.fingerprints
+        );
+        if (!comparison.ok || current.summary.actionSetFingerprint !== expected.preview.actionSetFingerprint) {
+          this.duplicateRoutePlanCache.clear();
+          this.state.duplicateRoutePlan = null;
+          this.state.duplicateRouteNotice = "Unassigned items, destinations, or EA capabilities changed. Preview again.";
+          this.invalidateRouterRecommendation(
+            "Unassigned items, destinations, or EA capabilities changed. Nothing moved."
+          );
+          this.logger.warn("Duplicate Approval", "Stale duplicate route rejected", {
+            changedEvidence: comparison.changed
+          });
+          this.emit();
+          return { started: false, stale: true, changed: comparison.changed };
+        }
+        const preview = expected.preview;
+        const definition = {
+          id: `fut-magic-duplicates-${expected.id}`,
+          name: `Move ${preview.safeCount} safe item${preview.safeCount === 1 ? "" : "s"}`,
+          version: 1,
+          metadata: {
+            source: "fut-magic-duplicate-route",
+            planId: expected.id,
+            safetyModel: "exact-refresh-verify-move"
+          },
+          steps: [{
+            id: "approved-safe-item-moves",
+            type: WorkflowStepType.RESOLVE_ITEMS,
+            config: {
+              approvedActions: preview.approvedActions,
+              approvedRouteActions: preview.routeActions,
+              expectedUnassignedItemIdsBefore: preview.expectedUnassignedItemIdsBefore,
+              expectedRemainingItemIdsAfter: preview.expectedRemainingItemIdsAfter,
+              resolutionPolicy: current.policy,
+              actionSetFingerprint: preview.actionSetFingerprint,
+              allowPartial: false,
+              allowUnresolved: preview.expectedRemainingItemIdsAfter.length > 0
+            },
+            timeoutMs: 45e3,
+            retryPolicy: { maxAttempts: 1 },
+            onFailure: "PAUSE"
+          }]
+        };
+        this.state.maxIterations = 1;
+        await this.engine.start(definition, {
+          mode: WorkflowMode.AUTO,
+          approval: createAutoApproval(definition)
+        });
+        this.duplicateRoutePlanCache.clear();
+        this.state.duplicateRoutePlan = null;
+        this.state.duplicateRouteNotice = null;
+        this.invalidateRouterRecommendation();
+        this.state.routerRecommendationNotice = null;
+        this.logger.info("Duplicate Approval", "Approved one exact set of safe item moves", {
+          planId: expected.id,
+          safeMoves: preview.safeCount
+        });
+        queueMicrotask(() => this.drive());
+        this.emit();
+        return { started: true, runId: this.engine.getSnapshot()?.runId || null };
+      } finally {
+        this.duplicateRouteApprovalInFlight = false;
+      }
+    }
+    buildSbcPlanningEvidence(projectId) {
+      const project = this.targets.list().find((candidate) => String(candidate.id) === String(projectId));
+      if (!project) {
+        const error = new Error("The selected Target Project no longer exists");
+        error.code = "PROJECT_NOT_FOUND";
+        throw error;
+      }
+      const inventorySnapshot = this.inventory.getSnapshot();
+      const policy = this.createFodderPolicy();
+      const analysis = policy.analyze(inventorySnapshot.items);
+      const policySnapshot = {
+        protectedItemIds: [...analysis.protectedItemIds].map(String).sort(),
+        reasonsByItemId: analysis.reasonsByItemId,
+        activeTargetProjectIds: [...analysis.activeTargetProjectIds].map(String).sort(),
+        conservationPolicy: policy.toSolverConservationPolicy()
+      };
+      const capabilityRegistry = buildRuntimeCapabilityRegistry(
+        this.state.capabilityHealth
+      );
+      if (!this.inventoryAvailable) {
+        capabilityRegistry.declare("ea.inventory.read", {
+          state: "unavailable",
+          reason: "A current Club snapshot is unavailable"
+        });
+      }
+      const capabilitySnapshot = capabilityRegistry.snapshot();
+      const gameContext = this.currentSbcGameContext();
+      const fingerprints = buildSbcPlanFingerprints({
+        gameContext,
+        inventorySnapshot,
+        project,
+        policySnapshot,
+        capabilitySnapshot
+      });
+      return {
+        project,
+        inventorySnapshot,
+        policy,
+        analysis,
+        capabilityRegistry,
+        capabilitySnapshot,
+        gameContext,
+        fingerprints
+      };
+    }
+    async previewSbcProject(projectId) {
+      await this.refreshStatus();
+      const evidence = this.buildSbcPlanningEvidence(projectId);
+      const strategy = async () => {
+        const { project, gameContext, inventorySnapshot, policy, analysis, fingerprints } = evidence;
+        const challenge = projectChallengeForContext(project, gameContext);
+        const blockers = [];
+        if (String(project.sourceSetId || "") !== String(gameContext.setId || "")) {
+          blockers.push({
+            code: "OPEN_PROJECT_REQUIRED",
+            message: "Open this project's SBC set in EA before previewing a squad."
+          });
+        } else if (!challenge) {
+          blockers.push({
+            code: "CURRENT_CHALLENGE_NOT_IN_PROJECT",
+            message: "The open challenge is not mapped to this Target Project."
+          });
+        } else if (challenge.completed) {
+          blockers.push({
+            code: "CHALLENGE_COMPLETED",
+            message: "The open challenge is already complete."
+          });
+        } else if (challenge.unknownRequirements?.length) {
+          blockers.push({
+            code: "UNKNOWN_REQUIREMENTS",
+            message: "EA exposed requirements that FUT Magic cannot verify safely.",
+            count: challenge.unknownRequirements.length
+          });
+        }
+        const basePreview = {
+          status: blockers.length ? "blocked" : "planning",
+          projectId: project.id,
+          setId: project.sourceSetId,
+          challengeId: challenge?.id || gameContext.challengeId,
+          challengeName: challenge?.name || gameContext.challengeName || "Open challenge",
+          targetRating: challenge?.requiredSquadRating ?? null
+        };
+        if (blockers.length) {
+          return {
+            requiredCapabilities: SBC_PREVIEW_CAPABILITIES,
+            blockers,
+            fingerprints,
+            preview: basePreview
+          };
+        }
+        let solution;
+        try {
+          solution = await this.adapter.solveCurrentSbc({
+            previewOnly: true,
+            protectedItemIds: analysis.protectedItemIds,
+            conservationPolicy: {
+              ...policy.toSolverConservationPolicy(),
+              protectedItemIds: analysis.protectedItemIds
+            },
+            prioritize: {
+              duplicates: this.config.preferDuplicates !== false,
+              untradeables: this.config.preferUntradeables !== false,
+              storage: this.config.preferSbcStorage !== false
+            },
+            solverSettings: { ...this.config.solverSettings || {} }
+          });
+        } catch (error) {
+          return {
+            requiredCapabilities: SBC_PREVIEW_CAPABILITIES,
+            blockers: [{
+              code: String(error?.code || "NO_VERIFIED_SOLUTION"),
+              message: String(error?.message || "No verified squad solution is available.")
+            }],
+            fingerprints,
+            preview: { ...basePreview, status: "blocked" }
+          };
+        }
+        const summary = summarizeSbcSolution({
+          solution,
+          inventorySnapshot,
+          protectedItemIds: analysis.protectedItemIds
+        });
+        if (!summary.solved || summary.selectedCount !== 11) {
+          blockers.push({
+            code: "NO_VERIFIED_SOLUTION",
+            message: "The solver did not return a submit-ready 11-card squad."
+          });
+        }
+        if (summary.unobservedItemIds.length) {
+          blockers.push({
+            code: "SOLUTION_ITEMS_UNOBSERVED",
+            message: "The preview referenced cards outside the current Club snapshot."
+          });
+        }
+        if (summary.protectedViolations.length) {
+          blockers.push({
+            code: "PROTECTED_ITEM_SELECTED",
+            message: "The preview included a protected card."
+          });
+        }
+        const explanation = policy.explainSelection(
+          solution.solutionIds,
+          inventorySnapshot.items,
+          { targetRating: challenge.requiredSquadRating }
+        );
+        return {
+          requiredCapabilities: SBC_PREVIEW_CAPABILITIES,
+          blockers,
+          fingerprints,
+          explanation: explanation.explanations,
+          preview: {
+            ...basePreview,
+            status: blockers.length ? "blocked" : "ready",
+            solved: summary.solved,
+            selectedCount: summary.selectedCount,
+            cards: summary.cards,
+            ratingRange: summary.ratingRange,
+            specialCount: summary.specialCount,
+            duplicateCount: summary.duplicateCount,
+            storageCount: summary.storageCount,
+            protectedCount: analysis.protectedItemIds.length,
+            selectedProtectedCount: summary.selectedProtectedCount,
+            objectiveTuple: summary.objectiveTuple
+          },
+          steps: blockers.length ? [] : [{
+            type: "CALL_EXISTING_SERVICE",
+            service: "workflow",
+            command: "COMPLETE_CURRENT_SBC",
+            projectId: project.id,
+            setId: project.sourceSetId,
+            challengeId: challenge.id
+          }]
+        };
+      };
+      strategy.requiredCapabilities = SBC_PREVIEW_CAPABILITIES;
+      const compiler = new PlanCompiler({
+        capabilityRegistry: evidence.capabilityRegistry,
+        entitlementService: new EntitlementService({ plan: ProductPlan.FREE }),
+        strategies: { [GoalKind.COMPLETE_SBC]: strategy },
+        compilerVersion: 2
+      });
+      const goal = createGoal({
+        kind: GoalKind.COMPLETE_SBC,
+        intent: "Preview a protected squad for the open challenge",
+        inputs: { projectId: evidence.project.id },
+        createdAt: 0
+      });
+      const plan = await compiler.compile(goal, evidence.gameContext);
+      this.sbcPlanCache.set(String(projectId), plan);
+      this.state.sbcPlanPreviews = {
+        ...this.state.sbcPlanPreviews,
+        [String(projectId)]: plan
+      };
+      this.state.sbcPlanNotices = {
+        ...this.state.sbcPlanNotices,
+        [String(projectId)]: null
+      };
+      this.logger.info("SBC Preview", plan.state === "ready" ? "Built a protected squad preview; no cards were changed" : "Squad preview blocked safely", {
+        projectId: String(projectId),
+        planId: plan.id,
+        blockerCodes: plan.blockers.map((blocker) => blocker.code)
+      });
+      this.emit();
+      return plan;
+    }
+    async approveSbcPlan(projectId, planId) {
+      const key = String(projectId || "");
+      const expected = this.sbcPlanCache.get(key);
+      if (!expected || expected.id !== String(planId || "") || expected.state !== "ready") {
+        const error = new Error("Preview this squad again before approving it");
+        error.code = "SBC_PLAN_NOT_APPROVABLE";
+        throw error;
+      }
+      const active = this.engine.getSnapshot();
+      if (active && ![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(active.status)) {
+        const error = new Error("Finish or stop the active run before approving this squad");
+        error.code = "WORKFLOW_ALREADY_ACTIVE";
+        throw error;
+      }
+      await this.refreshStatus();
+      const current = this.buildSbcPlanningEvidence(key);
+      const comparison = compareSbcPlanFingerprints(expected.fingerprints, current.fingerprints);
+      if (!comparison.ok) {
+        this.sbcPlanCache.delete(key);
+        const nextPreviews2 = { ...this.state.sbcPlanPreviews };
+        delete nextPreviews2[key];
+        this.state.sbcPlanPreviews = nextPreviews2;
+        this.state.sbcPlanNotices = {
+          ...this.state.sbcPlanNotices,
+          [key]: "Club, protections, project, capabilities, or the open EA squad changed. Preview again."
+        };
+        this.logger.warn("SBC Approval", "Stale squad preview rejected", {
+          projectId: key,
+          changedEvidence: comparison.changed
+        });
+        this.emit();
+        return { started: false, stale: true, changed: comparison.changed };
+      }
+      const preview = expected.preview;
+      const definition = {
+        id: `fut-magic-sbc-${expected.id}`,
+        name: `Complete ${preview?.challengeName || "open SBC"}`,
+        version: 1,
+        metadata: {
+          source: "fut-magic-sbc-plan",
+          planId: expected.id,
+          projectId: key,
+          safetyModel: "refresh-re-solve-verify-submit"
+        },
+        steps: [
+          {
+            id: "approved-sbc-solve",
+            type: WorkflowStepType.SOLVE_SBC,
+            config: {
+              target: {
+                kind: "SPECIFIC_CHALLENGE",
+                setId: preview.setId,
+                challengeId: preview.challengeId
+              }
+            },
+            timeoutMs: 12e4,
+            retryPolicy: { maxAttempts: 1 },
+            onFailure: "PAUSE"
+          },
+          {
+            id: "approved-sbc-submit",
+            type: WorkflowStepType.SUBMIT_SBC,
+            timeoutMs: 3e4,
+            retryPolicy: { maxAttempts: 1 },
+            onFailure: "PAUSE"
+          }
+        ]
+      };
+      this.state.maxIterations = 1;
+      await this.engine.start(definition, {
+        mode: WorkflowMode.AUTO,
+        approval: createAutoApproval(definition)
+      });
+      this.sbcPlanCache.delete(key);
+      const nextPreviews = { ...this.state.sbcPlanPreviews };
+      delete nextPreviews[key];
+      this.state.sbcPlanPreviews = nextPreviews;
+      this.state.sbcPlanNotices = { ...this.state.sbcPlanNotices, [key]: null };
+      this.logger.info("SBC Approval", "Approved one refreshed, verified squad submission", {
+        projectId: key,
+        planId: expected.id
+      });
+      queueMicrotask(() => this.drive());
+      this.emit();
+      return { started: true, runId: this.engine.getSnapshot()?.runId || null };
     }
     stopConditionTriggered(condition, context) {
       const type = String(condition?.type ?? "").trim().toUpperCase();
@@ -6617,7 +10997,33 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       }
       return true;
     }
-    evaluateRunGate({ run, node }) {
+    async evaluateRunGate({ run, node }) {
+      const versionSensitiveSteps = /* @__PURE__ */ new Set([
+        WorkflowStepType.SOLVE_SBC,
+        WorkflowStepType.SUBMIT_SBC,
+        WorkflowStepType.CLAIM_REWARD,
+        WorkflowStepType.OPEN_REWARD_PACK,
+        WorkflowStepType.RESOLVE_ITEMS,
+        WorkflowStepType.ORGANIZE_ITEMS,
+        WorkflowStepType.HANDLE_PLAYER_PICK
+      ]);
+      if (versionSensitiveSteps.has(node?.step?.type)) {
+        const gameContext = await this.refreshGameContext();
+        if (gameContext.gameVersion !== GameVersion.FC26) {
+          return {
+            allowed: false,
+            code: gameContext.gameVersion === GameVersion.FC27 ? "GAME_VERSION_UNSUPPORTED" : "GAME_CONTEXT_UNVERIFIED",
+            message: gameContext.gameVersion === GameVersion.FC27 ? "FC 27 is observe-only in this build. No workflow action was run." : "The active EA game version could not be verified. No workflow action was run."
+          };
+        }
+        if (gameContext.state !== "verified") {
+          return {
+            allowed: false,
+            code: "GAME_CONTEXT_UNVERIFIED",
+            message: "The current FC 26 context is not verified. No workflow action was run."
+          };
+        }
+      }
       const limits = this.config.runLimits || { maxIterations: this.config.maxIterations };
       const cleanupStep = [WorkflowStepType.HANDLE_PLAYER_PICK, WorkflowStepType.RESOLVE_ITEMS, WorkflowStepType.ORGANIZE_ITEMS].includes(node?.step?.type);
       const completed2 = (type) => (run?.nodes || []).filter(
@@ -6629,7 +11035,7 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
         [limits.maxPacksOpened != null && !cleanupStep && completed2(WorkflowStepType.OPEN_REWARD_PACK) >= Number(limits.maxPacksOpened), "Maximum opened packs reached"],
         [limits.maxDurationMinutes != null && !cleanupStep && Date.now() - Number(run?.createdAt || Date.now()) >= Number(limits.maxDurationMinutes) * 6e4, "Maximum workflow duration reached"]
       ];
-      const reached = checks.find(([blocked]) => blocked);
+      const reached = checks.find(([blocked2]) => blocked2);
       if (reached) return { allowed: false, code: "RUN_LIMIT_REACHED", message: reached[1] };
       const context = this.conditionContext(run);
       for (const condition of this.config.stopConditions || []) {
@@ -6702,15 +11108,26 @@ aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overfl
       return () => this.listeners.delete(listener);
     }
     emit() {
+      this.state.productRevision += 1;
       const snapshot = this.getState();
       for (const listener of this.listeners) listener(snapshot);
     }
     onRun(run) {
       if (!run) return;
+      if (![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(run.status)) {
+        this.invalidateDuplicateRoutePreview(
+          "Activity Guard changed while a workflow was active. Preview again."
+        );
+      }
+      this.invalidateRouterRecommendation(
+        "Activity Guard changed while a workflow was active. Check again."
+      );
       const node = run.nodes?.[run.cursor];
       const completed2 = (type) => run.nodes.filter((entry) => entry.step?.type === type && entry.status === "completed");
       this.state.runStatus = run.status;
       this.state.currentStep = node?.step?.type || null;
+      this.state.runName = run.definition?.name || "FUT Magic run";
+      this.state.runModeLabel = run.mode === WorkflowMode.REVIEW ? "Preview only" : run.mode === WorkflowMode.ASSISTED ? "Ask before each action" : "Approved plan";
       this.state.iterations = run.counters?.loopIterations || 0;
       this.state.maxIterations = this.config.maxIterations;
       this.state.sbcCompleted = completed2(WorkflowStepType.SUBMIT_SBC).length;
@@ -6929,21 +11346,21 @@ ${summary}`)) return;
         }
       });
       if (plan.packs.length !== 1) {
-        const error = new Error("No uniquely selected owned pack is ready for Quick Open");
+        const error = new Error("No uniquely selected owned pack is ready to open safely");
         error.code = "QUICK_OPEN_PACK_UNAVAILABLE";
         throw error;
       }
       const pack = plan.packs[0];
       const packId2 = String(pack?.packId ?? pack?.id ?? "");
       const label = String(pack?.name ?? pack?.packName ?? pack?.type ?? packId2);
-      if (!requestedPackId && !this.confirm(`Quick Open ${label}?
+      if (!requestedPackId && !this.confirm(`Open ${label} safely?
 
 Only this already-owned pack will be opened. No purchase is allowed.`)) {
         return { status: "cancelled", result: { packId: packId2 } };
       }
       const definition = {
         id: "quick-open-pack",
-        name: "Quick Open",
+        name: "Open safely",
         version: 1,
         metadata: { source: "grindpilot-quick-open", safetyModel: "owned-only" },
         steps: [{
@@ -6959,7 +11376,7 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
         mode: WorkflowMode.AUTO,
         approval: createAutoApproval(definition)
       });
-      this.logger.info("Quick Open", "Approved one verified owned pack", { packId: packId2 });
+      this.logger.info("Open safely", "Approved one verified owned pack", { packId: packId2 });
       await this.drive();
       return this.engine.getSnapshot();
     }
@@ -7000,6 +11417,7 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       } catch (error) {
         this.state.error = this.state.error || `Inventory refresh failed: ${error?.message || error}`;
       }
+      await this.refreshGameContext();
       try {
         this.state.capabilityHealth = await this.adapter.getCapabilityHealth();
       } catch {
@@ -7011,10 +11429,20 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
       this.inventoryRefreshPromise = (async () => {
         this.inventoryAvailable = false;
+        this.state.inventoryAvailable = false;
+        this.state.fodderReviewPlan = null;
+        this.invalidateDuplicateRoutePreview(
+          "Club or Unassigned evidence was refreshed. Preview the safe route again."
+        );
+        this.invalidateRouterRecommendation(
+          "Club or Unassigned evidence was refreshed. Check the next action again."
+        );
         const raw = await this.adapter.readInventory();
         const snapshot = this.inventory.synchronize({ club: raw.club, storage: raw.storage, unassigned: raw.unassigned, storageCapacity: this.state.storageCapacity });
         this.inventoryAvailable = true;
         const status = this.inventory.getStatus();
+        this.inventoryAvailable = true;
+        this.state.inventoryAvailable = true;
         this.state.inventory = status;
         this.state.storageCount = status.storageCount;
         this.state.unassignedCount = status.unassignedCount;
@@ -7046,6 +11474,8 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
         this.state.projects = this.targets.list();
       }
       this.state.draft = this.config;
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation("Protection or project settings changed. Check the next action again.");
       this.emit();
     }
     async exportCurrentProfile() {
@@ -7063,6 +11493,12 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
     async saveProtectionSettings(input) {
       this.config = { ...this.config, ...input, protectStartingSquad: true };
       this.state.draft = this.config;
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation(
+        "Protection settings changed. Check the next action again."
+      );
+      this.sbcPlanCache.clear();
+      this.state.sbcPlanPreviews = {};
       await this.storage.saveSettings(this.config);
       this.emit();
     }
@@ -7133,6 +11569,8 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       if (!name) throw new Error("Target project name is required");
       const project = this.targets.upsert({ id: `project-${Date.now()}`, name, active: true, priority: Math.max(0, Math.trunc(input.priority || 0)), requiredSquadsRemaining: Math.max(0, Math.trunc(input.requiredSquadsRemaining || 0)), protectedRatings: { atOrAbove: input.protectRatingAtOrAbove || null }, ratingRequirements: [], specialCardRequirements: [], completionProgress: 0 });
       this.state.projects = this.targets.list();
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation("Target Projects changed. Check the next action again.");
       await this.storage.saveProjects(this.state.projects);
       this.emit();
       return project;
@@ -7143,6 +11581,10 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
         id: input?.id || `project-${Date.now()}`
       });
       this.state.projects = this.targets.list();
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation(
+        "Target Projects changed. Check the next action again."
+      );
       let items = [];
       try {
         items = this.inventory.getSnapshot().items;
@@ -7154,9 +11596,14 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       return project;
     }
     async importCurrentSbcProject() {
+      await this.requireFc26PlanningContext({ requireSbcTarget: true });
       const snapshot = await this.adapter.readCurrentSbcProject();
       const project = this.targets.importCurrentSbc(snapshot);
       this.state.projects = this.targets.list();
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation(
+        "Target Projects changed. Check the next action again."
+      );
       this.state.targetDashboard = this.targets.getDashboard(
         this.inventoryAvailable ? this.inventory.getSnapshot().items : []
       );
@@ -7173,9 +11620,14 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       return project;
     }
     async syncTargetProject(id) {
+      await this.requireFc26PlanningContext({ requireSbcTarget: true });
       const snapshot = await this.adapter.readCurrentSbcProject();
       const project = this.targets.synchronizeFromCurrentSbc(id, snapshot);
       this.state.projects = this.targets.list();
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation(
+        "Target Projects changed. Check the next action again."
+      );
       this.state.targetDashboard = this.targets.getDashboard(
         this.inventoryAvailable ? this.inventory.getSnapshot().items : []
       );
@@ -7186,6 +11638,8 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
     async removeTargetProject(id) {
       this.targets.remove(id);
       this.state.projects = this.targets.list();
+      this.state.fodderReviewPlan = null;
+      this.invalidateRouterRecommendation("Target Projects changed. Check the next action again.");
       await this.storage.saveProjects(this.state.projects);
       this.emit();
     }
@@ -7203,6 +11657,58 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
     }
     async exportDiagnostics() {
       return this.dev.exportDiagnostics({ healthChecks: [await this.adapter.health().catch((error) => ({ error: error.message }))], logs: this.logger.entries() });
+    }
+    getProductShellViewModel() {
+      return buildProductShellViewModel({
+        ...this.state,
+        gameContext: this.currentGameContext()
+      });
+    }
+    async executeProductShellCommand(command = {}) {
+      const type = String(command?.type || "");
+      if (type === "REFRESH") return this.refreshStatus().then(() => this.getProductShellViewModel());
+      if (type === "PAUSE_RUN") await this.pause();
+      else if (type === "RESUME_RUN") await this.resume();
+      else if (type === "STOP_RUN") await this.stop();
+      else if (type === "IMPORT_CURRENT_SBC_PROJECT") await this.importCurrentSbcProject();
+      else if (type === "PREVIEW_SBC_PROJECT") {
+        await this.previewSbcProject(String(command.projectId || ""));
+      } else if (type === "APPROVE_SBC_PLAN") {
+        await this.approveSbcPlan(
+          String(command.projectId || ""),
+          String(command.planId || "")
+        );
+      } else if (type === "PREVIEW_CLEAR_DUPLICATES") {
+        await this.previewDuplicateRoute();
+      } else if (type === "PREVIEW_FODDER_REVIEW") {
+        await this.previewFodderReview();
+      } else if (type === "APPROVE_CLEAR_DUPLICATES_PLAN") {
+        await this.approveDuplicateRoute(String(command.planId || ""));
+      } else if (type === "OPEN_LEGACY_UI") {
+        const allowed = /* @__PURE__ */ new Set(["Easy Loop", "SBC Solver", "Workflows", "Profiles", "Inventory", "Protected Cards", "Target Projects", "Activity", "Settings", "Developer"]);
+        const section = allowed.has(String(command.section)) ? String(command.section) : "Easy Loop";
+        this.panel?.openSection?.(section);
+      } else {
+        const error = new Error("Unsupported FUT Magic surface command");
+        error.code = "FUT_MAGIC_COMMAND_FORBIDDEN";
+        throw error;
+      }
+      return this.getProductShellViewModel();
+    }
+    async openSidePanel() {
+      return new Promise((resolve, reject) => {
+        const api = globalThis.chrome?.runtime;
+        if (!api?.sendMessage) {
+          this.panel?.openSection?.("Easy Loop");
+          resolve({ opened: false, legacy: true });
+          return;
+        }
+        api.sendMessage({ type: "FUT_MAGIC_OPEN_PANEL_V1" }, (response) => {
+          const error = api.lastError;
+          if (error || !response?.ok) reject(new Error(error?.message || response?.error?.message || "FUT Magic Side Panel could not open"));
+          else resolve(response.data || { opened: true });
+        });
+      });
     }
     reportUiError(error) {
       this.state.error = error?.message || String(error);

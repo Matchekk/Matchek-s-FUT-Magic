@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">FUT Magic app icon</title>
+  <desc id="desc">An angular strategy frame, simplified football node, forward trajectory, and single four-point spark.</desc>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#0B1020"/>
+  <rect x="6.5" y="6.5" width="115" height="115" rx="25.5" fill="none" stroke="#1E2B4D" stroke-width="3"/>
+  <path d="M34 91 27 36l56-12-5 15-34 7 5 39c15 2 30-2 42-11" fill="none" stroke="#00E6FF" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M25 96c26 7 55 1 74-20" fill="none" stroke="#26FFC2" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="64" cy="86" r="13" fill="#121A2E" stroke="#00E6FF" stroke-width="4"/>
+  <path d="m64 78 7 5-3 8h-8l-3-8Z" fill="#26FFC2"/>
+  <path d="M64 78v-5m7 10 5-2m-8 10 4 5m-12-5-4 5m1-13-5-2" fill="none" stroke="#00E6FF" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="m91 72 11 1-3 11" fill="none" stroke="#26FFC2" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M99 27c0 8-4 12-12 12 8 0 12 4 12 12 0-8 4-12 12-12-8 0-12-4-12-12Z" fill="#E6EDF5"/>
+</svg>

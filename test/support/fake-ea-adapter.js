@@ -16,8 +16,9 @@ export class FakeGrindStorage {
 }
 
 export class FakeEaAdapter {
-  constructor({ iterations = 20 } = {}) {
+  constructor({ iterations = 20, gameVersion = "fc26" } = {}) {
     this.iterations = iterations;
+    this.gameVersion = gameVersion;
     this.setId = "fake-set-26";
     this.challengeIndex = 0;
     this.completedChallenges = new Set();
@@ -58,12 +59,18 @@ export class FakeEaAdapter {
 
   async health() { return { eaReady: true }; }
   async getCapabilityHealth() {
-    return ["inventory", "solve", "submit", "claim", "packs", "pick", "resolve"].map((id) => ({
+    return ["inventory", "current sbc read", "solve", "submit", "claim", "packs", "pick", "resolve"].map((id) => ({
       id, status: "AVAILABLE", evidence: { fake: true },
     }));
   }
   async getContext() {
+    const observedGameVersion = ["fc26", "fc27"].includes(this.gameVersion)
+      ? this.gameVersion
+      : "unknown";
     return {
+      gameVersion: observedGameVersion,
+      gameVersionObservation: observedGameVersion === "unknown" ? "unverified" : "observed",
+      gameVersionSource: observedGameVersion === "unknown" ? "none" : "test_fixture",
       setId: this.setId,
       challengeId: this.#challengeId(),
       challengeCompleted: this.completedChallenges.has(this.#challengeId()),
@@ -106,7 +113,7 @@ export class FakeEaAdapter {
       );
     if (candidates.length < 11) throw new Error("Fake club has insufficient players");
     const solutionIds = candidates.slice(0, 11).map(itemId);
-    this.pendingSolution = solutionIds;
+    if (options.previewOnly !== true) this.pendingSolution = solutionIds;
     return {
       solved: true,
       submitReady: true,
@@ -204,8 +211,23 @@ export class FakeEaAdapter {
     return this.#finish("pick", { success: true, selectedItemId: String(intent.itemId) });
   }
 
-  async resolveUnassigned({ expectedActions = [] } = {}) {
+  async resolveUnassigned({
+    expectedActions = [],
+    expectedUnassignedItemIdsBefore = null,
+    expectedRemainingItemIdsAfter = null,
+  } = {}) {
     this.calls.resolve += 1;
+    const beforeIds = this.unassigned.map(itemId).sort();
+    if (Array.isArray(expectedUnassignedItemIdsBefore)) {
+      const expectedBefore = expectedUnassignedItemIdsBefore.map(String).sort();
+      if (JSON.stringify(beforeIds) !== JSON.stringify(expectedBefore)) {
+        const error = new Error("Fake complete Unassigned pre-state mismatch");
+        error.code = "EA_OPERATION_NOT_APPLIED";
+        error.notApplied = true;
+        error.safeToRetry = true;
+        throw error;
+      }
+    }
     const remaining = new Map(this.unassigned.map((item) => [itemId(item), item]));
     const movedToClub = [];
     const movedToStorage = [];
@@ -222,6 +244,15 @@ export class FakeEaAdapter {
       }
     }
     this.unassigned = [...remaining.values()];
+    if (Array.isArray(expectedRemainingItemIdsAfter)) {
+      const expectedAfter = expectedRemainingItemIdsAfter.map(String).sort();
+      const afterIds = this.unassigned.map(itemId).sort();
+      if (JSON.stringify(afterIds) !== JSON.stringify(expectedAfter)) {
+        const error = new Error("Fake exact Unassigned post-state mismatch");
+        error.code = "EA_STATE_AMBIGUOUS";
+        throw error;
+      }
+    }
     const result = {
       movedToClub,
       movedToStorage,

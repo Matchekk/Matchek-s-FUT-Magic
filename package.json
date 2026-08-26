@@ -1,22 +1,28 @@
 {
-  "name": "grindpilot-fc26",
-  "version": "2.2.0",
+  "name": "fut-magic",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
-  "description": "Unified local-first FC26 SBC grind manager derived from AutoPilot-SBC.",
+  "description": "Local-first FUT Magic extension for explainable SBC plans, protected grinding and safe recovery.",
   "scripts": {
+    "build:icons": "node scripts/build-icons.mjs",
     "build:runtime": "node scripts/build-runtime.mjs",
     "test": "node --test \"test/**/*.test.js\"",
     "test:browser": "npm run build:runtime && node scripts/browser-test.mjs",
-    "check": "node scripts/verify.mjs",
-    "package": "npm run build:runtime && node scripts/package.mjs"
+    "check": "node scripts/verify.mjs && tsc --noEmit",
+    "package": "npm run build:icons && npm run build:runtime && node scripts/package.mjs"
   },
   "license": "GPL-3.0-only",
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
+    "@types/chrome": "^0.1.43",
     "esbuild": "^0.25.9",
-    "playwright": "^1.62.1"
+    "playwright": "^1.62.1",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "preact": "^10.29.8"
   }
 }

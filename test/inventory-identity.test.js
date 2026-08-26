@@ -38,6 +38,33 @@ test("owned item, card version, and footballer identifiers remain separate", () 
   assert.equal(item.location, "club");
 });
 
+test("policy-relevant boolean provenance survives inventory normalization", () => {
+  const item = normalizeInventoryItem({
+    ...base89,
+    isTradeable: false,
+    isLocked: false,
+    isFavorite: true,
+    isInStartingSquad: false,
+    isProtected: false,
+    isSpecial: false,
+  }, { location: "club" });
+
+  assert.equal(item.hasTradabilityEvidence, true);
+  assert.equal(item.hasLockedEvidence, true);
+  assert.equal(item.hasFavoriteEvidence, true);
+  assert.equal(item.hasStartingSquadEvidence, true);
+  assert.equal(item.hasProtectedEvidence, true);
+  assert.equal(item.hasSpecialEvidence, true);
+
+  const unknown = normalizeInventoryItem(base89, { location: "club" });
+  assert.equal(unknown.hasTradabilityEvidence, false);
+  assert.equal(unknown.hasLockedEvidence, false);
+  assert.equal(unknown.hasFavoriteEvidence, false);
+  assert.equal(unknown.hasStartingSquadEvidence, false);
+  assert.equal(unknown.hasProtectedEvidence, false);
+  assert.equal(unknown.hasSpecialEvidence, true);
+});
+
 test("same footballer base and promo versions remain separate and are not duplicates", () => {
   const inventory = new InventoryService();
   inventory.synchronize({

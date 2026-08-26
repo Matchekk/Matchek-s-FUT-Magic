@@ -26,6 +26,96 @@ const verifiedValue = (result, operation) => {
   throw error;
 };
 
+export const ControllerGameVersion = Object.freeze({
+  FC26: "fc26",
+  FC27: "fc27",
+  UNKNOWN: "unknown",
+});
+
+export const ControllerGameVersionObservation = Object.freeze({
+  OBSERVED: "observed",
+  UNVERIFIED: "unverified",
+  COMPATIBILITY_DEFAULT: "compatibility_default",
+});
+
+const ownDataProperty = (input, key) => {
+  if (input == null || typeof input !== "object") return { present: false, value: undefined };
+  let descriptor;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(input, key);
+  } catch {
+    return { present: true, value: undefined };
+  }
+  if (!descriptor) return { present: false, value: undefined };
+  return { present: true, value: "value" in descriptor ? descriptor.value : undefined };
+};
+
+const boundedScalar = (input, key, maxLength, { allowNumber = false } = {}) => {
+  const property = ownDataProperty(input, key);
+  const value = property.value;
+  if (allowNumber && Number.isSafeInteger(value)) return String(value);
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized && normalized.length <= maxLength && !/[\u0000-\u001f\u007f]/.test(normalized)
+    ? normalized
+    : null;
+};
+
+const normalizeVersionFields = (input) => {
+  const versionProperty = ownDataProperty(input, "gameVersion");
+  if (!versionProperty.present) {
+    return {
+      gameVersion: ControllerGameVersion.FC26,
+      gameVersionObservation: ControllerGameVersionObservation.COMPATIBILITY_DEFAULT,
+      gameVersionSource: "legacy_bridge_v1",
+    };
+  }
+  const value = typeof versionProperty.value === "string"
+    ? versionProperty.value.trim().toLowerCase()
+    : "";
+  if (![ControllerGameVersion.FC26, ControllerGameVersion.FC27].includes(value)) {
+    return {
+      gameVersion: ControllerGameVersion.UNKNOWN,
+      gameVersionObservation: ControllerGameVersionObservation.UNVERIFIED,
+      gameVersionSource: "none",
+    };
+  }
+  const observation = boundedScalar(input, "gameVersionObservation", 32) ===
+    ControllerGameVersionObservation.UNVERIFIED
+    ? ControllerGameVersionObservation.UNVERIFIED
+    : ControllerGameVersionObservation.OBSERVED;
+  const declaredSource = boundedScalar(input, "gameVersionSource", 64);
+  return {
+    gameVersion: value,
+    gameVersionObservation: observation,
+    gameVersionSource: declaredSource === "ea_runtime" ? declaredSource : "main_world_context",
+  };
+};
+
+export const normalizeControllerContext = (input) => {
+  let prototype;
+  try {
+    prototype = input != null && typeof input === "object" && !Array.isArray(input)
+      ? Object.getPrototypeOf(input)
+      : undefined;
+  } catch {
+    prototype = undefined;
+  }
+  const context = prototype === Object.prototype || prototype === null
+    ? input
+    : { gameVersion: ControllerGameVersion.UNKNOWN };
+  return Object.freeze({
+    ...normalizeVersionFields(context),
+    route: boundedScalar(context, "route", 512),
+    setId: boundedScalar(context, "setId", 128, { allowNumber: true }),
+    setName: boundedScalar(context, "setName", 240),
+    challengeId: boundedScalar(context, "challengeId", 128, { allowNumber: true }),
+    challengeName: boundedScalar(context, "challengeName", 240),
+    challengeCompleted: ownDataProperty(context, "challengeCompleted").value === true,
+    bridgeReady: ownDataProperty(context, "bridgeReady").value === true,
+  });
+};
+
 /** Primary adapter around the preserved AutoPilot controller/runtime bridge. */
 export class ControllerAdapter {
   async health() {
@@ -33,7 +123,7 @@ export class ControllerAdapter {
   }
 
   async getContext() {
-    return requireBridge().getContext();
+    return normalizeControllerContext(await requireBridge().getContext());
   }
 
   async readInventory() {

@@ -53,6 +53,33 @@ test("diagnostics omit network data when no origin was explicitly allowed", () =
   assert.deepEqual(bundle.network, []);
 });
 
+test("support exports omit stable gameplay identifiers, names, and free-text log messages", () => {
+  const canaries = [
+    "owned-item-123", "player-456", "challenge-789", "Sensitive Player Name",
+    "private project name", "raw error prose",
+  ];
+  const bundle = createDiagnosticsExport({
+    logs: [{
+      timestamp: "2026-08-26T00:00:00.000Z",
+      level: "error",
+      action: "Workflow",
+      message: "raw error prose for Sensitive Player Name",
+      data: { code: "SAFE_CODE", itemId: "owned-item-123", projectName: "private project name" },
+    }],
+    healthChecks: [{
+      status: "available",
+      challengeId: "challenge-789",
+      playerId: "player-456",
+      challengeName: "Sensitive Player Name",
+      capabilities: [{ id: "read_inventory", state: "available" }],
+    }],
+  });
+  const serialized = JSON.stringify(bundle);
+  for (const canary of canaries) assert.equal(serialized.includes(canary), false, `${canary} leaked`);
+  assert.equal(bundle.logs[0].code, "SAFE_CODE");
+  assert.deepEqual(bundle.healthChecks[0].capabilities, [{ id: "read_inventory", state: "available" }]);
+});
+
 test("Developer Mode captures, compares and exports only after opt-in", () => {
   class UTWorkflowController {
     start() {}

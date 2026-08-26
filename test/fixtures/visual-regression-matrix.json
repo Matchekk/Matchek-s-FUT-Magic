@@ -1,0 +1,105 @@
+{
+  "sidePanelRuns": {
+    "normal": {
+      "title": "85x10 Grind",
+      "modeLabel": "Ask before each action",
+      "status": "running",
+      "progress": { "current": 4, "total": 10, "label": "cycles" },
+      "currentStep": { "label": "Open reward", "status": "running" },
+      "nextStep": { "label": "Route items" },
+      "timeline": [
+        { "label": "Solve", "status": "completed", "active": false },
+        { "label": "Submit", "status": "completed", "active": false },
+        { "label": "Open reward", "status": "running", "active": true },
+        { "label": "Route items", "status": "pending", "active": false }
+      ],
+      "guard": { "state": "normal", "label": "Normal", "reason": null },
+      "intervention": null,
+      "canPause": true,
+      "canResume": false,
+      "canStop": true
+    },
+    "elevated": {
+      "title": "85x10 Grind",
+      "modeLabel": "Ask before each action",
+      "status": "waiting",
+      "progress": { "current": 5, "total": 10, "label": "cycles" },
+      "currentStep": { "label": "Activity cooldown", "status": "waiting" },
+      "nextStep": { "label": "Solve" },
+      "timeline": [
+        { "label": "Claim", "status": "completed", "active": false },
+        { "label": "Activity cooldown", "status": "waiting", "active": true },
+        { "label": "Solve", "status": "pending", "active": false }
+      ],
+      "guard": { "state": "elevated", "label": "Elevated", "reason": "A longer verified cooldown is active." },
+      "intervention": null,
+      "canPause": true,
+      "canResume": false,
+      "canStop": true
+    },
+    "paused": {
+      "title": "85x10 Grind",
+      "modeLabel": "Ask before each action",
+      "status": "paused",
+      "progress": { "current": 6, "total": 10, "label": "cycles" },
+      "currentStep": { "label": "Player pick", "status": "paused" },
+      "nextStep": { "label": "Route items" },
+      "timeline": [
+        { "label": "Open reward", "status": "completed", "active": false },
+        { "label": "Player pick", "status": "paused", "active": true },
+        { "label": "Route items", "status": "pending", "active": false }
+      ],
+      "guard": { "state": "paused", "label": "Paused", "reason": "A player pick has no unique safe choice." },
+      "intervention": {
+        "title": "Run paused",
+        "message": "A player pick has no unique safe choice. Nothing else was submitted."
+      },
+      "canPause": false,
+      "canResume": true,
+      "canStop": true
+    }
+  },
+  "hudStates": {
+    "running": {
+      "runStatus": "running",
+      "runName": "85x10 Grind",
+      "runModeLabel": "Ask before each action",
+      "iterations": 4,
+      "maxIterations": 10,
+      "pauseReason": null,
+      "error": null,
+      "timeline": [
+        { "type": "SOLVE_SBC", "status": "completed", "active": false },
+        { "type": "OPEN_REWARD_PACK", "status": "running", "active": true },
+        { "type": "RESOLVE_ITEMS", "status": "pending", "active": false }
+      ]
+    },
+    "paused": {
+      "runStatus": "paused",
+      "runName": "85x10 Grind",
+      "runModeLabel": "Ask before each action",
+      "iterations": 6,
+      "maxIterations": 10,
+      "pauseReason": "A player pick has no unique safe choice. Nothing else was submitted.",
+      "error": null,
+      "timeline": [
+        { "type": "OPEN_REWARD_PACK", "status": "completed", "active": false },
+        { "type": "HANDLE_PLAYER_PICK", "status": "paused", "active": true },
+        { "type": "RESOLVE_ITEMS", "status": "pending", "active": false }
+      ]
+    },
+    "intervention": {
+      "runStatus": "recovery_required",
+      "runName": "85x10 Grind",
+      "runModeLabel": "Ask before each action",
+      "iterations": 6,
+      "maxIterations": 10,
+      "pauseReason": "FUT Magic could not verify the last action. Review the EA screen before continuing.",
+      "error": null,
+      "timeline": [
+        { "type": "SUBMIT_SBC", "status": "unknown", "active": true },
+        { "type": "CLAIM_REWARD", "status": "pending", "active": false }
+      ]
+    }
+  }
+}

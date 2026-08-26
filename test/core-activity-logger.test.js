@@ -28,6 +28,18 @@ test("recursive redaction removes credentials without mutating caller data", () 
   assert.equal(input.auth.accessToken, "top-secret");
 });
 
+test("free-text activity fields redact common credential forms", () => {
+  const logger = new ActivityLogger({ clock: () => new Date(0) });
+  const entry = logger.error(
+    "Basic dXNlcjpwYXNz",
+    "cookie=session-value password=hunter2 x-ut-sid:abc123 ?code=oauth-code&safe=1",
+  );
+  const serialized = JSON.stringify(entry);
+  for (const secret of ["dXNlcjpwYXNz", "session-value", "hunter2", "abc123", "oauth-code"]) {
+    assert.equal(serialized.includes(secret), false, `${secret} leaked`);
+  }
+});
+
 test("activity logger retains a bounded, structured history", () => {
   let seconds = 0;
   const logger = new ActivityLogger({

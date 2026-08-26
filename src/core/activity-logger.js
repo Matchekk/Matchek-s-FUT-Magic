@@ -47,13 +47,18 @@ const isSecretKey = (key) => {
 const redactString = (value, maxLength = 4096) => {
   const redacted = value
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`)
+    .replace(/\bBasic\s+[A-Za-z0-9+/=]+/gi, `Basic ${REDACTED}`)
     .replace(
       /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g,
       REDACTED,
     )
     .replace(
-      /([?&](?:access_token|refresh_token|token|session_id|sid|api_key)=)[^&#\s]*/gi,
+      /([?&](?:access_token|refresh_token|id_token|token|session|session_id|sid|x-ut-sid|api_key|code|password|secret)=)[^&#\s]*/gi,
       `$1${encodeURIComponent(REDACTED)}`,
+    )
+    .replace(
+      /\b((?:access_token|refresh_token|id_token|token|session|session_id|sid|x-ut-sid|api_key|password|secret|cookie)\s*[:=]\s*)[^\s,;]+/gi,
+      `$1${REDACTED}`,
     );
   return redacted.length > maxLength
     ? `${redacted.slice(0, maxLength)}…${TRUNCATED}`

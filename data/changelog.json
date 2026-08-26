@@ -2,6 +2,35 @@
   "version": 1,
   "releases": [
     {
+      "version": "2.3.0",
+      "date": "2026-08-26",
+      "headline": "FUT Magic product shell and native Side Panel.",
+      "summary": "Introduced the FUT Magic brand, goal-first Side Panel, run HUD, strict presentation boundary and Advanced-only legacy access without changing stored user data or workflow safety.",
+      "details": [
+        "Added Home, Projects, Club and More views backed by bounded serializable runtime state.",
+        "Added a compact active-run HUD with progress, current/next step, Activity Guard state, pause, resume, stop and Side Panel access.",
+        "Added native protected SBC previews and a native Clear duplicates route that shows every approved Club/Storage move and never hides Organizer, submission, pack or quicksell actions.",
+        "Bound duplicate approval and execution to the exact full Unassigned set, action destinations, capabilities and expected residual items with fail-closed stale and recovery behavior.",
+        "Added a native read-only Card protection review with fresh hard-exclusion counts, distinct soft conservation signals, Target Project explanations and explicit unverified-evidence states.",
+        "Defined strict public Pro v1 contracts for token-free auth and entitlements, request-local handles, Project Optimization, Smart Route, local recipe metadata and downgrade-only compatibility without adding a live service or host permission.",
+        "Specified the future private Global Project Optimizer's deterministic model, service boundary, privacy/licensing gates and verification plan without placing private backend code in the GPL extension.",
+        "Added one deterministic local Router recommendation for the complete bounded Unassigned snapshot, with Activity Guard/evidence fail-closed behavior, strict identifier redaction and no new execution path.",
+        "Added a restrained suggestion-only Recommended next region while keeping the exact Clear duplicates batch approval authoritative; multi-step, Assisted and Auto routing remain future work.",
+        "Added exact FC27 strategy, streamlined-evidence, score-provider, runtime propagation and pre-execution boundaries while keeping the release observe-only and all unknown rules explicit.",
+        "Added a compact FC27 or unknown compatibility status that disables planning without changing the verified FC26 journey.",
+        "Added a deterministic proposal-only Evolution graph engine with explicit OVR/role Pareto tradeoffs, baseline separation, verified-only edges and fail-closed search bounds.",
+        "Added exact Evolution metadata request/evidence contracts with a shipped not-configured provider; no live catalog, price feed, activation or execution is claimed.",
+        "Hardened auth and entitlement freshness, made the not-configured cloud boundary uninjectionable, and kept every missing, erroneous, or future-dated provider state on the complete Free feature set.",
+        "Hard-disabled FUT.GG traffic, removed its host permission, restricted remote connections, purged legacy EA-origin metadata caches, and minimized local diagnostic exports.",
+        "Added visible source, license, privacy, third-party notice, and no-warranty context while keeping all Pro-labelled actions disabled and command-free.",
+        "Split release packaging into a root-manifest store candidate, wrapped corresponding source, and a hashed provenance record with package-time content and secret checks.",
+        "Added a canonical commercial-readiness matrix whose unresolved authorization, licensed-provider, operator, support, store-media, exact-source, and native-QA gates explicitly block publication; no publication or purchase occurred.",
+        "Kept existing GrindPilot storage keys and the proven local workflow/recovery engine intact.",
+        "Added the production FUT Magic deep-navy/cyan design system, original scalable brand assets, size-specific extension icons, restrained Pro violet, keyboard focus, contrast and reduced-preference support.",
+        "Added product-shell tests, screenshot review flows, canonical architecture/design/reliability/licensing documentation and release gates."
+      ]
+    },
+    {
       "version": "2.2.0",
       "date": "2026-08-25",
       "headline": "Production-ready grind workflows and fail-safe recovery.",

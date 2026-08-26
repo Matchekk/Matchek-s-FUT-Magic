@@ -4,6 +4,7 @@ dist/
 node_modules/
 .playwright-cli/
 .bug-hunter/
+output/
 solver/glpk.js
 solver/glpk.wasm
 .DS_Store

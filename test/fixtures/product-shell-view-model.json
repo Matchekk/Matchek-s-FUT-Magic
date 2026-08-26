@@ -1,0 +1,110 @@
+{
+  "protocolVersion": 1,
+  "revision": 12,
+  "observedAt": 1787745600000,
+  "brand": { "name": "FUT Magic", "paidName": "FUT Magic Pro", "plan": "free" },
+  "connection": { "state": "connected", "label": "EA connected" },
+  "context": {
+    "gameVersion": "fc26",
+    "setId": "set-marcelo",
+    "setName": "Marcelo",
+    "challengeId": "challenge-88",
+    "challengeName": "Marcelo · 88-Rated Squad",
+    "observedAt": 1787745600000
+  },
+  "compatibility": null,
+  "notice": null,
+  "run": null,
+  "projects": [
+    {
+      "id": "project-marcelo",
+      "name": "Marcelo",
+      "state": "active",
+      "completedSquads": 8,
+      "totalSquads": 18,
+      "progress": 0.4444444444,
+      "requiredSquadsRemaining": 10,
+      "remainingRatings": [
+        { "rating": 89, "needed": 1, "exactRatingInClub": 2 },
+        { "rating": 88, "needed": 2, "exactRatingInClub": 5 },
+        { "rating": 87, "needed": 3, "exactRatingInClub": 9 }
+      ],
+      "remainingSpecials": [{ "type": "totw", "needed": 1 }],
+      "protectionSummary": ["90+ hard protected", "Project reserves influence every solve"],
+      "source": "ea_import",
+      "unknownRequirementCount": 0,
+      "preview": null,
+      "planNotice": null,
+      "observedAt": 1787745600000
+    }
+  ],
+  "activeProject": {
+    "id": "project-marcelo",
+    "name": "Marcelo",
+    "state": "active",
+    "completedSquads": 8,
+    "totalSquads": 18,
+    "progress": 0.4444444444,
+    "requiredSquadsRemaining": 10,
+    "remainingRatings": [
+      { "rating": 89, "needed": 1, "exactRatingInClub": 2 },
+      { "rating": 88, "needed": 2, "exactRatingInClub": 5 },
+      { "rating": 87, "needed": 3, "exactRatingInClub": 9 }
+    ],
+    "remainingSpecials": [{ "type": "totw", "needed": 1 }],
+    "protectionSummary": ["90+ hard protected", "Project reserves influence every solve"],
+    "source": "ea_import",
+    "unknownRequirementCount": 0,
+    "preview": null,
+    "planNotice": null,
+    "observedAt": 1787745600000
+  },
+  "clubHealth": {
+    "observedAt": 1787745600000,
+    "available": true,
+    "clubCount": 1187,
+    "unassignedCount": 3,
+    "duplicateGroupCount": 4,
+    "storage": { "used": 86, "capacity": 100, "free": 14 },
+    "ratingBands": [
+      { "label": "90+ cards", "club": 7, "storage": 2 },
+      { "label": "87–89 cards", "club": 18, "storage": 6 },
+      { "label": "85–86 cards", "club": 34, "storage": 12 }
+    ],
+    "protectedCount": 14
+  },
+  "duplicateRoute": null,
+  "routerRecommendation": null,
+  "protection": {
+    "status": "idle",
+    "observedAt": null,
+    "verificationMessage": "Review current protection to see its effect.",
+    "uniqueHardProtectedCount": null,
+    "analyzedItemCount": null,
+    "reasonGroups": [],
+    "ratingReserves": [],
+    "specialReserves": [],
+    "projectSignals": [],
+    "preferences": [],
+    "evidenceWarnings": [],
+    "advancedActive": true
+  },
+  "actions": [
+    { "id": "complete-sbc", "label": "Complete an SBC", "description": "Continue Marcelo · 88-Rated Squad", "enabled": true, "command": { "type": "PREVIEW_SBC_PROJECT", "projectId": "project-marcelo" }, "plan": "free" },
+    { "id": "grind-upgrades", "label": "Grind upgrades", "description": "Build a bounded local recipe", "enabled": true, "command": { "type": "OPEN_LEGACY_UI", "section": "Workflows" }, "plan": "free" },
+    { "id": "clear-duplicates", "label": "Clear duplicates", "description": "3 items need attention", "enabled": true, "command": { "type": "PREVIEW_CLEAR_DUPLICATES" }, "plan": "free" },
+    { "id": "protect-cards", "label": "Protect my cards", "description": "Review exclusions and local squad preferences", "enabled": true, "command": { "type": "PREVIEW_FODDER_REVIEW" }, "plan": "free" },
+    { "id": "plan-evolution", "label": "Plan an Evolution", "description": "Live Evolution data is not available in this build", "enabled": false, "disabledReason": "Live Evolution data is not available in this build", "command": null, "plan": "pro" },
+    { "id": "optimize-club", "label": "Optimize my club", "description": "Club-wide planning is coming later", "enabled": false, "disabledReason": "Club optimization is not implemented yet", "command": null, "plan": "pro" }
+  ],
+  "legacyAvailable": true,
+  "legal": {
+    "disclaimer": "Unofficial. Not affiliated with or endorsed by Electronic Arts.",
+    "license": "GPL-3.0-only",
+    "sourceUrl": "https://github.com/Matchekk/Matchek-s-FUT-Magic",
+    "licenseUrl": "../LICENSE",
+    "privacyUrl": "../PRIVACY.md",
+    "noticesUrl": "../THIRD_PARTY_NOTICES.md",
+    "warranty": "No warranty. Redistribution and modification are permitted under GPLv3."
+  }
+}

@@ -1,6 +1,6 @@
 # Third-party notices
 
-GrindPilot FC26 is a modified derivative of AutoPilot-SBC. The complete work
+FUT Magic, formerly GrindPilot FC26, is a modified derivative of AutoPilot-SBC. The complete work
 is licensed under GPL-3.0-only; see `LICENSE`. Changes are documented by date
 in `CHANGELOG.md`. Corresponding source is available at
 https://github.com/Matchekk/Matchek-s-FUT-Magic.
@@ -46,4 +46,10 @@ SOFTWARE.
 
 The reviewed AutoPilot snapshot included unused `glpk.js` and `glpk.wasm`
 artifacts without corresponding build sources in that repository. They and all
-other opaque solver binaries are intentionally excluded from GrindPilot.
+other opaque solver binaries are intentionally excluded from FUT Magic.
+
+## Bundled UI dependency
+
+The FUT Magic Side Panel bundles Preact (MIT), Copyright (c) 2015-present
+Jason Miller. Its MIT permission and warranty text is shipped alongside the
+bundle in `LICENSES/PREACT.txt`.

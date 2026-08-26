@@ -1597,41 +1597,12 @@
   const loadLeagueMetaCache = () => {
     if (leagueMetaLoaded) return;
     leagueMetaLoaded = true;
-    let parsed = null;
     try {
-      const raw = window?.localStorage?.getItem?.(LEAGUE_META_STORAGE_KEY);
-      if (raw) parsed = JSON.parse(raw);
+      window?.localStorage?.removeItem?.(LEAGUE_META_STORAGE_KEY);
     } catch {}
-    if (!parsed || typeof parsed !== "object") return;
-    for (const [idRaw, value] of Object.entries(parsed)) {
-      const id = normalizeLeagueId(idRaw);
-      if (!id || !value || typeof value !== "object") continue;
-      const name = sanitizeDisplayText(value?.name) ?? null;
-      leagueMetaCache.set(id, { name });
-    }
   };
 
-  const persistLeagueMetaCache = () => {
-    if (!leagueMetaLoaded) return;
-    try {
-      const entries = Array.from(leagueMetaCache.entries());
-      const limited =
-        entries.length > LEAGUE_META_STORAGE_LIMIT
-          ? entries.slice(entries.length - LEAGUE_META_STORAGE_LIMIT)
-          : entries;
-      const out = {};
-      for (const [id, meta] of limited) {
-        if (!id || !meta || typeof meta !== "object") continue;
-        out[id] = {
-          name: sanitizeDisplayText(meta?.name) ?? null,
-        };
-      }
-      window?.localStorage?.setItem?.(
-        LEAGUE_META_STORAGE_KEY,
-        JSON.stringify(out),
-      );
-    } catch {}
-  };
+  const persistLeagueMetaCache = () => {};
 
   const schedulePersistLeagueMetaCache = () => {
     if (!leagueMetaLoaded) return;
@@ -1690,41 +1661,12 @@
   const loadNationMetaCache = () => {
     if (nationMetaLoaded) return;
     nationMetaLoaded = true;
-    let parsed = null;
     try {
-      const raw = window?.localStorage?.getItem?.(NATION_META_STORAGE_KEY);
-      if (raw) parsed = JSON.parse(raw);
+      window?.localStorage?.removeItem?.(NATION_META_STORAGE_KEY);
     } catch {}
-    if (!parsed || typeof parsed !== "object") return;
-    for (const [idRaw, value] of Object.entries(parsed)) {
-      const id = normalizeNationId(idRaw);
-      if (!id || !value || typeof value !== "object") continue;
-      const name = sanitizeDisplayText(value?.name) ?? null;
-      nationMetaCache.set(id, { name });
-    }
   };
 
-  const persistNationMetaCache = () => {
-    if (!nationMetaLoaded) return;
-    try {
-      const entries = Array.from(nationMetaCache.entries());
-      const limited =
-        entries.length > NATION_META_STORAGE_LIMIT
-          ? entries.slice(entries.length - NATION_META_STORAGE_LIMIT)
-          : entries;
-      const out = {};
-      for (const [id, meta] of limited) {
-        if (!id || !meta || typeof meta !== "object") continue;
-        out[id] = {
-          name: sanitizeDisplayText(meta?.name) ?? null,
-        };
-      }
-      window?.localStorage?.setItem?.(
-        NATION_META_STORAGE_KEY,
-        JSON.stringify(out),
-      );
-    } catch {}
-  };
+  const persistNationMetaCache = () => {};
 
   const schedulePersistNationMetaCache = () => {
     if (!nationMetaLoaded) return;
@@ -1783,47 +1725,12 @@
   const loadExcludedPlayerMetaCache = () => {
     if (excludedPlayerMetaLoaded) return;
     excludedPlayerMetaLoaded = true;
-    let parsed = null;
     try {
-      const raw = window?.localStorage?.getItem?.(
-        EXCLUDED_PLAYER_META_STORAGE_KEY,
-      );
-      if (raw) parsed = JSON.parse(raw);
+      window?.localStorage?.removeItem?.(EXCLUDED_PLAYER_META_STORAGE_KEY);
     } catch {}
-    if (!parsed || typeof parsed !== "object") return;
-    for (const [idRaw, value] of Object.entries(parsed)) {
-      const id = idRaw == null ? null : String(idRaw).trim();
-      if (!id || !value || typeof value !== "object") continue;
-      const name = sanitizeDisplayText(value?.name);
-      const rating = normalizeRatingValue(value?.rating);
-      const rarityName = sanitizeDisplayText(value?.rarityName);
-      excludedPlayerMetaCache.set(id, { name, rating, rarityName });
-    }
   };
 
-  const persistExcludedPlayerMetaCache = () => {
-    if (!excludedPlayerMetaLoaded) return;
-    try {
-      const entries = Array.from(excludedPlayerMetaCache.entries());
-      const limited =
-        entries.length > EXCLUDED_PLAYER_META_STORAGE_LIMIT
-          ? entries.slice(entries.length - EXCLUDED_PLAYER_META_STORAGE_LIMIT)
-          : entries;
-      const out = {};
-      for (const [id, meta] of limited) {
-        if (!id || !meta || typeof meta !== "object") continue;
-        out[id] = {
-          name: sanitizeDisplayText(meta?.name) ?? null,
-          rating: normalizeRatingValue(meta?.rating),
-          rarityName: sanitizeDisplayText(meta?.rarityName) ?? null,
-        };
-      }
-      window?.localStorage?.setItem?.(
-        EXCLUDED_PLAYER_META_STORAGE_KEY,
-        JSON.stringify(out),
-      );
-    } catch {}
-  };
+  const persistExcludedPlayerMetaCache = () => {};
 
   const schedulePersistExcludedPlayerMetaCache = () => {
     if (!excludedPlayerMetaLoaded) return;
@@ -5739,7 +5646,8 @@
   const PREF_CACHE_TTL_MS = 10 * 1000;
   const CHANGELOG_DATA_PATH = "data/changelog.json";
   const BRIDGE_STYLESHEET_PATH = "page/ea-data-bridge.css";
-  const EA_DATA_SUPPORT_URL = "https://ko-fi.com/P5P5YOUU7";
+  const EA_DATA_SUPPORT_URL =
+    "https://github.com/Matchekk/Matchek-s-FUT-Magic";
   const EA_DATA_TOPBAR_SUPPORT_WRAP_CLASS = "ea-data-topbar-support-wrap";
   const EA_DATA_TOPBAR_SUPPORT_BUTTON_CLASS = "ea-data-topbar-support-btn";
   const EA_DATA_TOPBAR_SUPPORT_SELECTOR = `.${EA_DATA_TOPBAR_SUPPORT_WRAP_CLASS}`;
@@ -5747,7 +5655,7 @@
   const EA_DATA_TOPBAR_SUPPORT_TOOLTIP_ID = "ea-data-topbar-support-tip";
   const EA_DATA_TOPBAR_SUPPORT_TOOLTIP_VISIBLE_CLASS = "is-visible";
   const EA_DATA_TOPBAR_SUPPORT_TOOLTIP_TEXT =
-    "If you're enjoying AutopilotSBC, supporting the project helps me keep improving it and keep offering it for completely free!";
+    "View FUT Magic source code, license, notices, and release documentation.";
   const EA_DATA_TOPBAR_SUPPORT_HOVER_DELAY_MS = 650;
   const EA_DATA_TOPBAR_SUPPORT_FOCUS_DELAY_MS = 350;
   let preferencesCache = null; // { at: number, value: object }
@@ -29895,8 +29803,8 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = EA_DATA_TOPBAR_SUPPORT_BUTTON_CLASS;
-    button.textContent = "Support My Work";
-    button.setAttribute("aria-label", "Support AutopilotSBC on Ko-fi");
+    button.textContent = "FUT Magic source";
+    button.setAttribute("aria-label", "View FUT Magic source and license");
     button.setAttribute("aria-describedby", EA_DATA_TOPBAR_SUPPORT_TOOLTIP_ID);
     button.addEventListener("pointerenter", () => {
       scheduleTopbarSupportTooltip(
@@ -30414,6 +30322,8 @@
       }
       return false;
     };
+    const hasItemBooleanEvidence = (...keys) => keys.some((key) =>
+      typeof item?.[key] === "function" || typeof item?.[key] === "boolean");
     const isDuplicate =
       Boolean(duplicateDefIds?.has(item.definitionId)) &&
       !isStorage &&
@@ -30434,13 +30344,25 @@
           ? Boolean(item.isTradeable())
           : Boolean(item.isTradeable),
       isUntradeable,
+      hasTradabilityEvidence:
+        typeof item.isTradeable === "function" ||
+        typeof item.isTradeable === "boolean" ||
+        typeof item.isTradable === "boolean" ||
+        typeof item.isUntradeable === "boolean",
       isStorage,
       isUnassigned,
       isMovable: readItemBoolean("isMovable"),
       isStorable: readItemBoolean("isStorable"),
+      hasMovableEvidence: hasItemBooleanEvidence("isMovable"),
+      hasStorableEvidence: hasItemBooleanEvidence("isStorable"),
       isLocked: readItemBoolean("isLocked", "locked"),
+      hasLockedEvidence: hasItemBooleanEvidence("isLocked", "locked"),
+      isProtected: readItemBoolean("isProtected"),
+      hasProtectedEvidence: hasItemBooleanEvidence("isProtected"),
       isFavorite: readItemBoolean("isFavorite", "isFavourite", "favorite"),
+      hasFavoriteEvidence: hasItemBooleanEvidence("isFavorite", "isFavourite", "favorite"),
       isInStartingSquad: readItemBoolean("isInStartingSquad", "isInActive11"),
+      hasStartingSquadEvidence: hasItemBooleanEvidence("isInStartingSquad", "isInActive11"),
       hasStorageDuplicate: false,
       hasClubDuplicate: false,
       isDuplicate,
@@ -30459,6 +30381,10 @@
       groups: Array.isArray(item.groups) ? item.groups.slice() : [],
       cardType: rarityName,
       isSpecial,
+      hasSpecialEvidence:
+        typeof item.isSpecial === "function" ||
+        typeof item.isSpecial === "boolean" ||
+        rarityId != null,
       isTotw,
       isEvolution,
       preferredPositionId,
@@ -30700,6 +30626,9 @@
   });
 
   const grindPilotContext = () => ({
+    // This legacy FC26 bridge contract is intentionally versionless. The
+    // isolated adapter owns the one documented compatibility mapping; newer
+    // bridges must supply explicit version evidence instead.
     setId: currentSbcSet?.id ?? currentChallenge?.setId ?? null,
     setName: currentSbcSet?.name ?? currentSbcSet?.title ?? null,
     challengeId: currentChallenge?.id ?? null,
@@ -31438,8 +31367,32 @@
     storageCapacity = 100,
     expectedActions = null,
     allowPartial = false,
+    expectedUnassignedItemIdsBefore = null,
+    expectedRemainingItemIdsAfter = null,
   } = {}) => {
     const items = await getUnassignedItems({ refresh: true, failClosed: true });
+    const itemIdentifier = (item) => String(item?.id ?? item?.itemId ?? "");
+    const sortedIds = (values) => (values || []).map(String).filter(Boolean).sort();
+    const observedUnassignedItemIdsBefore = sortedIds(items.map(itemIdentifier));
+    if (Array.isArray(expectedUnassignedItemIdsBefore)) {
+      const approvedUnassignedItemIdsBefore = sortedIds(expectedUnassignedItemIdsBefore);
+      if (
+        observedUnassignedItemIdsBefore.length !== approvedUnassignedItemIdsBefore.length ||
+        observedUnassignedItemIdsBefore.some(
+          (id, index) => id !== approvedUnassignedItemIdsBefore[index],
+        )
+      ) {
+        return grindPilotResult(
+          "not_applied",
+          null,
+          "The complete Unassigned set changed before any approved move",
+          {
+            expectedUnassignedItemIdsBefore: approvedUnassignedItemIdsBefore,
+            observedUnassignedItemIdsBefore,
+          },
+        );
+      }
+    }
     const storage = await getStorageItems();
     const effectiveStorageCapacity = Math.min(100, Math.max(0, Math.trunc(Number(storageCapacity) || 0)));
     const freeStorage = Math.max(0, effectiveStorageCapacity - storage.length);
@@ -31462,11 +31415,11 @@
     if (Array.isArray(expectedActions)) {
       const observedActions = [
         ...toClub.map((item) => ({
-          itemId: String(item?.id ?? ""),
+          itemId: itemIdentifier(item),
           type: "SEND_TO_CLUB",
         })),
         ...toStorage.map((item) => ({
-          itemId: String(item?.id ?? ""),
+          itemId: itemIdentifier(item),
           type: "MOVE_TO_SBC_STORAGE",
         })),
       ].sort((left, right) =>
@@ -31507,10 +31460,10 @@
           approvedActions.map((action) => `${action.itemId}:${action.type}`),
         );
         toClub = toClub.filter((item) =>
-          approvedKeys.has(`${String(item?.id ?? "")}:SEND_TO_CLUB`),
+          approvedKeys.has(`${itemIdentifier(item)}:SEND_TO_CLUB`),
         );
         toStorage = toStorage.filter((item) =>
-          approvedKeys.has(`${String(item?.id ?? "")}:MOVE_TO_SBC_STORAGE`),
+          approvedKeys.has(`${itemIdentifier(item)}:MOVE_TO_SBC_STORAGE`),
         );
       }
     }
@@ -31527,10 +31480,10 @@
     const clubIds = new Set(clubAfter.map((item) => String(item?.id ?? "")));
     const storageIds = new Set(storageAfter.map((item) => String(item?.id ?? "")));
     const missingClubIds = toClub
-      .map((item) => String(item.id))
+      .map(itemIdentifier)
       .filter((id) => !clubIds.has(id));
     const missingStorageIds = toStorage
-      .map((item) => String(item.id))
+      .map(itemIdentifier)
       .filter((id) => !storageIds.has(id));
     if (missingClubIds.length || missingStorageIds.length) {
       return grindPilotResult(
@@ -31540,10 +31493,30 @@
         { missingClubIds, missingStorageIds },
       );
     }
+    const observedRemainingItemIdsAfter = sortedIds(remaining.map(itemIdentifier));
+    if (Array.isArray(expectedRemainingItemIdsAfter)) {
+      const approvedRemainingItemIdsAfter = sortedIds(expectedRemainingItemIdsAfter);
+      if (
+        observedRemainingItemIdsAfter.length !== approvedRemainingItemIdsAfter.length ||
+        observedRemainingItemIdsAfter.some(
+          (id, index) => id !== approvedRemainingItemIdsAfter[index],
+        )
+      ) {
+        return grindPilotResult(
+          "ambiguous",
+          null,
+          "Approved moves completed but the exact remaining Unassigned set could not be verified",
+          {
+            expectedRemainingItemIdsAfter: approvedRemainingItemIdsAfter,
+            observedRemainingItemIdsAfter,
+          },
+        );
+      }
+    }
     return grindPilotResult("verified", {
-      movedToClub: toClub.map((item) => String(item.id)),
-      movedToStorage: toStorage.map((item) => String(item.id)),
-      unresolvedItemIds: remaining.map((item) => String(item.id)),
+      movedToClub: toClub.map(itemIdentifier),
+      movedToStorage: toStorage.map(itemIdentifier),
+      unresolvedItemIds: remaining.map(itemIdentifier),
       unresolvedUnassigned: remaining.length,
       storageUsed: storageAfter.length,
       storageCapacity: effectiveStorageCapacity,

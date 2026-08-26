@@ -1,5 +1,32 @@
 import { ActivityLogger } from "./core/activity-logger.js";
 import { exportRunAnalytics, summarizeRunAnalytics } from "./analytics/run-analytics.js";
+import {
+  buildDuplicateRouteFingerprints,
+  buildFodderReview,
+  buildRuntimeCapabilityRegistry,
+  buildSbcPlanFingerprints,
+  canonicalDuplicateRouteActions,
+  compareDuplicateRouteFingerprints,
+  compareSbcPlanFingerprints,
+  createGameContext,
+  createGoal,
+  EntitlementService,
+  GameVersion,
+  normalizeGameVersion,
+  GoalKind,
+  FODDER_REVIEW_CAPABILITIES,
+  PlanCompiler,
+  ProductPlan,
+  projectChallengeForContext,
+  recommendRouterNextAction,
+  RouterActivityGuardState,
+  DUPLICATE_ROUTE_MOVE_CAPABILITIES,
+  DUPLICATE_ROUTE_POLICY,
+  DUPLICATE_ROUTE_READ_CAPABILITIES,
+  SBC_PREVIEW_CAPABILITIES,
+  summarizeDuplicateRoute,
+  summarizeSbcSolution,
+} from "./application/index.js";
 import { createDeveloperMode } from "./dev/debug-mode.js";
 import { ControllerAdapter } from "./ea/controller-adapter.js";
 import { PageStorageArea } from "./ea/page-storage-area.js";
@@ -12,8 +39,10 @@ import { FodderPolicy } from "./policies/fodder-policy.js";
 import { TargetProjectService } from "./policies/target-project-service.js";
 import { ChromeStorageProfileRepository } from "./profiles/profile-repository.js";
 import { ProfileService } from "./profiles/profile-service.js";
+import { buildProductShellViewModel } from "./presentation/product-shell-view-model.js";
 import { GrindPanel } from "./ui/grind-panel.js";
 import { EaSurfaceActions } from "./ui/ea-surface-actions.js";
+import { RunHud } from "./ui/run-hud.js";
 import {
   createAutoApproval,
   addWorkflowStep,
@@ -137,6 +166,9 @@ class GrindPilotRuntime {
     this.drivePromise = null;
     this.inventoryRefreshPromise = null;
     this.inventoryAvailable = false;
+    this.sbcPlanCache = new Map();
+    this.duplicateRoutePlanCache = new Map();
+    this.duplicateRouteApprovalInFlight = false;
     this.wakeTimer = null;
     this.config = this.defaultConfig();
     this.state = {
@@ -153,6 +185,16 @@ class GrindPilotRuntime {
       timeline: [],
       capabilityHealth: [],
       analytics: summarizeRunAnalytics(null),
+      currentContext: null, contextObservedAt: null, inventoryAvailable: false,
+      gameVersion: GameVersion.UNKNOWN,
+      gameVersionObservation: "unverified",
+      gameVersionSource: "none",
+      runName: null, runModeLabel: null, productRevision: 0,
+      legacyPanelOpen: false,
+      sbcPlanPreviews: {}, sbcPlanNotices: {},
+      duplicateRoutePlan: null, duplicateRouteNotice: null,
+      routerRecommendation: null, routerRecommendationNotice: null,
+      fodderReviewPlan: null,
       pauseReason: null, error: null,
     };
     this.inventoryFacade = {
@@ -191,8 +233,136 @@ class GrindPilotRuntime {
       runLimits: { maxIterations: 1 }, stopConditions: [] };
   }
 
+  createFodderPolicy() {
+    return new FodderPolicy({
+      protectRatingAtOrAbove: this.config.protectRatingAtOrAbove,
+      protectedCardTypes: this.config.protectedCardTypes,
+      allowedSpecialTypes: this.config.allowedSpecialTypes,
+      protectedItemIds: this.config.protectedItemIds || [],
+      protectedPlayerIds: this.config.protectedPlayerIds || [],
+      protectedResourceIds: this.config.protectedResourceIds || [],
+      protectedRatings: this.config.protectedRatings || [],
+      protectStartingSquad: this.config.protectStartingSquad === true,
+      protectFavorites: this.config.protectFavorites === true,
+      protectTradables: this.config.protectTradables === true,
+      preferUntradeables: this.config.preferUntradeables !== false,
+      preferDuplicates: this.config.preferDuplicates !== false,
+      preferSbcStorage: this.config.preferSbcStorage !== false,
+      minimumReserveByRating: this.config.minimumReserveByRating || {},
+      specialReserveByCardType: this.config.specialReserveByCardType || {},
+    }, { targetProjects: this.targets });
+  }
+
   domainLogger() {
     return { info: (action, data) => this.logger.info(action, action, data), warn: (action, data) => this.logger.warn(action, action, data) };
+  }
+
+  invalidateRouterRecommendation(message = null) {
+    const hadRecommendation = Boolean(this.state.routerRecommendation);
+    this.state.routerRecommendation = null;
+    if (hadRecommendation && message) {
+      this.state.routerRecommendationNotice = String(message);
+    }
+  }
+
+  invalidateDuplicateRoutePreview(message = null) {
+    const hadPreview = Boolean(this.state.duplicateRoutePlan);
+    this.duplicateRoutePlanCache?.clear?.();
+    this.state.duplicateRoutePlan = null;
+    if (hadPreview && message) {
+      this.state.duplicateRouteNotice = String(message);
+    }
+  }
+
+  invalidateGameSemanticPlans(message = null) {
+    const hadSbcPreviews = this.sbcPlanCache.size > 0 ||
+      Object.keys(this.state.sbcPlanPreviews || {}).length > 0;
+    this.sbcPlanCache.clear();
+    this.state.sbcPlanPreviews = {};
+    if (hadSbcPreviews && message) {
+      this.state.sbcPlanNotices = Object.fromEntries(
+        Object.keys(this.state.sbcPlanNotices || {}).map((key) => [key, String(message)]),
+      );
+    }
+    this.state.fodderReviewPlan = null;
+    this.invalidateDuplicateRoutePreview(message);
+    this.invalidateRouterRecommendation(message);
+  }
+
+  async refreshGameContext() {
+    const previous = this.state.currentContext || null;
+    let observed = null;
+    try {
+      const raw = await this.adapter.getContext();
+      let gameVersion = GameVersion.UNKNOWN;
+      try { gameVersion = normalizeGameVersion(raw?.gameVersion); } catch {}
+      observed = {
+        route: raw?.route == null ? null : String(raw.route),
+        setId: raw?.setId == null ? null : String(raw.setId),
+        setName: raw?.setName == null ? null : String(raw.setName),
+        challengeId: raw?.challengeId == null ? null : String(raw.challengeId),
+        challengeName: raw?.challengeName == null ? null : String(raw.challengeName),
+        challengeKind: raw?.challengeKind == null ? null : String(raw.challengeKind),
+        gameVersion,
+        gameVersionObservation: ["observed", "compatibility_default"].includes(raw?.gameVersionObservation)
+          ? raw.gameVersionObservation
+          : (gameVersion === GameVersion.UNKNOWN ? "unverified" : "observed"),
+        gameVersionSource: raw?.gameVersionSource == null ? "none" : String(raw.gameVersionSource),
+      };
+    } catch {
+      observed = {
+        gameVersion: GameVersion.UNKNOWN,
+        gameVersionObservation: "unverified",
+        gameVersionSource: "none",
+      };
+    }
+    this.state.currentContext = observed;
+    this.state.gameVersion = observed.gameVersion;
+    this.state.gameVersionObservation = observed.gameVersionObservation;
+    this.state.gameVersionSource = observed.gameVersionSource;
+    this.state.contextObservedAt = Date.now();
+    const beforeKey = previous && JSON.stringify([
+      previous.gameVersion,
+      previous.gameVersionObservation,
+      previous.gameVersionSource,
+      previous.challengeKind,
+      previous.setId,
+      previous.challengeId,
+    ]);
+    const afterKey = JSON.stringify([
+      observed.gameVersion,
+      observed.gameVersionObservation,
+      observed.gameVersionSource,
+      observed.challengeKind,
+      observed.setId,
+      observed.challengeId,
+    ]);
+    if (beforeKey && beforeKey !== afterKey) {
+      this.invalidateGameSemanticPlans(
+        "The observed EA game context changed. Preview again before approving anything.",
+      );
+    }
+    return this.currentGameContext();
+  }
+
+  currentRouterActivityGuard() {
+    const run = this.engine?.getSnapshot?.();
+    if (!run || [RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(run.status)) {
+      return {
+        state: RouterActivityGuardState.IDLE,
+        evidence: { runStatus: run?.status || "idle" },
+      };
+    }
+    if (Object.values(RunStatus).includes(run.status)) {
+      return {
+        state: RouterActivityGuardState.NON_IDLE,
+        evidence: { runStatus: run.status, currentStep: run.nodes?.[run.cursor]?.step?.type || null },
+      };
+    }
+    return {
+      state: RouterActivityGuardState.UNKNOWN,
+      evidence: { runStatus: String(run.status || "unknown") },
+    };
   }
 
   async initialize() {
@@ -210,6 +380,7 @@ class GrindPilotRuntime {
     if (this.enableUi) {
       this.panel = new GrindPanel(this);
       this.surfaceActions = new EaSurfaceActions(this);
+      this.runHud = new RunHud(this);
     }
     this.emit();
   }
@@ -244,7 +415,11 @@ class GrindPilotRuntime {
           const context = await this.adapter.getContext();
           if (
             target.kind === "SPECIFIC_CHALLENGE" &&
-            String(context?.challengeId ?? "") !== String(target.challengeId ?? "")
+            (
+              String(context?.challengeId ?? "") !== String(target.challengeId ?? "") ||
+              (target.setId != null &&
+                String(context?.setId ?? "") !== String(target.setId ?? ""))
+            )
           ) {
             return {
               status: "paused",
@@ -265,20 +440,7 @@ class GrindPilotRuntime {
             };
           }
           await this.refreshInventory();
-          const policy = new FodderPolicy({
-            protectRatingAtOrAbove: this.config.protectRatingAtOrAbove,
-            protectedCardTypes: this.config.protectedCardTypes,
-            protectedItemIds: this.config.protectedItemIds || [],
-            protectedPlayerIds: this.config.protectedPlayerIds || [],
-            protectedResourceIds: this.config.protectedResourceIds || [],
-            protectStartingSquad: this.config.protectStartingSquad === true,
-            protectFavorites: this.config.protectFavorites === true,
-            protectTradables: this.config.protectTradables === true,
-            preferUntradeables: this.config.preferUntradeables !== false,
-            preferDuplicates: this.config.preferDuplicates !== false,
-            preferSbcStorage: this.config.preferSbcStorage !== false,
-            minimumReserveByRating: this.config.minimumReserveByRating || {},
-          }, { targetProjects: this.targets });
+          const policy = this.createFodderPolicy();
           const inventoryItems = this.inventory.getSnapshot().items;
           const analysis = policy.analyze(inventoryItems);
           this.currentProtectedItemIds = analysis.protectedItemIds;
@@ -299,6 +461,18 @@ class GrindPilotRuntime {
               ...(step?.config?.solverSettings || {}),
             },
           });
+          if (
+            target.kind === "SPECIFIC_CHALLENGE" &&
+            (
+              String(solved?.challengeId ?? "") !== String(target.challengeId ?? "") ||
+              (target.setId != null &&
+                String(solved?.setId ?? "") !== String(target.setId ?? ""))
+            )
+          ) {
+            const error = new Error("The solved squad no longer matches the approved SBC challenge");
+            error.code = "SBC_TARGET_CHANGED_DURING_SOLVE";
+            throw error;
+          }
           const explanation = policy.explainSelection(
             solved.solutionIds,
             inventoryItems,
@@ -307,6 +481,17 @@ class GrindPilotRuntime {
           const selectedItems = inventoryItems
             .filter((item) => selectedIds.has(String(item.itemId)))
             .map((item) => ({ itemId: item.itemId, rating: item.rating }));
+          const protectedIds = new Set(analysis.protectedItemIds.map(String));
+          if ([...selectedIds].some((id) => protectedIds.has(id))) {
+            const error = new Error("The solved squad contains a protected card");
+            error.code = "PROTECTED_ITEM_SELECTED";
+            throw error;
+          }
+          if (selectedIds.size !== 11 || selectedItems.length !== 11) {
+            const error = new Error("The solved squad is not a verified 11-card Club selection");
+            error.code = "SOLUTION_ITEMS_UNOBSERVED";
+            throw error;
+          }
           this.state.protectedCardsSaved = analysis.protectedItemIds.length;
           this.state.solveDetails = explanation;
           this.logger.info("Solve", "Verified squad solution", {
@@ -502,27 +687,81 @@ class GrindPilotRuntime {
       },
       [WorkflowStepType.RESOLVE_ITEMS]: {
         prepare: async ({ step }) => {
-          await this.refreshInventory();
-          const plan = this.inventory.planUnassignedResolution({
-            preferSbcStorage: this.config.preferSbcStorage !== false,
-            tradableWhenStorageUnavailable: "SAFE_HOLD",
-            untradeableWhenStorageUnavailable: "PAUSE",
-          });
+          const approvedBoundary = Array.isArray(step?.config?.approvedRouteActions);
+          if (approvedBoundary) await this.refreshStatus();
+          else await this.refreshInventory();
+          const resolutionPolicy = approvedBoundary
+            ? { ...step.config.resolutionPolicy }
+            : {
+                preferSbcStorage: this.config.preferSbcStorage !== false,
+                tradableWhenStorageUnavailable: "SAFE_HOLD",
+                untradeableWhenStorageUnavailable: "PAUSE",
+              };
+          const plan = this.inventory.planUnassignedResolution(resolutionPolicy);
+          const currentRouteActions = canonicalDuplicateRouteActions(plan.actions);
+          const currentUnassignedItemIds = this.inventory
+            .getSnapshot().unassigned.items.map((item) => String(item.itemId)).sort();
+          if (approvedBoundary) {
+            const capabilities = buildRuntimeCapabilityRegistry(this.state.capabilityHealth)
+              .require([
+                ...DUPLICATE_ROUTE_READ_CAPABILITIES,
+                ...DUPLICATE_ROUTE_MOVE_CAPABILITIES,
+              ]);
+            if (!capabilities.ok) {
+              const error = new Error(
+                "A required EA item-move capability changed after approval",
+              );
+              error.code = "DUPLICATE_CAPABILITY_CHANGED";
+              error.notApplied = true;
+              error.safeToRetry = false;
+              throw error;
+            }
+            const approvedRouteActions = canonicalDuplicateRouteActions(
+              step.config.approvedRouteActions,
+            );
+            const expectedUnassignedItemIdsBefore = [
+              ...(step.config.expectedUnassignedItemIdsBefore || []),
+            ].map(String).sort();
+            if (JSON.stringify(currentRouteActions) !== JSON.stringify(approvedRouteActions) ||
+                JSON.stringify(currentUnassignedItemIds) !==
+                  JSON.stringify(expectedUnassignedItemIdsBefore)) {
+              const error = new Error(
+                "Unassigned items or their safe destinations changed after approval",
+              );
+              error.code = "DUPLICATE_PLAN_STALE";
+              error.notApplied = true;
+              error.safeToRetry = false;
+              throw error;
+            }
+          }
           const allowPartial = step?.config?.allowPartial === true;
-          const expectedActions = allowPartial
-            ? plan.actions.filter((action) =>
+          const expectedActions = approvedBoundary
+            ? canonicalDuplicateRouteActions(step.config.approvedActions || [])
+            : allowPartial
+              ? plan.actions.filter((action) =>
                 ["SEND_TO_CLUB", "MOVE_TO_SBC_STORAGE"].includes(action.type),
               )
-            : plan.actions;
+              : plan.actions;
           return {
             plan,
             expectedActions,
             allowPartial,
             allowUnresolved: step?.config?.allowUnresolved === true,
+            approvedBoundary,
+            expectedUnassignedItemIdsBefore: approvedBoundary
+              ? [...step.config.expectedUnassignedItemIdsBefore]
+              : null,
+            expectedRemainingItemIdsAfter: approvedBoundary
+              ? [...step.config.expectedRemainingItemIdsAfter]
+              : null,
+            actionSetFingerprint: approvedBoundary
+              ? String(step.config.actionSetFingerprint || "")
+              : null,
           };
         },
         execute: async ({ intent }) => {
-          if (intent?.plan?.requiresUserAction && !intent?.allowPartial) {
+          if (intent?.plan?.requiresUserAction && !intent?.allowPartial &&
+              !intent?.approvedBoundary) {
             return {
               status: "paused",
               code: "UNASSIGNED_USER_ACTION_REQUIRED",
@@ -534,6 +773,9 @@ class GrindPilotRuntime {
             storageCapacity: this.state.storageCapacity,
             expectedActions: intent.expectedActions,
             allowPartial: intent.allowPartial === true,
+            expectedUnassignedItemIdsBefore: intent.expectedUnassignedItemIdsBefore,
+            expectedRemainingItemIdsAfter: intent.expectedRemainingItemIdsAfter,
+            actionSetFingerprint: intent.actionSetFingerprint,
           });
           await this.refreshInventory();
           if (result.unresolvedUnassigned > 0 && !intent?.allowUnresolved) {
@@ -566,12 +808,38 @@ class GrindPilotRuntime {
               byLocation.unassigned.has(String(action.itemId)),
             ).length;
             if (atDestination === actions.length) {
+              if (Array.isArray(intent.expectedRemainingItemIdsAfter)) {
+                const expectedRemaining = new Set(
+                  intent.expectedRemainingItemIdsAfter.map(String),
+                );
+                if (!sameStringSet(byLocation.unassigned, expectedRemaining)) {
+                  return recovery(
+                    "ambiguous",
+                    null,
+                    "Moved items reached their destinations, but the remaining Unassigned set changed",
+                  );
+                }
+              }
               return recovery("completed", {
                 movedToClub: actions.filter((action) => action.to === "club").map((action) => action.itemId),
                 movedToStorage: actions.filter((action) => action.to === "sbc_storage").map((action) => action.itemId),
               });
             }
-            if (stillUnassigned === actions.length) return recovery("not_applied");
+            if (stillUnassigned === actions.length) {
+              if (Array.isArray(intent.expectedUnassignedItemIdsBefore)) {
+                const expectedBefore = new Set(
+                  intent.expectedUnassignedItemIdsBefore.map(String),
+                );
+                if (!sameStringSet(byLocation.unassigned, expectedBefore)) {
+                  return recovery(
+                    "ambiguous",
+                    null,
+                    "Approved items remain, but the complete Unassigned set changed",
+                  );
+                }
+              }
+              return recovery("not_applied");
+            }
             return recovery("ambiguous", null, "Unassigned resolution is partial or items are missing");
           } catch (error) {
             return recovery("ambiguous", null, error?.message || "Unassigned post-state is unavailable");
@@ -764,8 +1032,659 @@ class GrindPilotRuntime {
     });
     if (!updated) return null;
     this.state.projects = this.targets.list();
+    let items = [];
+    try { items = this.inventory.getSnapshot().items; } catch {}
+    this.state.targetDashboard = this.targets.getDashboard(items);
     await this.storage.saveProjects(this.state.projects);
     return updated;
+  }
+
+  currentGameContext({ requireSbcTarget = false } = {}) {
+    const observed = this.state.currentContext || {};
+    let gameVersion = GameVersion.UNKNOWN;
+    try { gameVersion = normalizeGameVersion(observed.gameVersion ?? this.state.gameVersion); } catch {}
+    const verified =
+      this.state.bridgeHealth === "healthy" &&
+      gameVersion === GameVersion.FC26 &&
+      ["observed", "compatibility_default"].includes(
+        observed.gameVersionObservation ?? this.state.gameVersionObservation,
+      ) &&
+      (!requireSbcTarget || (Boolean(observed.setId) && Boolean(observed.challengeId)));
+    return createGameContext({
+      gameVersion,
+      state: verified ? "verified" : "unverified",
+      challengeKind: observed.challengeKind,
+      gameVersionObservation: observed.gameVersionObservation ?? this.state.gameVersionObservation,
+      gameVersionSource: observed.gameVersionSource ?? this.state.gameVersionSource,
+      route: observed.route,
+      setId: observed.setId,
+      setName: observed.setName,
+      challengeId: observed.challengeId,
+      challengeName: observed.challengeName,
+      observedAt: Number(this.state.contextObservedAt || Date.now()),
+    });
+  }
+
+  currentSbcGameContext() {
+    return this.currentGameContext({ requireSbcTarget: true });
+  }
+
+  async requireFc26PlanningContext({ requireSbcTarget = false } = {}) {
+    await this.refreshGameContext();
+    const context = this.currentGameContext({ requireSbcTarget });
+    if (context.gameVersion !== GameVersion.FC26 || context.state !== "verified") {
+      const error = new Error(context.gameVersion === GameVersion.FC27
+        ? "FC 27 planning is observe-only in this build"
+        : "The active EA game version could not be verified for planning");
+      error.code = context.gameVersion === GameVersion.FC27
+        ? "GAME_VERSION_UNSUPPORTED"
+        : "GAME_CONTEXT_UNVERIFIED";
+      throw error;
+    }
+    return context;
+  }
+
+  buildDuplicateRouteEvidence() {
+    const inventorySnapshot = this.inventory.getSnapshot();
+    const policy = {
+      ...DUPLICATE_ROUTE_POLICY,
+      preferSbcStorage: this.config.preferSbcStorage !== false,
+    };
+    const resolutionPlan = this.inventory.planUnassignedResolution(policy);
+    const capabilityRegistry = buildRuntimeCapabilityRegistry(this.state.capabilityHealth);
+    if (!this.inventoryAvailable) {
+      capabilityRegistry.declare("ea.inventory.read", {
+        state: "unavailable",
+        reason: "A current Club snapshot is unavailable",
+      });
+      capabilityRegistry.declare("ea.unassigned.read", {
+        state: "unavailable",
+        reason: "A current Unassigned snapshot is unavailable",
+      });
+    }
+    const capabilitySnapshot = capabilityRegistry.snapshot();
+    const gameContext = this.currentGameContext();
+    const summary = summarizeDuplicateRoute({ plan: resolutionPlan, inventorySnapshot });
+    const fingerprints = buildDuplicateRouteFingerprints({
+      gameContext,
+      inventorySnapshot,
+      capabilitySnapshot,
+      policy,
+      routeActions: summary.routeActions,
+    });
+    return {
+      inventorySnapshot,
+      policy,
+      resolutionPlan,
+      summary,
+      capabilityRegistry,
+      capabilitySnapshot,
+      gameContext,
+      fingerprints,
+    };
+  }
+
+  async previewDuplicateRoute() {
+    await this.refreshStatus();
+    const evidence = this.buildDuplicateRouteEvidence();
+    const protectionPolicy = this.createFodderPolicy();
+    const protectionAnalysis = protectionPolicy.analyze(evidence.inventorySnapshot.items);
+    const routerRecommendation = recommendRouterNextAction({
+      inventorySnapshot: evidence.inventorySnapshot,
+      routeSummary: evidence.summary,
+      capabilitySnapshot: evidence.capabilitySnapshot,
+      gameContext: evidence.gameContext,
+      activityGuard: this.currentRouterActivityGuard(),
+      protectionAnalysis: {
+        protectedItemIds: [...protectionAnalysis.protectedItemIds].map(String).sort(),
+        reasonsByItemId: protectionAnalysis.reasonsByItemId,
+        activeTargetProjectIds: [...protectionAnalysis.activeTargetProjectIds].map(String).sort(),
+      },
+      conservationPolicy: protectionPolicy.toSolverConservationPolicy(),
+      duplicatePolicy: evidence.policy,
+      observedAt: Number(evidence.inventorySnapshot.updatedAt || this.state.contextObservedAt || Date.now()),
+    });
+    const strategy = async () => {
+      const { summary, fingerprints } = evidence;
+      const blockers = [...summary.blockers];
+      if (summary.totalCount > 0 && summary.safeCount === 0) {
+        blockers.push({
+          code: "NO_SAFE_ROUTE",
+          message: "No current Unassigned item has a verified safe destination.",
+        });
+      }
+      const requiredCapabilities = summary.safeCount > 0
+        ? [...DUPLICATE_ROUTE_READ_CAPABILITIES, ...DUPLICATE_ROUTE_MOVE_CAPABILITIES]
+        : DUPLICATE_ROUTE_READ_CAPABILITIES;
+      return {
+        requiredCapabilities,
+        blockers,
+        fingerprints,
+        explanation: [
+          "Only the listed moves to Club or SBC Storage can run.",
+          "SBC submission, pack opening, and quicksell are outside this plan.",
+        ],
+        preview: {
+          ...summary,
+          status: blockers.length ? "blocked" : summary.status,
+          safetyBoundary: "SAFE_ITEM_MOVES_ONLY",
+        },
+        steps: blockers.length || summary.safeCount === 0 ? [] : [{
+          type: "CALL_EXISTING_SERVICE",
+          service: "workflow",
+          command: "RESOLVE_APPROVED_UNASSIGNED",
+          approvedActions: summary.approvedActions,
+          routeActions: summary.routeActions,
+          expectedUnassignedItemIdsBefore: summary.expectedUnassignedItemIdsBefore,
+          expectedRemainingItemIdsAfter: summary.expectedRemainingItemIdsAfter,
+          actionSetFingerprint: summary.actionSetFingerprint,
+        }],
+      };
+    };
+    strategy.requiredCapabilities = DUPLICATE_ROUTE_READ_CAPABILITIES;
+    const compiler = new PlanCompiler({
+      capabilityRegistry: evidence.capabilityRegistry,
+      entitlementService: new EntitlementService({ plan: ProductPlan.FREE }),
+      strategies: { [GoalKind.CLEAR_DUPLICATES]: strategy },
+      compilerVersion: 2,
+    });
+    const goal = createGoal({
+      kind: GoalKind.CLEAR_DUPLICATES,
+      intent: "Preview one bounded safe route for current Unassigned items",
+      inputs: { policyVersion: evidence.policy.schemaVersion },
+      createdAt: 0,
+    });
+    const plan = await compiler.compile(goal, evidence.gameContext);
+    this.duplicateRoutePlanCache.clear();
+    this.duplicateRoutePlanCache.set(plan.id, plan);
+    this.state.duplicateRoutePlan = plan;
+    this.state.duplicateRouteNotice = null;
+    this.state.routerRecommendation = routerRecommendation;
+    this.state.routerRecommendationNotice = null;
+    this.logger.info("Duplicate Preview", plan.state === "ready"
+      ? "Built a safe duplicate route preview; no cards were changed"
+      : "Duplicate route preview blocked safely", {
+      planId: plan.id,
+      safeMoves: plan.preview?.safeCount || 0,
+      attention: plan.preview?.attentionCount || 0,
+      blockerCodes: plan.blockers.map((blocker) => blocker.code),
+      routerState: routerRecommendation.state,
+      routerKind: routerRecommendation.outcome.kind,
+      routerReason: routerRecommendation.outcome.reasonCode,
+    });
+    this.emit();
+    return plan;
+  }
+
+  buildFodderReviewEvidence() {
+    const inventorySnapshot = this.inventory.getSnapshot();
+    const items = inventorySnapshot.items || [];
+    const verifiedWhenComplete = (field) =>
+      items.length > 0 && items.every((item) => item?.[field] === true)
+        ? "verified"
+        : "unverified";
+    const startingSquadState = verifiedWhenComplete("hasStartingSquadEvidence");
+    const sourceEvidence = {
+      schemaVersion: 1,
+      fields: {
+        locked: verifiedWhenComplete("hasLockedEvidence"),
+        protected: verifiedWhenComplete("hasProtectedEvidence"),
+        favorite: verifiedWhenComplete("hasFavoriteEvidence"),
+        special: verifiedWhenComplete("hasSpecialEvidence"),
+        tradability: verifiedWhenComplete("hasTradabilityEvidence"),
+        startingSquad: startingSquadState,
+      },
+      activeSquadProtection: {
+        state: startingSquadState,
+        mode: "per_item_flag",
+      },
+      loansIncluded: false,
+    };
+    const capabilityRegistry = buildRuntimeCapabilityRegistry(this.state.capabilityHealth);
+    if (!this.inventoryAvailable) {
+      capabilityRegistry.declare("ea.inventory.read", {
+        state: "unavailable",
+        reason: "A current Club snapshot is unavailable",
+      });
+    }
+    return {
+      inventorySnapshot,
+      policy: this.createFodderPolicy(),
+      targetProjects: this.targets,
+      capabilityRegistry,
+      capabilitySnapshot: capabilityRegistry.snapshot(),
+      gameContext: this.currentGameContext(),
+      sourceEvidence,
+    };
+  }
+
+  async previewFodderReview() {
+    await this.refreshStatus();
+    const evidence = this.buildFodderReviewEvidence();
+    const strategy = async () => buildFodderReview(evidence);
+    strategy.requiredCapabilities = FODDER_REVIEW_CAPABILITIES;
+    const compiler = new PlanCompiler({
+      capabilityRegistry: evidence.capabilityRegistry,
+      entitlementService: new EntitlementService({ plan: ProductPlan.FREE }),
+      strategies: { [GoalKind.OPTIMIZE_FODDER]: strategy },
+      compilerVersion: 2,
+    });
+    const goal = createGoal({
+      kind: GoalKind.OPTIMIZE_FODDER,
+      intent: "Review current card protection and local squad preferences",
+      inputs: { scope: "current_inventory", reviewSchemaVersion: 1 },
+      createdAt: 0,
+    });
+    const plan = await compiler.compile(goal, evidence.gameContext);
+    this.state.fodderReviewPlan = plan;
+    this.logger.info("Card protection", plan.state === "ready"
+      ? "Reviewed current protection; no cards were changed"
+      : "Protection review is unavailable with current evidence", {
+      planId: plan.id,
+      verificationState: plan.preview?.verificationState || "blocked",
+      protectedCount: plan.preview?.uniqueHardProtectedCount ?? null,
+      blockerCodes: plan.blockers.map((blocker) => blocker.code),
+    });
+    this.emit();
+    return plan;
+  }
+
+  async approveDuplicateRoute(planId) {
+    if (this.duplicateRouteApprovalInFlight) {
+      const error = new Error("A duplicate-route approval is already being checked");
+      error.code = "DUPLICATE_APPROVAL_IN_FLIGHT";
+      throw error;
+    }
+    this.duplicateRouteApprovalInFlight = true;
+    try {
+    const expected = this.duplicateRoutePlanCache.get(String(planId || ""));
+    if (!expected || expected.id !== String(planId || "") ||
+        expected.state !== "ready" || expected.preview?.safeCount <= 0 ||
+        expected.preview?.safetyBoundary !== "SAFE_ITEM_MOVES_ONLY") {
+      const error = new Error("Preview the safe duplicate route again before approving it");
+      error.code = "DUPLICATE_PLAN_NOT_APPROVABLE";
+      throw error;
+    }
+    const active = this.engine.getSnapshot();
+    if (active && ![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(active.status)) {
+      const error = new Error("Finish or stop the active run before moving these items");
+      error.code = "WORKFLOW_ALREADY_ACTIVE";
+      throw error;
+    }
+
+    await this.refreshStatus();
+    const current = this.buildDuplicateRouteEvidence();
+    const comparison = compareDuplicateRouteFingerprints(
+      expected.fingerprints,
+      current.fingerprints,
+    );
+    if (!comparison.ok ||
+        current.summary.actionSetFingerprint !== expected.preview.actionSetFingerprint) {
+      this.duplicateRoutePlanCache.clear();
+      this.state.duplicateRoutePlan = null;
+      this.state.duplicateRouteNotice =
+        "Unassigned items, destinations, or EA capabilities changed. Preview again.";
+      this.invalidateRouterRecommendation(
+        "Unassigned items, destinations, or EA capabilities changed. Nothing moved.",
+      );
+      this.logger.warn("Duplicate Approval", "Stale duplicate route rejected", {
+        changedEvidence: comparison.changed,
+      });
+      this.emit();
+      return { started: false, stale: true, changed: comparison.changed };
+    }
+
+    const preview = expected.preview;
+    const definition = {
+      id: `fut-magic-duplicates-${expected.id}`,
+      name: `Move ${preview.safeCount} safe item${preview.safeCount === 1 ? "" : "s"}`,
+      version: 1,
+      metadata: {
+        source: "fut-magic-duplicate-route",
+        planId: expected.id,
+        safetyModel: "exact-refresh-verify-move",
+      },
+      steps: [{
+        id: "approved-safe-item-moves",
+        type: WorkflowStepType.RESOLVE_ITEMS,
+        config: {
+          approvedActions: preview.approvedActions,
+          approvedRouteActions: preview.routeActions,
+          expectedUnassignedItemIdsBefore: preview.expectedUnassignedItemIdsBefore,
+          expectedRemainingItemIdsAfter: preview.expectedRemainingItemIdsAfter,
+          resolutionPolicy: current.policy,
+          actionSetFingerprint: preview.actionSetFingerprint,
+          allowPartial: false,
+          allowUnresolved: preview.expectedRemainingItemIdsAfter.length > 0,
+        },
+        timeoutMs: 45_000,
+        retryPolicy: { maxAttempts: 1 },
+        onFailure: "PAUSE",
+      }],
+    };
+    this.state.maxIterations = 1;
+    await this.engine.start(definition, {
+      mode: WorkflowMode.AUTO,
+      approval: createAutoApproval(definition),
+    });
+    this.duplicateRoutePlanCache.clear();
+    this.state.duplicateRoutePlan = null;
+    this.state.duplicateRouteNotice = null;
+    this.invalidateRouterRecommendation();
+    this.state.routerRecommendationNotice = null;
+    this.logger.info("Duplicate Approval", "Approved one exact set of safe item moves", {
+      planId: expected.id,
+      safeMoves: preview.safeCount,
+    });
+    queueMicrotask(() => this.drive());
+    this.emit();
+    return { started: true, runId: this.engine.getSnapshot()?.runId || null };
+    } finally {
+      this.duplicateRouteApprovalInFlight = false;
+    }
+  }
+
+  buildSbcPlanningEvidence(projectId) {
+    const project = this.targets
+      .list()
+      .find((candidate) => String(candidate.id) === String(projectId));
+    if (!project) {
+      const error = new Error("The selected Target Project no longer exists");
+      error.code = "PROJECT_NOT_FOUND";
+      throw error;
+    }
+    const inventorySnapshot = this.inventory.getSnapshot();
+    const policy = this.createFodderPolicy();
+    const analysis = policy.analyze(inventorySnapshot.items);
+    const policySnapshot = {
+      protectedItemIds: [...analysis.protectedItemIds].map(String).sort(),
+      reasonsByItemId: analysis.reasonsByItemId,
+      activeTargetProjectIds: [...analysis.activeTargetProjectIds].map(String).sort(),
+      conservationPolicy: policy.toSolverConservationPolicy(),
+    };
+    const capabilityRegistry = buildRuntimeCapabilityRegistry(
+      this.state.capabilityHealth,
+    );
+    if (!this.inventoryAvailable) {
+      capabilityRegistry.declare("ea.inventory.read", {
+        state: "unavailable",
+        reason: "A current Club snapshot is unavailable",
+      });
+    }
+    const capabilitySnapshot = capabilityRegistry.snapshot();
+    const gameContext = this.currentSbcGameContext();
+    const fingerprints = buildSbcPlanFingerprints({
+      gameContext,
+      inventorySnapshot,
+      project,
+      policySnapshot,
+      capabilitySnapshot,
+    });
+    return {
+      project,
+      inventorySnapshot,
+      policy,
+      analysis,
+      capabilityRegistry,
+      capabilitySnapshot,
+      gameContext,
+      fingerprints,
+    };
+  }
+
+  async previewSbcProject(projectId) {
+    await this.refreshStatus();
+    const evidence = this.buildSbcPlanningEvidence(projectId);
+    const strategy = async () => {
+      const { project, gameContext, inventorySnapshot, policy, analysis, fingerprints } = evidence;
+      const challenge = projectChallengeForContext(project, gameContext);
+      const blockers = [];
+      if (String(project.sourceSetId || "") !== String(gameContext.setId || "")) {
+        blockers.push({
+          code: "OPEN_PROJECT_REQUIRED",
+          message: "Open this project's SBC set in EA before previewing a squad.",
+        });
+      } else if (!challenge) {
+        blockers.push({
+          code: "CURRENT_CHALLENGE_NOT_IN_PROJECT",
+          message: "The open challenge is not mapped to this Target Project.",
+        });
+      } else if (challenge.completed) {
+        blockers.push({
+          code: "CHALLENGE_COMPLETED",
+          message: "The open challenge is already complete.",
+        });
+      } else if (challenge.unknownRequirements?.length) {
+        blockers.push({
+          code: "UNKNOWN_REQUIREMENTS",
+          message: "EA exposed requirements that FUT Magic cannot verify safely.",
+          count: challenge.unknownRequirements.length,
+        });
+      }
+
+      const basePreview = {
+        status: blockers.length ? "blocked" : "planning",
+        projectId: project.id,
+        setId: project.sourceSetId,
+        challengeId: challenge?.id || gameContext.challengeId,
+        challengeName: challenge?.name || gameContext.challengeName || "Open challenge",
+        targetRating: challenge?.requiredSquadRating ?? null,
+      };
+      if (blockers.length) {
+        return {
+          requiredCapabilities: SBC_PREVIEW_CAPABILITIES,
+          blockers,
+          fingerprints,
+          preview: basePreview,
+        };
+      }
+
+      let solution;
+      try {
+        solution = await this.adapter.solveCurrentSbc({
+          previewOnly: true,
+          protectedItemIds: analysis.protectedItemIds,
+          conservationPolicy: {
+            ...policy.toSolverConservationPolicy(),
+            protectedItemIds: analysis.protectedItemIds,
+          },
+          prioritize: {
+            duplicates: this.config.preferDuplicates !== false,
+            untradeables: this.config.preferUntradeables !== false,
+            storage: this.config.preferSbcStorage !== false,
+          },
+          solverSettings: { ...(this.config.solverSettings || {}) },
+        });
+      } catch (error) {
+        return {
+          requiredCapabilities: SBC_PREVIEW_CAPABILITIES,
+          blockers: [{
+            code: String(error?.code || "NO_VERIFIED_SOLUTION"),
+            message: String(error?.message || "No verified squad solution is available."),
+          }],
+          fingerprints,
+          preview: { ...basePreview, status: "blocked" },
+        };
+      }
+
+      const summary = summarizeSbcSolution({
+        solution,
+        inventorySnapshot,
+        protectedItemIds: analysis.protectedItemIds,
+      });
+      if (!summary.solved || summary.selectedCount !== 11) {
+        blockers.push({
+          code: "NO_VERIFIED_SOLUTION",
+          message: "The solver did not return a submit-ready 11-card squad.",
+        });
+      }
+      if (summary.unobservedItemIds.length) {
+        blockers.push({
+          code: "SOLUTION_ITEMS_UNOBSERVED",
+          message: "The preview referenced cards outside the current Club snapshot.",
+        });
+      }
+      if (summary.protectedViolations.length) {
+        blockers.push({
+          code: "PROTECTED_ITEM_SELECTED",
+          message: "The preview included a protected card.",
+        });
+      }
+      const explanation = policy.explainSelection(
+        solution.solutionIds,
+        inventorySnapshot.items,
+        { targetRating: challenge.requiredSquadRating },
+      );
+      return {
+        requiredCapabilities: SBC_PREVIEW_CAPABILITIES,
+        blockers,
+        fingerprints,
+        explanation: explanation.explanations,
+        preview: {
+          ...basePreview,
+          status: blockers.length ? "blocked" : "ready",
+          solved: summary.solved,
+          selectedCount: summary.selectedCount,
+          cards: summary.cards,
+          ratingRange: summary.ratingRange,
+          specialCount: summary.specialCount,
+          duplicateCount: summary.duplicateCount,
+          storageCount: summary.storageCount,
+          protectedCount: analysis.protectedItemIds.length,
+          selectedProtectedCount: summary.selectedProtectedCount,
+          objectiveTuple: summary.objectiveTuple,
+        },
+        steps: blockers.length ? [] : [{
+          type: "CALL_EXISTING_SERVICE",
+          service: "workflow",
+          command: "COMPLETE_CURRENT_SBC",
+          projectId: project.id,
+          setId: project.sourceSetId,
+          challengeId: challenge.id,
+        }],
+      };
+    };
+    strategy.requiredCapabilities = SBC_PREVIEW_CAPABILITIES;
+    const compiler = new PlanCompiler({
+      capabilityRegistry: evidence.capabilityRegistry,
+      entitlementService: new EntitlementService({ plan: ProductPlan.FREE }),
+      strategies: { [GoalKind.COMPLETE_SBC]: strategy },
+      compilerVersion: 2,
+    });
+    const goal = createGoal({
+      kind: GoalKind.COMPLETE_SBC,
+      intent: "Preview a protected squad for the open challenge",
+      inputs: { projectId: evidence.project.id },
+      createdAt: 0,
+    });
+    const plan = await compiler.compile(goal, evidence.gameContext);
+    this.sbcPlanCache.set(String(projectId), plan);
+    this.state.sbcPlanPreviews = {
+      ...this.state.sbcPlanPreviews,
+      [String(projectId)]: plan,
+    };
+    this.state.sbcPlanNotices = {
+      ...this.state.sbcPlanNotices,
+      [String(projectId)]: null,
+    };
+    this.logger.info("SBC Preview", plan.state === "ready"
+      ? "Built a protected squad preview; no cards were changed"
+      : "Squad preview blocked safely", {
+      projectId: String(projectId),
+      planId: plan.id,
+      blockerCodes: plan.blockers.map((blocker) => blocker.code),
+    });
+    this.emit();
+    return plan;
+  }
+
+  async approveSbcPlan(projectId, planId) {
+    const key = String(projectId || "");
+    const expected = this.sbcPlanCache.get(key);
+    if (!expected || expected.id !== String(planId || "") || expected.state !== "ready") {
+      const error = new Error("Preview this squad again before approving it");
+      error.code = "SBC_PLAN_NOT_APPROVABLE";
+      throw error;
+    }
+    const active = this.engine.getSnapshot();
+    if (active && ![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(active.status)) {
+      const error = new Error("Finish or stop the active run before approving this squad");
+      error.code = "WORKFLOW_ALREADY_ACTIVE";
+      throw error;
+    }
+
+    await this.refreshStatus();
+    const current = this.buildSbcPlanningEvidence(key);
+    const comparison = compareSbcPlanFingerprints(expected.fingerprints, current.fingerprints);
+    if (!comparison.ok) {
+      this.sbcPlanCache.delete(key);
+      const nextPreviews = { ...this.state.sbcPlanPreviews };
+      delete nextPreviews[key];
+      this.state.sbcPlanPreviews = nextPreviews;
+      this.state.sbcPlanNotices = {
+        ...this.state.sbcPlanNotices,
+        [key]: "Club, protections, project, capabilities, or the open EA squad changed. Preview again.",
+      };
+      this.logger.warn("SBC Approval", "Stale squad preview rejected", {
+        projectId: key,
+        changedEvidence: comparison.changed,
+      });
+      this.emit();
+      return { started: false, stale: true, changed: comparison.changed };
+    }
+
+    const preview = expected.preview;
+    const definition = {
+      id: `fut-magic-sbc-${expected.id}`,
+      name: `Complete ${preview?.challengeName || "open SBC"}`,
+      version: 1,
+      metadata: {
+        source: "fut-magic-sbc-plan",
+        planId: expected.id,
+        projectId: key,
+        safetyModel: "refresh-re-solve-verify-submit",
+      },
+      steps: [
+        {
+          id: "approved-sbc-solve",
+          type: WorkflowStepType.SOLVE_SBC,
+          config: {
+            target: {
+              kind: "SPECIFIC_CHALLENGE",
+              setId: preview.setId,
+              challengeId: preview.challengeId,
+            },
+          },
+          timeoutMs: 120_000,
+          retryPolicy: { maxAttempts: 1 },
+          onFailure: "PAUSE",
+        },
+        {
+          id: "approved-sbc-submit",
+          type: WorkflowStepType.SUBMIT_SBC,
+          timeoutMs: 30_000,
+          retryPolicy: { maxAttempts: 1 },
+          onFailure: "PAUSE",
+        },
+      ],
+    };
+    this.state.maxIterations = 1;
+    await this.engine.start(definition, {
+      mode: WorkflowMode.AUTO,
+      approval: createAutoApproval(definition),
+    });
+    this.sbcPlanCache.delete(key);
+    const nextPreviews = { ...this.state.sbcPlanPreviews };
+    delete nextPreviews[key];
+    this.state.sbcPlanPreviews = nextPreviews;
+    this.state.sbcPlanNotices = { ...this.state.sbcPlanNotices, [key]: null };
+    this.logger.info("SBC Approval", "Approved one refreshed, verified squad submission", {
+      projectId: key,
+      planId: expected.id,
+    });
+    queueMicrotask(() => this.drive());
+    this.emit();
+    return { started: true, runId: this.engine.getSnapshot()?.runId || null };
   }
 
   stopConditionTriggered(condition, context) {
@@ -812,7 +1731,37 @@ class GrindPilotRuntime {
     return true;
   }
 
-  evaluateRunGate({ run, node }) {
+  async evaluateRunGate({ run, node }) {
+    const versionSensitiveSteps = new Set([
+      WorkflowStepType.SOLVE_SBC,
+      WorkflowStepType.SUBMIT_SBC,
+      WorkflowStepType.CLAIM_REWARD,
+      WorkflowStepType.OPEN_REWARD_PACK,
+      WorkflowStepType.RESOLVE_ITEMS,
+      WorkflowStepType.ORGANIZE_ITEMS,
+      WorkflowStepType.HANDLE_PLAYER_PICK,
+    ]);
+    if (versionSensitiveSteps.has(node?.step?.type)) {
+      const gameContext = await this.refreshGameContext();
+      if (gameContext.gameVersion !== GameVersion.FC26) {
+        return {
+          allowed: false,
+          code: gameContext.gameVersion === GameVersion.FC27
+            ? "GAME_VERSION_UNSUPPORTED"
+            : "GAME_CONTEXT_UNVERIFIED",
+          message: gameContext.gameVersion === GameVersion.FC27
+            ? "FC 27 is observe-only in this build. No workflow action was run."
+            : "The active EA game version could not be verified. No workflow action was run.",
+        };
+      }
+      if (gameContext.state !== "verified") {
+        return {
+          allowed: false,
+          code: "GAME_CONTEXT_UNVERIFIED",
+          message: "The current FC 26 context is not verified. No workflow action was run.",
+        };
+      }
+    }
     const limits = this.config.runLimits || { maxIterations: this.config.maxIterations };
     const cleanupStep = [WorkflowStepType.HANDLE_PLAYER_PICK, WorkflowStepType.RESOLVE_ITEMS, WorkflowStepType.ORGANIZE_ITEMS].includes(node?.step?.type);
     const completed = (type) =>
@@ -902,13 +1851,27 @@ class GrindPilotRuntime {
 
   getState() { return structuredClone(this.state); }
   subscribe(listener) { this.listeners.add(listener); listener(this.getState()); return () => this.listeners.delete(listener); }
-  emit() { const snapshot=this.getState(); for(const listener of this.listeners) listener(snapshot); }
+  emit() { this.state.productRevision += 1; const snapshot=this.getState(); for(const listener of this.listeners) listener(snapshot); }
 
   onRun(run) {
     if (!run) return;
+    if (![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(run.status)) {
+      this.invalidateDuplicateRoutePreview(
+        "Activity Guard changed while a workflow was active. Preview again.",
+      );
+    }
+    this.invalidateRouterRecommendation(
+      "Activity Guard changed while a workflow was active. Check again.",
+    );
     const node = run.nodes?.[run.cursor];
     const completed = (type) => run.nodes.filter((entry) => entry.step?.type === type && entry.status === "completed");
     this.state.runStatus = run.status; this.state.currentStep = node?.step?.type || null;
+    this.state.runName = run.definition?.name || "FUT Magic run";
+    this.state.runModeLabel = run.mode === WorkflowMode.REVIEW
+      ? "Preview only"
+      : run.mode === WorkflowMode.ASSISTED
+        ? "Ask before each action"
+        : "Approved plan";
     this.state.iterations = run.counters?.loopIterations || 0; this.state.maxIterations = this.config.maxIterations;
     this.state.sbcCompleted = completed(WorkflowStepType.SUBMIT_SBC).length;
     this.state.packsOpened = completed(WorkflowStepType.OPEN_REWARD_PACK).length;
@@ -1147,19 +2110,19 @@ class GrindPilotRuntime {
       },
     });
     if (plan.packs.length !== 1) {
-      const error = new Error("No uniquely selected owned pack is ready for Quick Open");
+      const error = new Error("No uniquely selected owned pack is ready to open safely");
       error.code = "QUICK_OPEN_PACK_UNAVAILABLE";
       throw error;
     }
     const pack = plan.packs[0];
     const packId = String(pack?.packId ?? pack?.id ?? "");
     const label = String(pack?.name ?? pack?.packName ?? pack?.type ?? packId);
-    if (!requestedPackId && !this.confirm(`Quick Open ${label}?\n\nOnly this already-owned pack will be opened. No purchase is allowed.`)) {
+    if (!requestedPackId && !this.confirm(`Open ${label} safely?\n\nOnly this already-owned pack will be opened. No purchase is allowed.`)) {
       return { status: "cancelled", result: { packId } };
     }
     const definition = {
       id: "quick-open-pack",
-      name: "Quick Open",
+      name: "Open safely",
       version: 1,
       metadata: { source: "grindpilot-quick-open", safetyModel: "owned-only" },
       steps: [{
@@ -1175,7 +2138,7 @@ class GrindPilotRuntime {
       mode: WorkflowMode.AUTO,
       approval: createAutoApproval(definition),
     });
-    this.logger.info("Quick Open", "Approved one verified owned pack", { packId });
+    this.logger.info("Open safely", "Approved one verified owned pack", { packId });
     await this.drive();
     return this.engine.getSnapshot();
   }
@@ -1205,6 +2168,7 @@ class GrindPilotRuntime {
     } catch (error) {
       this.state.error = this.state.error || `Inventory refresh failed: ${error?.message || error}`;
     }
+    await this.refreshGameContext();
     try { this.state.capabilityHealth = await this.adapter.getCapabilityHealth(); } catch {}
     this.emit(); return this.getState();
   }
@@ -1213,10 +2177,20 @@ class GrindPilotRuntime {
     if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
     this.inventoryRefreshPromise = (async () => {
       this.inventoryAvailable = false;
+      this.state.inventoryAvailable = false;
+      this.state.fodderReviewPlan = null;
+      this.invalidateDuplicateRoutePreview(
+        "Club or Unassigned evidence was refreshed. Preview the safe route again.",
+      );
+      this.invalidateRouterRecommendation(
+        "Club or Unassigned evidence was refreshed. Check the next action again.",
+      );
       const raw=await this.adapter.readInventory();
       const snapshot=this.inventory.synchronize({ club:raw.club, storage:raw.storage, unassigned:raw.unassigned, storageCapacity:this.state.storageCapacity });
       this.inventoryAvailable = true;
       const status=this.inventory.getStatus();
+      this.inventoryAvailable = true;
+      this.state.inventoryAvailable = true;
       this.state.inventory=status;
       this.state.storageCount=status.storageCount;
       this.state.unassignedCount=status.unassignedCount;
@@ -1233,13 +2207,19 @@ class GrindPilotRuntime {
     const id=`profile-${Date.now()}`; const profile=await this.profileService.save({ id, name:`Grind profile ${new Date().toLocaleString()}`, automationMode:this.config.mode, workflow:this.config.workflow||buildWorkflow(this.config), solverSettings:this.config.solverSettings||{}, fodderPolicy, duplicatePolicy:{ ...(this.config.duplicatePolicy||{}), quicksell:false, unresolved:"PAUSE", storageCapacity:this.config.storageCapacity }, packPolicy:{ mode:this.config.packMode, maxPacks:this.config.maxPacks||1 }, pickPolicy:{ type:this.config.pickMode, ...(this.config.pickPolicy||{}) }, runLimits:{ ...(this.config.runLimits||{}), maxIterations:this.config.maxIterations }, stopConditions:this.config.stopConditions||[], targetProjects:this.targets.list() });
     this.state.profiles=await this.profileService.list(); this.emit(); return profile;
   }
-  async loadProfile(id) { const p=await this.profileService.get(id); if(!p)return; this.config={...this.defaultConfig(),...p.fodderPolicy,mode:p.automationMode||WorkflowMode.REVIEW,workflow:p.workflow,runLimits:{...p.runLimits},maxIterations:p.runLimits.maxIterations,storageCapacity:Math.min(100,p.duplicatePolicy.storageCapacity||100),solverSettings:p.solverSettings,duplicatePolicy:p.duplicatePolicy,packMode:p.packPolicy.mode,maxPacks:p.packPolicy.maxPacks,pickMode:p.pickPolicy.type,pickPolicy:p.pickPolicy,stopConditions:p.stopConditions,loadedProfileId:p.id,profileCeilings:{...p.runLimits,maxPacks:p.packPolicy.maxPacks},protectStartingSquad:true}; this.state.storageCapacity=this.config.storageCapacity; this.state.workflowDraft=structuredClone(p.workflow); if(Array.isArray(p.targetProjects)){this.targets=new TargetProjectService(p.targetProjects);this.state.projects=this.targets.list();} this.state.draft=this.config; this.emit(); }
+  async loadProfile(id) { const p=await this.profileService.get(id); if(!p)return; this.config={...this.defaultConfig(),...p.fodderPolicy,mode:p.automationMode||WorkflowMode.REVIEW,workflow:p.workflow,runLimits:{...p.runLimits},maxIterations:p.runLimits.maxIterations,storageCapacity:Math.min(100,p.duplicatePolicy.storageCapacity||100),solverSettings:p.solverSettings,duplicatePolicy:p.duplicatePolicy,packMode:p.packPolicy.mode,maxPacks:p.packPolicy.maxPacks,pickMode:p.pickPolicy.type,pickPolicy:p.pickPolicy,stopConditions:p.stopConditions,loadedProfileId:p.id,profileCeilings:{...p.runLimits,maxPacks:p.packPolicy.maxPacks},protectStartingSquad:true}; this.state.storageCapacity=this.config.storageCapacity; this.state.workflowDraft=structuredClone(p.workflow); if(Array.isArray(p.targetProjects)){this.targets=new TargetProjectService(p.targetProjects);this.state.projects=this.targets.list();} this.state.draft=this.config; this.state.fodderReviewPlan=null; this.invalidateRouterRecommendation("Protection or project settings changed. Check the next action again."); this.emit(); }
   async exportCurrentProfile() { const p=this.state.profiles.at(-1) || await this.saveDraftProfile(); return this.profileService.export(p.id); }
   exportRunAnalytics() { return exportRunAnalytics(this.engine.getSnapshot()); }
   async importProfile(text) { await this.profileService.import(text,{overwrite:false}); this.state.profiles=await this.profileService.list(); this.emit(); }
   async saveProtectionSettings(input) {
     this.config = { ...this.config, ...input, protectStartingSquad: true };
     this.state.draft = this.config;
+    this.state.fodderReviewPlan = null;
+    this.invalidateRouterRecommendation(
+      "Protection settings changed. Check the next action again.",
+    );
+    this.sbcPlanCache.clear();
+    this.state.sbcPlanPreviews = {};
     await this.storage.saveSettings(this.config);
     this.emit();
   }
@@ -1311,7 +2291,7 @@ class GrindPilotRuntime {
   async addTargetProject(input) {
     const name=String(input?.name||"").trim(); if(!name)throw new Error("Target project name is required");
     const project=this.targets.upsert({ id:`project-${Date.now()}`, name, active:true, priority:Math.max(0,Math.trunc(input.priority||0)), requiredSquadsRemaining:Math.max(0,Math.trunc(input.requiredSquadsRemaining||0)), protectedRatings:{ atOrAbove:input.protectRatingAtOrAbove||null }, ratingRequirements:[], specialCardRequirements:[], completionProgress:0 });
-    this.state.projects=this.targets.list(); await this.storage.saveProjects(this.state.projects); this.emit(); return project;
+    this.state.projects=this.targets.list(); this.state.fodderReviewPlan=null; this.invalidateRouterRecommendation("Target Projects changed. Check the next action again."); await this.storage.saveProjects(this.state.projects); this.emit(); return project;
   }
   async saveTargetProject(input) {
     const project = this.targets.upsert({
@@ -1319,6 +2299,10 @@ class GrindPilotRuntime {
       id: input?.id || `project-${Date.now()}`,
     });
     this.state.projects = this.targets.list();
+    this.state.fodderReviewPlan = null;
+    this.invalidateRouterRecommendation(
+      "Target Projects changed. Check the next action again.",
+    );
     let items = [];
     try { items = this.inventory.getSnapshot().items; } catch {}
     this.state.targetDashboard = this.targets.getDashboard(items);
@@ -1327,9 +2311,14 @@ class GrindPilotRuntime {
     return project;
   }
   async importCurrentSbcProject() {
+    await this.requireFc26PlanningContext({ requireSbcTarget: true });
     const snapshot = await this.adapter.readCurrentSbcProject();
     const project = this.targets.importCurrentSbc(snapshot);
     this.state.projects = this.targets.list();
+    this.state.fodderReviewPlan = null;
+    this.invalidateRouterRecommendation(
+      "Target Projects changed. Check the next action again.",
+    );
     this.state.targetDashboard = this.targets.getDashboard(
       this.inventoryAvailable ? this.inventory.getSnapshot().items : [],
     );
@@ -1346,9 +2335,14 @@ class GrindPilotRuntime {
     return project;
   }
   async syncTargetProject(id) {
+    await this.requireFc26PlanningContext({ requireSbcTarget: true });
     const snapshot = await this.adapter.readCurrentSbcProject();
     const project = this.targets.synchronizeFromCurrentSbc(id, snapshot);
     this.state.projects = this.targets.list();
+    this.state.fodderReviewPlan = null;
+    this.invalidateRouterRecommendation(
+      "Target Projects changed. Check the next action again.",
+    );
     this.state.targetDashboard = this.targets.getDashboard(
       this.inventoryAvailable ? this.inventory.getSnapshot().items : [],
     );
@@ -1356,10 +2350,67 @@ class GrindPilotRuntime {
     this.emit();
     return project;
   }
-  async removeTargetProject(id) { this.targets.remove(id); this.state.projects=this.targets.list(); await this.storage.saveProjects(this.state.projects); this.emit(); }
+  async removeTargetProject(id) { this.targets.remove(id); this.state.projects=this.targets.list(); this.state.fodderReviewPlan=null; this.invalidateRouterRecommendation("Target Projects changed. Check the next action again."); await this.storage.saveProjects(this.state.projects); this.emit(); }
   async setDeveloperMode(enabled) { enabled?this.dev.enable():this.dev.disable(); this.state.diagnostics={...this.dev.getStatus(),latest:this.state.diagnostics.latest||null}; this.emit(); }
   async takeDiagnosticSnapshot() { const health=await this.adapter.health().catch(error=>({error:error.message})); const latest=this.dev.captureSnapshot({ bridgeHealth:health,route:location.pathname,selectors:{controllerBridge:Boolean(window.eaData?.grindPilot)} }); this.state.diagnostics={...this.dev.getStatus(),latest,diff:this.dev.compareLatestSnapshots()}; this.emit(); return latest; }
   async exportDiagnostics() { return this.dev.exportDiagnostics({ healthChecks:[await this.adapter.health().catch(error=>({error:error.message}))], logs:this.logger.entries() }); }
+  getProductShellViewModel() {
+    return buildProductShellViewModel({
+      ...this.state,
+      gameContext: this.currentGameContext(),
+    });
+  }
+  async executeProductShellCommand(command = {}) {
+    const type = String(command?.type || "");
+    if (type === "REFRESH") return this.refreshStatus().then(() => this.getProductShellViewModel());
+    if (type === "PAUSE_RUN") await this.pause();
+    else if (type === "RESUME_RUN") await this.resume();
+    else if (type === "STOP_RUN") await this.stop();
+    else if (type === "IMPORT_CURRENT_SBC_PROJECT") await this.importCurrentSbcProject();
+    else if (type === "PREVIEW_SBC_PROJECT") {
+      await this.previewSbcProject(String(command.projectId || ""));
+    }
+    else if (type === "APPROVE_SBC_PLAN") {
+      await this.approveSbcPlan(
+        String(command.projectId || ""),
+        String(command.planId || ""),
+      );
+    }
+    else if (type === "PREVIEW_CLEAR_DUPLICATES") {
+      await this.previewDuplicateRoute();
+    }
+    else if (type === "PREVIEW_FODDER_REVIEW") {
+      await this.previewFodderReview();
+    }
+    else if (type === "APPROVE_CLEAR_DUPLICATES_PLAN") {
+      await this.approveDuplicateRoute(String(command.planId || ""));
+    }
+    else if (type === "OPEN_LEGACY_UI") {
+      const allowed = new Set(["Easy Loop", "SBC Solver", "Workflows", "Profiles", "Inventory", "Protected Cards", "Target Projects", "Activity", "Settings", "Developer"]);
+      const section = allowed.has(String(command.section)) ? String(command.section) : "Easy Loop";
+      this.panel?.openSection?.(section);
+    } else {
+      const error = new Error("Unsupported FUT Magic surface command");
+      error.code = "FUT_MAGIC_COMMAND_FORBIDDEN";
+      throw error;
+    }
+    return this.getProductShellViewModel();
+  }
+  async openSidePanel() {
+    return new Promise((resolve, reject) => {
+      const api = globalThis.chrome?.runtime;
+      if (!api?.sendMessage) {
+        this.panel?.openSection?.("Easy Loop");
+        resolve({ opened: false, legacy: true });
+        return;
+      }
+      api.sendMessage({ type: "FUT_MAGIC_OPEN_PANEL_V1" }, (response) => {
+        const error = api.lastError;
+        if (error || !response?.ok) reject(new Error(error?.message || response?.error?.message || "FUT Magic Side Panel could not open"));
+        else resolve(response.data || { opened: true });
+      });
+    });
+  }
   reportUiError(error) { this.state.error=error?.message||String(error); this.logger.error("Error",this.state.error,{code:error?.code||null}); this.emit(); }
   persistActivity() {
     clearTimeout(this.activityTimer);

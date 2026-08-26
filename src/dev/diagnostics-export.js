@@ -5,14 +5,51 @@ import { sanitizeDiagnosticValue, truncateDiagnosticString } from "./redaction.j
 function sanitizeLogs(logs, limits) {
   return (Array.isArray(logs) ? logs : [])
     .slice(-limits.maxLogs)
-    .map((entry) =>
-      sanitizeDiagnosticValue(entry, {
+    .map((entry) => {
+      const safe = sanitizeDiagnosticValue(entry, {
         maxDepth: 5,
         maxItems: 50,
         maxKeys: 50,
         maxStringLength: 750,
-      }),
-    );
+      });
+      return {
+        timestamp: typeof safe?.timestamp === "string" ? safe.timestamp : null,
+        level: ["debug", "info", "warn", "error"].includes(safe?.level) ? safe.level : null,
+        action: typeof safe?.action === "string" ? truncateDiagnosticString(safe.action, 100) : null,
+        code: typeof safe?.data?.code === "string" ? truncateDiagnosticString(safe.data.code, 100) : null,
+      };
+    });
+}
+
+function sanitizeHealthChecks(checks, limits) {
+  return (Array.isArray(checks) ? checks : [])
+    .slice(-Math.min(100, limits.maxCollectionItems))
+    .map((entry) => {
+      const safe = sanitizeDiagnosticValue(entry, {
+        maxDepth: 4,
+        maxItems: 100,
+        maxKeys: 50,
+        maxStringLength: 200,
+      });
+      const capabilities = Array.isArray(safe?.capabilities)
+        ? safe.capabilities.slice(0, 100).map((capability) => ({
+            id: typeof capability?.id === "string" ? truncateDiagnosticString(capability.id, 100) : null,
+            state: typeof capability?.state === "string"
+              ? truncateDiagnosticString(capability.state, 50)
+              : typeof capability?.status === "string"
+                ? truncateDiagnosticString(capability.status, 50)
+                : null,
+          }))
+        : [];
+      return {
+        status: typeof safe?.status === "string"
+          ? truncateDiagnosticString(safe.status, 50)
+          : typeof safe?.state === "string"
+            ? truncateDiagnosticString(safe.state, 50)
+            : null,
+        capabilities,
+      };
+    });
 }
 
 function trimExportToLimit(bundle, maxBytes) {
@@ -66,7 +103,7 @@ export function createDiagnosticsExport(input = {}, options = {}) {
   const limits = resolveDevLimits(options);
   const bundle = {
     schemaVersion: 1,
-    product: truncateDiagnosticString(input.product || "GrindPilot FC26", 100),
+    product: truncateDiagnosticString(input.product || "FUT Magic", 100),
     extensionVersion: truncateDiagnosticString(input.extensionVersion || "unknown", 80),
     generatedAt: Number.isFinite(Number(input.generatedAt))
       ? Math.max(0, Math.floor(Number(input.generatedAt)))
@@ -98,12 +135,7 @@ export function createDiagnosticsExport(input = {}, options = {}) {
       maxItems: limits.maxNetworkRecords,
     }),
     logs: sanitizeLogs(input.logs, limits),
-    healthChecks: sanitizeDiagnosticValue(input.healthChecks ?? [], {
-      maxDepth: 5,
-      maxItems: 100,
-      maxKeys: 50,
-      maxStringLength: 500,
-    }),
+    healthChecks: sanitizeHealthChecks(input.healthChecks, limits),
     truncated: false,
   };
   return trimExportToLimit(bundle, limits.maxExportBytes);

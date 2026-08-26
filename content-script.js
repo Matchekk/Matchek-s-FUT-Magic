@@ -274,6 +274,37 @@ window.addEventListener(
   true,
 );
 
+const FUT_MAGIC_TAB_REQUEST = "FUT_MAGIC_TAB_REQUEST_V1";
+if (chrome.runtime?.onMessage?.addListener) {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type !== FUT_MAGIC_TAB_REQUEST) return false;
+    if (sender?.id !== chrome.runtime.id) {
+      sendResponse({ ok: false, error: { code: "UNTRUSTED_SENDER", message: "Sender extension is not trusted" } });
+      return false;
+    }
+    const requestId = String(message?.requestId || "").slice(0, 128);
+    const runtime = window.__grindPilotRuntime;
+    if (!runtime?.getProductShellViewModel) {
+      sendResponse({ requestId, ok: false, error: { code: "FUT_MAGIC_RUNTIME_NOT_READY", message: "FUT Magic is still connecting to this tab" } });
+      return false;
+    }
+    const action = String(message?.action || "SNAPSHOT");
+    const execute = action === "SNAPSHOT"
+      ? Promise.resolve(runtime.getProductShellViewModel())
+      : action === "COMMAND"
+        ? runtime.executeProductShellCommand(message?.command || {})
+        : Promise.reject(Object.assign(new Error("FUT Magic tab action is not allowed"), { code: "FUT_MAGIC_TAB_ACTION_FORBIDDEN" }));
+    Promise.resolve(execute).then(
+      (data) => sendResponse({ requestId, ok: true, data }),
+      (error) => sendResponse({ requestId, ok: false, error: {
+        code: error?.code || "FUT_MAGIC_TAB_REQUEST_FAILED",
+        message: error?.message || "FUT Magic tab request failed",
+      } }),
+    );
+    return true;
+  });
+}
+
 const solverBridgeSeen = new Set();
 
 let solverWorkerInitPromise = null;

@@ -69,6 +69,9 @@ const readTradable = (raw) => {
   return false;
 };
 
+const hasAnyValue = (source, keys) =>
+  keys.some((key) => source?.[key] !== undefined && source?.[key] !== null);
+
 const normalizeStringList = (value) =>
   Object.freeze(
     Array.from(
@@ -125,6 +128,14 @@ export const normalizeInventoryItem = (raw, options = {}) => {
   if (!location) throw new TypeError("Inventory item location is required");
 
   const isTradable = readTradable(raw);
+  const movableEvidence = readFirst(raw, ["isMovable"]);
+  const storableEvidence = readFirst(raw, ["isStorable"]);
+  const movableEvidenceDeclared = readFirst(raw, ["hasMovableEvidence"]);
+  const storableEvidenceDeclared = readFirst(raw, ["hasStorableEvidence"]);
+  const evidence = (declaredKey, sourceKeys) => {
+    const declared = readFirst(raw, [declaredKey]);
+    return declared == null ? hasAnyValue(raw, sourceKeys) : Boolean(declared);
+  };
   return Object.freeze({
     itemId,
     resourceId,
@@ -145,8 +156,28 @@ export const normalizeInventoryItem = (raw, options = {}) => {
     isUntradeable: !isTradable,
     // Older/fake adapters did not expose these EA capabilities. Preserve their
     // historical permissive behavior, while honoring explicit live false flags.
-    isMovable: raw.isMovable == null ? true : Boolean(raw.isMovable),
-    isStorable: raw.isStorable == null ? true : Boolean(raw.isStorable),
+    isMovable: movableEvidence == null ? true : Boolean(movableEvidence),
+    isStorable: storableEvidence == null ? true : Boolean(storableEvidence),
+    hasMovableEvidence: movableEvidenceDeclared == null
+      ? movableEvidence != null
+      : Boolean(movableEvidenceDeclared),
+    hasStorableEvidence: storableEvidenceDeclared == null
+      ? storableEvidence != null
+      : Boolean(storableEvidenceDeclared),
+    hasTradabilityEvidence: evidence("hasTradabilityEvidence", [
+      "isTradable", "isTradeable", "tradable", "isUntradeable", "untradeable",
+    ]),
+    hasLockedEvidence: evidence("hasLockedEvidence", ["isLocked", "locked"]),
+    hasProtectedEvidence: evidence("hasProtectedEvidence", ["isProtected"]),
+    hasFavoriteEvidence: evidence("hasFavoriteEvidence", [
+      "isFavorite", "isFavourite", "favorite",
+    ]),
+    hasStartingSquadEvidence: evidence("hasStartingSquadEvidence", [
+      "isInStartingSquad", "isInActive11",
+    ]),
+    hasSpecialEvidence: evidence("hasSpecialEvidence", [
+      "isSpecial", "cardType", "rarityId", "rarityName", "specialGroups",
+    ]),
     isDuplicate: Boolean(raw.isDuplicate),
     isLocked: Boolean(raw.isLocked ?? raw.locked),
     isFavorite: Boolean(raw.isFavorite ?? raw.isFavourite),

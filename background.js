@@ -12,11 +12,18 @@ const grindPilotRpcSecrets = new Map();
 const PRICE_BRIDGE_REQUEST = "EA_DATA_PRICE_REQUEST";
 const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
 const GP_STATE_COMMAND = "GRINDPILOT_STATE_COMMAND_V2";
+const FUT_MAGIC_PANEL_REQUEST = "FUT_MAGIC_PANEL_REQUEST_V1";
+const FUT_MAGIC_TAB_REQUEST = "FUT_MAGIC_TAB_REQUEST_V1";
+const FUT_MAGIC_OPEN_PANEL_REQUEST = "FUT_MAGIC_OPEN_PANEL_V1";
+const FUT_MAGIC_SIDE_PANEL_PATH = "sidepanel/index.html";
 const ALLOWED_BRIDGE_INJECT_PATHS = new Set(["page/ea-data-bridge.js"]);
 const EA_WEBAPP_URL_RE =
   /^https:\/\/www\.ea\.com(?:\/[^/?#]+)?\/ea-sports-fc\/ultimate-team\/web-app(?:\/|$)/i;
 const FUT_PRICE_API_URL = "https://www.fut.gg/api/fut/player-prices/26/";
 const FUT_PLAYERS_API_URL = "https://www.fut.gg/api/fut/players/v2/26/";
+// Commercial builds fail closed until written provider authorization and a
+// reviewed consent/response-validation boundary exist.
+const FUTGG_PROVIDER_ENABLED = false;
 const FUT_PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FUT_PRICE_ERROR_BACKOFF_MS = 20 * 1000;
 const FUT_PRICE_BATCH_SIZE = 10;
@@ -51,6 +58,7 @@ import {
   solveSquad,
 } from "./solver/solver.js?v=2026-08-25a";
 import { normalizeProfile } from "./src/profiles/profile-service.js";
+import { normalizeFutMagicPanelCommand } from "./src/presentation/product-shell-protocol.js";
 import { normalizeWorkflowDefinition } from "./src/workflow/definitions.js";
 
 const isRecord = (value) =>
@@ -80,6 +88,110 @@ const validateEaSender = (sender, { requireTab = true } = {}) => {
   }
   return null;
 };
+
+const validateFutMagicPanelSender = (sender) => {
+  if (sender?.id !== chrome.runtime.id) {
+    return { code: "UNTRUSTED_SENDER", message: "Sender extension is not trusted" };
+  }
+  const expected = typeof chrome.runtime.getURL === "function"
+    ? chrome.runtime.getURL(FUT_MAGIC_SIDE_PANEL_PATH)
+    : "";
+  if (!expected || String(sender?.url || "") !== expected) {
+    return { code: "UNTRUSTED_SENDER", message: "Sender is not the FUT Magic Side Panel" };
+  }
+  return null;
+};
+
+const syncFutMagicSidePanelTab = (tabId, url) => {
+  if (!Number.isInteger(tabId) || typeof chrome.sidePanel?.setOptions !== "function") return;
+  try {
+    const pending = chrome.sidePanel.setOptions({
+      tabId,
+      path: FUT_MAGIC_SIDE_PANEL_PATH,
+      enabled: EA_WEBAPP_URL_RE.test(String(url || "")),
+    });
+    pending?.catch?.(() => {});
+  } catch {}
+};
+
+const configureFutMagicSidePanel = () => {
+  if (typeof chrome.sidePanel?.setPanelBehavior === "function") {
+    try {
+      chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })?.catch?.(() => {});
+    } catch {}
+  }
+  if (typeof chrome.tabs?.query === "function") {
+    try {
+      chrome.tabs.query({}, (tabs) => {
+        void chrome.runtime?.lastError;
+        for (const tab of Array.isArray(tabs) ? tabs : []) {
+          syncFutMagicSidePanelTab(tab.id, tab.url);
+        }
+      });
+    } catch {}
+  }
+};
+
+const handleFutMagicPanelRequest = (message, sendResponse) => {
+  const requestId = normalizeRequestId(message?.requestId) || `fm-${Date.now()}`;
+  if (typeof chrome.tabs?.query !== "function" || typeof chrome.tabs?.sendMessage !== "function") {
+    sendResponse({ requestId, ok: false, error: { code: "FUT_MAGIC_TAB_UNAVAILABLE", message: "No supported EA Web App tab is available" } });
+    return;
+  }
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const queryError = chrome.runtime?.lastError;
+    const tab = Array.isArray(tabs) ? tabs[0] : null;
+    if (queryError || !Number.isInteger(tab?.id) || !EA_WEBAPP_URL_RE.test(String(tab?.url || ""))) {
+      sendResponse({ requestId, ok: false, error: { code: "FUT_MAGIC_TAB_UNAVAILABLE", message: "Open the EA Web App in the active tab to use FUT Magic" } });
+      return;
+    }
+    const action = String(message?.action || "SNAPSHOT");
+    if (!new Set(["SNAPSHOT", "COMMAND"]).has(action)) {
+      sendResponse({ requestId, ok: false, error: { code: "FUT_MAGIC_PANEL_ACTION_FORBIDDEN", message: "Side Panel action is not allowed" } });
+      return;
+    }
+    const command = action === "COMMAND"
+      ? normalizeFutMagicPanelCommand(message?.command)
+      : null;
+    if (action === "COMMAND" && !command) {
+      sendResponse({ requestId, ok: false, error: {
+        code: "FUT_MAGIC_PANEL_COMMAND_INVALID",
+        message: "Side Panel command is invalid",
+      } });
+      return;
+    }
+    chrome.tabs.sendMessage(tab.id, {
+      type: FUT_MAGIC_TAB_REQUEST,
+      requestId,
+      action,
+      command,
+    }, (response) => {
+      const error = chrome.runtime?.lastError;
+      if (error || !response?.ok) {
+        sendResponse({ requestId, ok: false, error: response?.error || {
+          code: "FUT_MAGIC_TAB_UNAVAILABLE",
+          message: error?.message || "FUT Magic is still connecting to the EA Web App",
+        } });
+        return;
+      }
+      sendResponse({ requestId, ok: true, data: response.data });
+    });
+  });
+};
+
+configureFutMagicSidePanel();
+chrome.runtime?.onInstalled?.addListener?.(configureFutMagicSidePanel);
+chrome.runtime?.onStartup?.addListener?.(configureFutMagicSidePanel);
+chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo, tab) => {
+  if (changeInfo?.url || tab?.url) syncFutMagicSidePanelTab(tabId, changeInfo?.url || tab?.url);
+});
+chrome.tabs?.onActivated?.addListener?.(({ tabId }) => {
+  if (!Number.isInteger(tabId) || typeof chrome.tabs?.get !== "function") return;
+  chrome.tabs.get(tabId, (tab) => {
+    void chrome.runtime?.lastError;
+    syncFutMagicSidePanelTab(tabId, tab?.url);
+  });
+});
 
 const validateSolverPayload = (workerType, payload) => {
   if (workerType === "INIT") return null;
@@ -552,6 +664,13 @@ const fetchFutPriceBatch = async (ids) => {
 };
 
 const handlePriceRequest = (message, sendResponse) => {
+  if (!FUTGG_PROVIDER_ENABLED) {
+    sendResponse({
+      ok: false,
+      error: { code: "FUTGG_PROVIDER_NOT_CONFIGURED", message: "External price data is not configured" },
+    });
+    return;
+  }
   if (!isRecord(message?.payload) || !Array.isArray(message.payload.ids)) {
     sendResponse({
       ok: false,
@@ -758,6 +877,13 @@ const fetchFutPlayersPage = async ({
 };
 
 const handleFutPlayersRequest = (message, sendResponse) => {
+  if (!FUTGG_PROVIDER_ENABLED) {
+    sendResponse({
+      ok: false,
+      error: { code: "FUTGG_PROVIDER_NOT_CONFIGURED", message: "External player data is not configured" },
+    });
+    return;
+  }
   const payloadError = validateFutPlayersPayload(message?.payload);
   if (payloadError) {
     sendResponse({ ok: false, error: payloadError });
@@ -1235,6 +1361,33 @@ const handleGrindPilotStateCommand = (message, sender, sendResponse) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isRecord(message)) return false;
+  if (message.type === FUT_MAGIC_PANEL_REQUEST) {
+    const error = validateFutMagicPanelSender(sender);
+    if (error) {
+      sendResponse({ requestId: normalizeRequestId(message?.requestId), ok: false, error });
+      return false;
+    }
+    handleFutMagicPanelRequest(message, sendResponse);
+    return true;
+  }
+  if (message.type === FUT_MAGIC_OPEN_PANEL_REQUEST) {
+    const error = validateEaSender(sender);
+    if (error || typeof chrome.sidePanel?.open !== "function") {
+      sendResponse({ ok: false, error: error || { code: "FUT_MAGIC_SIDE_PANEL_UNAVAILABLE", message: "Chrome Side Panel is unavailable" } });
+      return false;
+    }
+    try {
+      const pending = chrome.sidePanel.open({ tabId: sender.tab.id });
+      Promise.resolve(pending).then(
+        () => sendResponse({ ok: true, data: { opened: true, tabId: sender.tab.id } }),
+        (openError) => sendResponse({ ok: false, error: { code: "FUT_MAGIC_SIDE_PANEL_OPEN_FAILED", message: openError?.message || "FUT Magic Side Panel could not open" } }),
+      );
+      return true;
+    } catch (openError) {
+      sendResponse({ ok: false, error: { code: "FUT_MAGIC_SIDE_PANEL_OPEN_FAILED", message: openError?.message || "FUT Magic Side Panel could not open" } });
+      return false;
+    }
+  }
   const knownType =
     message.type === BRIDGE_INJECT_REQUEST ||
     message.type === GRINDPILOT_RPC_INSTALL_REQUEST ||
