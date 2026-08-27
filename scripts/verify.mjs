@@ -89,11 +89,10 @@ for (const entry of manifest.web_accessible_resources || []) {
   if (
     JSON.stringify(entry.matches || []) !==
     JSON.stringify([
-      "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
-      "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*",
+      "https://www.ea.com/*",
     ])
   ) {
-    errors.push("web-accessible resources must remain limited to supported EA Web App routes");
+    errors.push("web-accessible resources must remain limited to the valid www.ea.com origin pattern");
   }
   if (entry.use_dynamic_url === true) {
     errors.push("isolated-world modules must retain the extension origin");

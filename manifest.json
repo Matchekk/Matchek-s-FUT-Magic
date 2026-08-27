@@ -54,8 +54,7 @@
         "data/changelog.json"
       ],
       "matches": [
-        "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
-        "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
+        "https://www.ea.com/*"
       ]
     }
   ]

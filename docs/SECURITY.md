@@ -32,8 +32,10 @@ and byte limits, redirect rejection, requested-ID coverage, bounded caches/
 queues and malicious-provider tests are complete.
 
 Legacy player/league/nation metadata formerly persisted on the EA origin is
-purged on bridge startup; replacement caches are memory-only. Web-accessible
-resources are limited to the two supported EA Web App URL patterns.
+purged on bridge startup; replacement caches are memory-only. Chrome evaluates
+web-accessible resources at origin scope, so those files are limited to the
+`https://www.ea.com/*` origin. Content-script execution remains limited to the
+two supported EA Web App routes.
 
 No public vulnerability-reporting operator/channel is configured. A commercial
 release must name one, publish scope and response expectations, and keep manual

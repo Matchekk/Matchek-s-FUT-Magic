@@ -14,7 +14,13 @@ test("commercial client has no identity, commerce, remote-service, or broad page
     assert.equal(Object.hasOwn(manifest, key), false, `${key} must not be configured`);
   }
   assert.doesNotMatch(manifest.content_security_policy.extension_pages, /https?:\/\/|unsafe-eval|unsafe-inline/i);
-  assert.deepEqual(manifest.web_accessible_resources[0].matches, manifest.content_scripts[0].matches);
+  assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://www.ea.com/*"]);
+  assert.ok(
+    manifest.web_accessible_resources.every((entry) =>
+      entry.matches.every((pattern) => new URLPattern({ pathname: "/*" }).pathname === new URLPattern(pattern).pathname),
+    ),
+    "Chrome rejects web-accessible-resource match patterns whose path is not /*",
+  );
 });
 
 test("unlicensed external provider and legacy donation are disabled in shipped code", () => {
