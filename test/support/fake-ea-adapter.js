@@ -5,6 +5,7 @@ export class FakeGrindStorage {
   constructor() {
     this.settings = {};
     this.activity = [];
+    this.activityLedgers = {};
     this.projects = [];
   }
   async loadBootstrap() {
@@ -12,6 +13,12 @@ export class FakeGrindStorage {
   }
   async saveSettings(value) { this.settings = clone(value); }
   async saveActivity(value) { this.activity = clone(value); }
+  async loadActivityLedger(partitionKey) {
+    return clone(this.activityLedgers[partitionKey] ?? null);
+  }
+  async saveActivityLedger(partitionKey, value) {
+    this.activityLedgers[partitionKey] = clone(value);
+  }
   async saveProjects(value) { this.projects = clone(value); }
 }
 
@@ -54,7 +61,17 @@ export class FakeEaAdapter {
   }
   #challengeId(index = this.challengeIndex) { return `challenge-${index + 1}`; }
   #rawInventory() {
-    return clone({ club: this.club, storage: this.storage, unassigned: this.unassigned, generation: 1 });
+    const withMovementEvidence = (items) => items.map((item) => ({
+      isMovable: true,
+      isStorable: true,
+      ...item,
+    }));
+    return clone({
+      club: withMovementEvidence(this.club),
+      storage: withMovementEvidence(this.storage),
+      unassigned: withMovementEvidence(this.unassigned),
+      generation: 1,
+    });
   }
 
   async health() { return { eaReady: true }; }
@@ -278,19 +295,19 @@ export class FakeEaAdapter {
     if ([...required].some((id) => protectedIds.has(id))) {
       throw new Error("Fake organizer protected-card violation");
     }
-    const unassignedIds = new Set(this.unassigned.map(itemId));
-    if ([...required].some((id) => !unassignedIds.has(id))) {
+    const availableIds = new Set([...this.unassigned, ...this.club].map(itemId));
+    if ([...required].some((id) => !availableIds.has(id))) {
       throw new Error("Fake organizer required card is unavailable");
     }
     const filler = this.club
-      .filter((item) => !protectedIds.has(itemId(item)))
+      .filter((item) => !protectedIds.has(itemId(item)) && !required.has(itemId(item)))
       .slice(0, 11 - required.size);
     if (filler.length + required.size !== 11) {
       throw new Error("Fake organizer has insufficient filler");
     }
     const fillerIds = new Set(filler.map(itemId));
     this.unassigned = this.unassigned.filter((item) => !required.has(itemId(item)));
-    this.club = this.club.filter((item) => !fillerIds.has(itemId(item)));
+    this.club = this.club.filter((item) => !fillerIds.has(itemId(item)) && !required.has(itemId(item)));
     const completedId = String(challengeId || this.#challengeId());
     this.completedChallenges.add(completedId);
     return this.#finish("organize", {

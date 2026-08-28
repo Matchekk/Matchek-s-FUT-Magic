@@ -185,6 +185,21 @@ globalThis.__grindPilotIsolatedReady = (async () => {
     }
   }
   if (!bridgeInjected) throw new Error("EA page bridge injection failed");
+  const workspacePath = "page/fut-magic-ea-workspace.js";
+  try {
+    await injectPageScript(workspacePath, { type: null });
+  } catch (workspaceError) {
+    try {
+      await requestBackgroundBridgeInject(workspacePath);
+    } catch (backgroundWorkspaceError) {
+      console.warn("[FUT Magic] EA-native workspace unavailable; using overlay fallback", {
+        path: workspacePath,
+        injectionError: workspaceError?.message ?? String(workspaceError),
+        fallbackError:
+          backgroundWorkspaceError?.message ?? String(backgroundWorkspaceError),
+      });
+    }
+  }
   await requestGrindPilotRpcInstall();
   installIsolatedGrindPilotEaProxy();
   return { ready: true };

@@ -133,6 +133,8 @@ test("missing per-item move evidence blocks approval without mutation", async ()
     rating: 81,
     isTradeable: false,
     isDuplicate: false,
+    isMovable: null,
+    isStorable: null,
   }];
   await runtime.initialize();
 

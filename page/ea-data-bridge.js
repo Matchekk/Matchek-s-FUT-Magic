@@ -2090,9 +2090,18 @@
       }
     }
 
-    if (!refresh || typeof services?.Item?.requestUnassignedItems !== "function") {
+    if (!refresh) {
       if (failClosed && !verifiedRead) {
         const error = new Error("Unassigned state could not be verified");
+        error.code = "EA_UNASSIGNED_UNVERIFIED";
+        error.causes = failures;
+        throw error;
+      }
+      return initial;
+    }
+    if (typeof services?.Item?.requestUnassignedItems !== "function") {
+      if (failClosed) {
+        const error = new Error("Fresh unassigned state could not be requested");
         error.code = "EA_UNASSIGNED_UNVERIFIED";
         error.causes = failures;
         throw error;
@@ -2112,6 +2121,12 @@
     } catch (error) {
       failures.push(error);
     }
+    if (failClosed) {
+      const error = new Error("Fresh unassigned state could not be verified");
+      error.code = "EA_UNASSIGNED_UNVERIFIED";
+      error.causes = failures;
+      throw error;
+    }
 
     if (typeof lookup === "function") {
       try {
@@ -2124,12 +2139,6 @@
       }
     }
 
-    if (failClosed) {
-      const error = new Error("Fresh unassigned state could not be verified");
-      error.code = "EA_UNASSIGNED_UNVERIFIED";
-      error.causes = failures;
-      throw error;
-    }
     return initial;
   };
 
@@ -2226,7 +2235,7 @@
           data = await getStorageItems({});
           break;
         case "unassigned":
-          data = await getUnassignedItems({ refresh: true });
+          data = await getUnassignedItems({ refresh: true, failClosed: true });
           break;
         case "transfer": {
           const { unSoldItems, availableItems } = await getTransferListItems();
@@ -2235,6 +2244,11 @@
         }
         default:
           data = [];
+      }
+      if (!Array.isArray(data)) {
+        const error = new Error(`EA ${key} inventory source was not an array`);
+        error.code = "EA_INVENTORY_SOURCE_UNVERIFIED";
+        throw error;
       }
       rawInventoryCache[key] = { at: Date.now(), data };
       return data;
@@ -8688,9 +8702,22 @@
     } catch {}
   };
 
-  const closeSequenceSolveOverlay = () => {
+  const closeSequenceSolveOverlay = ({ fromNavigation = false } = {}) => {
     const overlay = document.getElementById("ea-data-sequence-overlay");
     if (!overlay) return;
+    const state = sequenceSolveOverlayState ?? null;
+    if (fromNavigation && state?.running) {
+      requestSequenceSolveStop({ statusText: "Stopping safely..." });
+    }
+    if (
+      !fromNavigation &&
+      state?.presentation === "native" &&
+      typeof state?.onRequestClose === "function"
+    ) {
+      try {
+        if (state.onRequestClose() !== false) return;
+      } catch {}
+    }
     overlay.setAttribute("aria-hidden", "true");
     try {
       overlay.style.pointerEvents = "none";
@@ -8698,6 +8725,18 @@
     try {
       overlay.style.display = "none";
     } catch {}
+    if (state?.presentation === "native") {
+      state.presentation = "overlay";
+      state.onRequestClose = null;
+      overlay.dataset.presentation = "overlay";
+      const modal = state?.modal ?? overlay.querySelector(".ea-data-sequence-modal");
+      modal?.setAttribute?.("role", "dialog");
+      modal?.setAttribute?.("aria-modal", "true");
+      if (state?.closeBtn) state.closeBtn.textContent = "Close Planner";
+      try {
+        if (overlay.parentElement !== document.body) document.body.appendChild(overlay);
+      } catch {}
+    }
   };
 
   const requestMultiSolveStop = ({ statusText = "Stopping..." } = {}) => {
@@ -15942,8 +15981,9 @@
       <div class="ea-data-sequence-modal" role="dialog" aria-modal="true" aria-labelledby="ea-data-sequence-title">
         <div class="ea-data-sequence-header">
           <div class="ea-data-sequence-title-wrap">
-            <div class="ea-data-sequence-title" id="ea-data-sequence-title">Sequence Solver</div>
-            <div class="ea-data-sequence-subtitle">Choose several SBCs, save the order, and solve them all in one run.</div>
+            <div class="ea-data-sequence-brandline"><span class="ea-data-sequence-brandmark" aria-hidden="true"><svg viewBox="0 0 48 48" focusable="false"><path d="M14 8h22l-3 7H20l-4 21h15l5-6"/><path d="M9 39c11 2 22-1 30-10"/><path d="M34 5v8M30 9h8"/></svg></span><span>FUT <strong>Magic</strong></span></div>
+            <div class="ea-data-sequence-title" id="ea-data-sequence-title" tabindex="-1">Grind planner</div>
+            <div class="ea-data-sequence-subtitle">Build protected SBC routes, review every plan, and keep execution visible.</div>
           </div>
           <div class="ea-data-sequence-header-meta">
             <div class="ea-data-sequence-badge ea-data-sequence-badge--accent" id="ea-data-sequence-plan-badge">Saved</div>
@@ -15953,11 +15993,11 @@
         <div class="ea-data-sequence-body">
           <aside class="ea-data-sequence-sidebar">
             <div class="ea-data-sequence-sidebar-head">
-              <div class="ea-data-sequence-sidebar-title">Saved Plans</div>
-              <div class="ea-data-sequence-sidebar-copy" id="ea-data-sequence-sidebar-copy">Loading sequence plans...</div>
+              <div class="ea-data-sequence-sidebar-title">Grind plans</div>
+              <div class="ea-data-sequence-sidebar-copy" id="ea-data-sequence-sidebar-copy">Loading saved plans...</div>
             </div>
             <div class="ea-data-sequence-sidebar-actions">
-              <button type="button" class="ea-data-sequence-sidebar-btn" id="ea-data-sequence-new-btn">+ New Plan</button>
+              <button type="button" class="ea-data-sequence-sidebar-btn" id="ea-data-sequence-new-btn">+ New plan</button>
             </div>
             <div class="ea-data-sequence-plan-list" id="ea-data-sequence-plan-list"></div>
             <div class="ea-data-sequence-sidebar-footer">
@@ -15965,22 +16005,22 @@
             </div>
           </aside>
           <div class="ea-data-sequence-main">
-            <div class="ea-data-sequence-tabs">
-              <button type="button" class="ea-data-sequence-tab is-active" data-tab="steps"><span class="ea-data-sequence-tab-label">Steps<span class="ea-data-sequence-tab-indicator" id="ea-data-sequence-toolbar-count">0</span></span></button>
-              <button type="button" class="ea-data-sequence-tab" data-tab="settings"><span class="ea-data-sequence-tab-label">Settings</span></button>
-              <button type="button" class="ea-data-sequence-tab" data-tab="execution"><span class="ea-data-sequence-tab-label">Execution</span></button>
+            <div class="ea-data-sequence-tabs" role="tablist" aria-label="Planner sections">
+              <button type="button" id="ea-data-sequence-tab-steps" class="ea-data-sequence-tab is-active" role="tab" aria-selected="true" aria-controls="ea-data-sequence-panel-steps" tabindex="0" data-tab="steps"><span class="ea-data-sequence-tab-label">Steps<span class="ea-data-sequence-tab-indicator" id="ea-data-sequence-toolbar-count">0</span></span></button>
+              <button type="button" id="ea-data-sequence-tab-settings" class="ea-data-sequence-tab" role="tab" aria-selected="false" aria-controls="ea-data-sequence-panel-settings" tabindex="-1" data-tab="settings"><span class="ea-data-sequence-tab-label">Settings</span></button>
+              <button type="button" id="ea-data-sequence-tab-execution" class="ea-data-sequence-tab" role="tab" aria-selected="false" aria-controls="ea-data-sequence-panel-execution" tabindex="-1" data-tab="execution"><span class="ea-data-sequence-tab-label">Execution</span></button>
             </div>
             <div class="ea-data-sequence-status-bar">
-              <div class="ea-data-sequence-status-text" id="ea-data-sequence-toolbar-status">Preparing planner...</div>
+              <div class="ea-data-sequence-status-text" id="ea-data-sequence-toolbar-status" role="status" aria-live="polite" aria-atomic="true">Preparing planner...</div>
             </div>
             <div class="ea-data-sequence-panels">
-              <div class="ea-data-sequence-tab-panel is-active" data-tab-panel="steps">
+              <div class="ea-data-sequence-tab-panel is-active" id="ea-data-sequence-panel-steps" role="tabpanel" aria-labelledby="ea-data-sequence-tab-steps" data-tab-panel="steps">
                 <div class="ea-data-sequence-tab-panel-inner" id="ea-data-sequence-steps-panel"></div>
               </div>
-              <div class="ea-data-sequence-tab-panel" data-tab-panel="settings">
+              <div class="ea-data-sequence-tab-panel" id="ea-data-sequence-panel-settings" role="tabpanel" aria-labelledby="ea-data-sequence-tab-settings" data-tab-panel="settings">
                 <div class="ea-data-sequence-tab-panel-inner" id="ea-data-sequence-settings-panel"></div>
               </div>
-              <div class="ea-data-sequence-tab-panel" data-tab-panel="execution">
+              <div class="ea-data-sequence-tab-panel" id="ea-data-sequence-panel-execution" role="tabpanel" aria-labelledby="ea-data-sequence-tab-execution" data-tab-panel="execution">
                 <div class="ea-data-sequence-tab-panel-inner" id="ea-data-sequence-execution-panel"></div>
               </div>
             </div>
@@ -16999,7 +17039,10 @@
       }
       tabButtons.forEach((btn) => {
         const key = btn.getAttribute("data-tab");
-        btn.classList.toggle("is-active", key === tabKey);
+        const selected = key === tabKey;
+        btn.classList.toggle("is-active", selected);
+        btn.setAttribute("aria-selected", selected ? "true" : "false");
+        btn.tabIndex = selected ? 0 : -1;
       });
       const currentPanel = Array.from(tabPanels).find((panel) =>
         panel.classList.contains("is-active"),
@@ -17066,20 +17109,17 @@
             ? plan.steps.filter((step) => step?.enabled !== false).length
             : 0;
           return `
-            <div
-              class="ea-data-sequence-plan-card${isActive ? " is-active" : ""}"
-              data-plan-id="${escapeHtml(plan?.id)}"
-            >
-              <div class="ea-data-sequence-plan-card-row">
+            <div class="ea-data-sequence-plan-card-shell${isActive ? " is-active" : ""}">
+              <button type="button" class="ea-data-sequence-plan-card${isActive ? " is-active" : ""}" data-plan-id="${escapeHtml(plan?.id)}" aria-pressed="${isActive ? "true" : "false"}">
                 <div class="ea-data-sequence-plan-name">${escapeHtml(
                   sanitizeDisplayText(plan?.name) ?? "Untitled Plan",
                 )}</div>
-                <button type="button" class="ea-data-sequence-plan-delete-btn" data-plan-delete="${escapeHtml(plan?.id)}" title="Delete plan">\u00D7</button>
-              </div>
-              <div class="ea-data-sequence-plan-meta">
+              <span class="ea-data-sequence-plan-meta">
                 <span>${enabledSteps} active</span>
                 <span>${escapeHtml(formatShortDate(plan?.updatedAt))}</span>
-              </div>
+              </span>
+              </button>
+              <button type="button" class="ea-data-sequence-plan-delete-btn" data-plan-delete="${escapeHtml(plan?.id)}" aria-label="Delete plan ${escapeHtml(sanitizeDisplayText(plan?.name) ?? "Untitled Plan")}">\u00D7</button>
             </div>
           `;
         })
@@ -17682,7 +17722,7 @@
               )}" ${isRunning ? "disabled" : ""} />
             </label>
             <div class="ea-data-sequence-field">
-              <span class="ea-data-sequence-label">Plan Loops</span>
+              <label class="ea-data-sequence-label" for="ea-data-sequence-plan-loops">Plan Loops</label>
               <div class="ea-data-times-stepper">
                 <button type="button" class="ea-data-times-stepper__btn" data-step="down" data-target="ea-data-sequence-plan-loops" aria-label="Decrease plan loops" ${isRunning ? "disabled" : ""}>-</button>
                 <input
@@ -17875,8 +17915,9 @@
               );
               return `
                 <div class="ea-data-sequence-step-card${isExpanded ? " is-expanded" : ""}${normalizedStep?.enabled ? "" : " is-disabled"}${!validation.valid && normalizedStep?.enabled !== false ? " is-invalid" : ""}${getSequenceStepMotionClass(normalizedStep?.id)}" data-step-card-id="${escapeHtml(normalizedStep?.id)}">
-                  <div class="ea-data-sequence-step-summary" data-step-toggle-id="${escapeHtml(normalizedStep?.id)}">
-                    <div class="ea-data-sequence-step-summary-left">
+                  <div class="ea-data-sequence-step-summary">
+                    <button type="button" class="ea-data-sequence-step-summary-toggle" data-step-toggle-id="${escapeHtml(normalizedStep?.id)}" aria-expanded="${isExpanded ? "true" : "false"}" aria-controls="ea-data-sequence-step-detail-${escapeHtml(normalizedStep?.id)}">
+                    <span class="ea-data-sequence-step-summary-left">
                       <div class="ea-data-sequence-step-chevron">\u25B6</div>
                       <div class="ea-data-sequence-step-title">${escapeHtml(
                         `Step ${stepIndex + 1}`,
@@ -17884,11 +17925,10 @@
                       <div class="ea-data-sequence-step-meta">${escapeHtml(
                         getStepTargetDisplay(normalizedStep),
                       )}</div>
-                    </div>
+                    </span>
+                    <span class="ea-data-sequence-step-badge" data-status="${escapeHtml(statusKey)}">${escapeHtml(statusLabel)}</span>
+                    </button>
                     <div class="ea-data-sequence-step-summary-right">
-                      <div class="ea-data-sequence-step-badge" data-status="${escapeHtml(statusKey)}">${escapeHtml(
-                        statusLabel,
-                      )}</div>
                       <div class="ea-data-sequence-step-controls">
                         <label class="ea-data-sequence-step-enabled" title="Enable or disable step">
                           <span class="ea-data-sequence-step-enabled-copy">Enabled</span>
@@ -17905,22 +17945,22 @@
                         </label>
                         <button type="button" class="ea-data-btn ea-data-btn--info" data-step-id="${escapeHtml(
                           normalizedStep?.id,
-                        )}" data-step-action="up" ${isRunning || stepIndex === 0 ? "disabled" : ""}>&#9650;</button>
+                        )}" data-step-action="up" aria-label="Move step ${stepIndex + 1} up" ${isRunning || stepIndex === 0 ? "disabled" : ""}>&#9650;</button>
                         <button type="button" class="ea-data-btn ea-data-btn--info" data-step-id="${escapeHtml(
                           normalizedStep?.id,
-                        )}" data-step-action="down" ${isRunning || stepIndex >= (plan?.steps?.length ?? 1) - 1 ? "disabled" : ""}>&#9660;</button>
+                        )}" data-step-action="down" aria-label="Move step ${stepIndex + 1} down" ${isRunning || stepIndex >= (plan?.steps?.length ?? 1) - 1 ? "disabled" : ""}>&#9660;</button>
                         <button type="button" class="ea-data-btn ea-data-btn--danger" data-step-id="${escapeHtml(
                           normalizedStep?.id,
-                        )}" data-step-action="delete" ${isRunning || (plan?.steps?.length ?? 0) <= 1 ? "disabled" : ""}>&#10005;</button>
+                        )}" data-step-action="delete" aria-label="Delete step ${stepIndex + 1}" ${isRunning || (plan?.steps?.length ?? 0) <= 1 ? "disabled" : ""}>&#10005;</button>
                       </div>
                     </div>
                   </div>
-                  <div class="ea-data-sequence-step-detail">
+                  <div class="ea-data-sequence-step-detail" id="ea-data-sequence-step-detail-${escapeHtml(normalizedStep?.id)}">
                     <div class="ea-data-sequence-step-detail-body">
                       <div class="ea-data-sequence-step-grid ea-data-sequence-step-grid--triple">
                         <div class="ea-data-sequence-field">
-                          <label class="ea-data-sequence-label">Target Type</label>
-                          <select class="ea-data-sequence-select" data-step-id="${escapeHtml(
+                          <label class="ea-data-sequence-label" for="ea-data-sequence-step-kind-${escapeHtml(normalizedStep?.id)}">Target Type</label>
+                          <select class="ea-data-sequence-select" id="ea-data-sequence-step-kind-${escapeHtml(normalizedStep?.id)}" data-step-id="${escapeHtml(
                             normalizedStep?.id,
                           )}" data-step-field="kind" ${isRunning ? "disabled" : ""}>
                             <option value="${SEQUENCE_TARGET_KIND_SINGLE}"${
@@ -17936,15 +17976,15 @@
                           </select>
                         </div>
                         <div class="ea-data-sequence-field">
-                          <label class="ea-data-sequence-label">SBC Set</label>
-                          <select class="ea-data-sequence-select" data-step-id="${escapeHtml(
+                          <label class="ea-data-sequence-label" for="ea-data-sequence-step-set-${escapeHtml(normalizedStep?.id)}">SBC Set</label>
+                          <select class="ea-data-sequence-select" id="ea-data-sequence-step-set-${escapeHtml(normalizedStep?.id)}" data-step-id="${escapeHtml(
                             normalizedStep?.id,
                           )}" data-step-field="setId" ${isRunning || !compatibleSets.length ? "disabled" : ""}>
                             ${setOptionsHtml}
                           </select>
                         </div>
                         <div class="ea-data-sequence-field">
-                          <label class="ea-data-sequence-label">Loop Count</label>
+                          <label class="ea-data-sequence-label" for="ea-data-sequence-step-loop-${escapeHtml(normalizedStep?.id)}">Loop Count</label>
                           <div class="ea-data-times-stepper">
                             <button type="button" class="ea-data-times-stepper__btn" data-step="down" data-target="ea-data-sequence-step-loop-${escapeHtml(
                               normalizedStep?.id,
@@ -17998,6 +18038,7 @@
                 <div class="ea-data-range__track"></div>
                 <input
                   class="ea-data-range__input ea-data-range__input--min"
+                  aria-label="Minimum rating slider"
                   type="range"
                   min="0"
                   max="99"
@@ -18010,6 +18051,7 @@
                 />
                 <input
                   class="ea-data-range__input ea-data-range__input--max"
+                  aria-label="Maximum rating slider"
                   type="range"
                   min="0"
                   max="99"
@@ -18023,9 +18065,11 @@
               </div>
               <div class="ea-data-sequence-range-row">
                 <div class="ea-data-range__field">
-                  <div class="ea-data-range__label">Min</div>
+                  <label class="ea-data-range__label" for="ea-data-sequence-rating-min-${escapeHtml(normalizedStep?.id)}">Min</label>
                   <input
                     class="ea-data-range__number"
+                    id="ea-data-sequence-rating-min-${escapeHtml(normalizedStep?.id)}"
+                    aria-label="Minimum rating"
                     type="number"
                     min="0"
                     max="99"
@@ -18040,9 +18084,11 @@
                   />
                 </div>
                 <div class="ea-data-range__field">
-                  <div class="ea-data-range__label">Max</div>
+                  <label class="ea-data-range__label" for="ea-data-sequence-rating-max-${escapeHtml(normalizedStep?.id)}">Max</label>
                   <input
                     class="ea-data-range__number"
+                    id="ea-data-sequence-rating-max-${escapeHtml(normalizedStep?.id)}"
+                    aria-label="Maximum rating"
                     type="number"
                     min="0"
                     max="99"
@@ -18282,6 +18328,7 @@
       const reviewReady =
         normalizeRunStatusKey(state?.runState?.status) === "ready_to_submit" &&
         (state?.pendingSequenceSubmissions?.length ?? 0) > 0;
+      const nativePlanningOnly = state?.presentation === "native";
       planBadgeEl.textContent = dirty ? "Unsaved" : "Saved";
       planBadgeEl.classList.toggle("ea-data-sequence-badge--accent", dirty);
       runBadgeEl.textContent =
@@ -18298,16 +18345,20 @@
       newBtn.disabled = isRunning;
       addStepFooterBtn.disabled = isRunning || !hasPlan;
       startBtn.disabled =
-        isRunning ||
+        nativePlanningOnly || isRunning ||
         (!reviewReady &&
           (!hasPlan || enabledSteps <= 0 || invalidEnabledCount > 0));
-      startBtn.textContent = reviewReady
+      startBtn.textContent = nativePlanningOnly
+        ? "Planning only"
+        : reviewReady
         ? "Submit Solved Squads"
         : submitModeMeta.actionLabel;
       stopBtn.classList.toggle("ea-data-is-hidden", !isRunning);
       stopBtn.disabled = !isRunning || Boolean(state?.abortRequested);
       startBtn.style.display = isRunning ? "none" : "";
-      if (reviewReady) {
+      if (nativePlanningOnly) {
+        setToolbarStatus("Planning only · execution remains behind the verified FUT Magic workflow boundary.");
+      } else if (reviewReady) {
         setToolbarStatus("Solved squads are ready to submit.");
       } else if (dirty) {
         setToolbarStatus("Unsaved changes.");
@@ -19674,6 +19725,15 @@
 
     const runActivePlan = async () => {
       if (sequenceSolveOverlayState?.running) return;
+      if (sequenceSolveOverlayState?.presentation === "native") {
+        showToast({
+          type: "info",
+          title: "Planning Only",
+          message: "Native execution stays disabled until this plan is delegated through FUT Magic's verified workflow engine.",
+          timeoutMs: 6500,
+        });
+        return;
+      }
       const activePlan = getActivePlan();
       if (!activePlan) {
         showToast({
@@ -20154,6 +20214,15 @@
 
     const submitPendingSequencePlan = async () => {
       if (sequenceSolveOverlayState?.running) return;
+      if (sequenceSolveOverlayState?.presentation === "native") {
+        showToast({
+          type: "info",
+          title: "Planning Only",
+          message: "Native submission is unavailable until verified workflow delegation is active.",
+          timeoutMs: 6500,
+        });
+        return;
+      }
       const pending = Array.isArray(
         sequenceSolveOverlayState?.pendingSequenceSubmissions,
       )
@@ -20500,6 +20569,23 @@
         const tabKey = tabBtn.getAttribute("data-tab");
         if (tabKey) switchTab(tabKey);
       });
+    overlay
+      .querySelector(".ea-data-sequence-tabs")
+      ?.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        const tabs = Array.from(tabButtons);
+        const activeTab = event.target.closest?.(".ea-data-sequence-tab");
+        const current = Math.max(0, tabs.indexOf(activeTab));
+        const next = event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? tabs.length - 1
+            : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        event.preventDefault();
+        const tab = tabs[next];
+        switchTab(tab.getAttribute("data-tab"));
+        tab.focus();
+      });
 
     // Sidebar: plan selection + deletion
     planListEl?.addEventListener("click", async (event) => {
@@ -20544,9 +20630,11 @@
             : [];
           for (const card of cards) {
             const cardId = card?.getAttribute?.("data-step-card-id");
-            card?.classList?.toggle?.(
-              "is-expanded",
-              String(cardId) === String(state?.expandedStepId),
+            const expanded = String(cardId) === String(state?.expandedStepId);
+            card?.classList?.toggle?.("is-expanded", expanded);
+            card?.querySelector?.("[data-step-toggle-id]")?.setAttribute?.(
+              "aria-expanded",
+              expanded ? "true" : "false",
             );
           }
           return;
@@ -20781,6 +20869,7 @@
 
     sequenceSolveOverlayState = {
       overlay,
+      modal,
       closeBtn,
       newBtn,
       saveBtn,
@@ -20821,6 +20910,8 @@
       tabTransitionTimers: [],
       expandedStepId: null,
       stepMotion: null,
+      presentation: "overlay",
+      onRequestClose: null,
       setRuntimeStatus,
       render,
       renderExecutionPanel,
@@ -20853,7 +20944,11 @@
     return overlay;
   };
 
-  const openSequenceSolveOverlay = async () => {
+  const openSequenceSolveOverlay = async ({
+    presentation = "overlay",
+    mount = null,
+    onRequestClose = null,
+  } = {}) => {
     if (!(await isSequenceFeatureEnabled())) {
       showToast({
         type: "error",
@@ -20864,6 +20959,30 @@
       return false;
     }
     const overlay = ensureSequenceSolveOverlay();
+    const useNative =
+      presentation === "native" && mount instanceof HTMLElement;
+    sequenceSolveOverlayState.presentation = useNative ? "native" : "overlay";
+    sequenceSolveOverlayState.onRequestClose =
+      useNative && typeof onRequestClose === "function" ? onRequestClose : null;
+    overlay.dataset.presentation = useNative ? "native" : "overlay";
+    const modal =
+      sequenceSolveOverlayState?.modal ??
+      overlay.querySelector(".ea-data-sequence-modal");
+    if (useNative) {
+      modal?.setAttribute?.("role", "region");
+      modal?.removeAttribute?.("aria-modal");
+      if (sequenceSolveOverlayState?.closeBtn) {
+        sequenceSolveOverlayState.closeBtn.textContent = "Back";
+      }
+      if (overlay.parentElement !== mount) mount.replaceChildren(overlay);
+    } else {
+      modal?.setAttribute?.("role", "dialog");
+      modal?.setAttribute?.("aria-modal", "true");
+      if (sequenceSolveOverlayState?.closeBtn) {
+        sequenceSolveOverlayState.closeBtn.textContent = "Close Planner";
+      }
+      if (overlay.parentElement !== document.body) document.body.appendChild(overlay);
+    }
     overlay.setAttribute("aria-hidden", "false");
     overlay.style.display = "flex";
     try {
@@ -20871,6 +20990,7 @@
     } catch {}
     await sequenceSolveOverlayState?.loadPlans?.();
     sequenceSolveOverlayState?.render?.();
+    queueMicrotask(() => overlay.querySelector("#ea-data-sequence-title")?.focus?.());
     return true;
   };
 
@@ -21107,6 +21227,10 @@
 
   const openSequenceHubEntry = async () => {
     try {
+      if (typeof window.FutMagicEaWorkspace?.open === "function") {
+        const opened = await window.FutMagicEaWorkspace.open();
+        if (opened) return true;
+      }
       if (typeof openSequenceSolveOverlay === "function") {
         const opened = await openSequenceSolveOverlay();
         if (opened) return true;
@@ -21133,9 +21257,9 @@
 
   const syncSequenceHubEntryButton = (button) => {
     if (!(button instanceof HTMLButtonElement)) return;
-    button.textContent = "Sequence Solver";
-    button.setAttribute("aria-label", "Open sequence solver");
-    button.title = "Plan several SBCs in order and solve them in one run.";
+    button.textContent = "Open FUT Magic Grind";
+    button.setAttribute("aria-label", "Open FUT Magic grind planner");
+    button.title = "Build a protected SBC route and keep every step visible.";
     button.disabled = !resolveSequenceFeatureEnabledFromPreferences(
       preferencesCache?.value ?? null,
     );
@@ -31533,9 +31657,9 @@
       { force: true },
     );
     return grindPilotResult("verified", {
-      club: snapshot?.clubPlayers ?? [],
-      storage: snapshot?.storagePlayers ?? [],
-      unassigned: snapshot?.unassignedPlayers ?? [],
+      club: snapshot.clubPlayers,
+      storage: snapshot.storagePlayers,
+      unassigned: snapshot.unassignedPlayers,
       generation: Number(playersFetchCacheRevision ?? 0),
     });
   };
@@ -32017,8 +32141,9 @@
       readPlayerPick: (query) => grindPilotReadPlayerPick(query),
       selectPlayerPick: (intent) => grindPilotSelectPlayerPick(intent),
     }),
-    openSequenceSolver: () => openSequenceSolveOverlay(),
-    openSequencePlanner: () => openSequenceSolveOverlay(),
+    openSequenceSolver: (options = {}) => openSequenceSolveOverlay(options),
+    openSequencePlanner: (options = {}) => openSequenceSolveOverlay(options),
+    closeSequenceSolver: (options = {}) => closeSequenceSolveOverlay(options),
     openWhatsNew: () => openWhatsNewOverlay({ source: "manual" }),
     openChangelog: () => openWhatsNewOverlay({ source: "manual" }),
     getClubPlayers: (options) =>

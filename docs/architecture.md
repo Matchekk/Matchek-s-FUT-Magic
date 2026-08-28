@@ -37,8 +37,17 @@ checkpointed through the isolated storage bridge.
 - `src/ea`: `EAInteractionAdapter`, controller implementation, DOM fallback and
   health snapshots. Domain code never accesses controllers or selectors.
 - `src/inventory`: normalized owned items and atomic Club/Storage/Unassigned
-  snapshots keyed by canonical string item ID.
-- `src/sbc`: solver interface and adapter around the existing AutoPilot solver.
+  snapshots keyed by canonical string item ID, plus location-aware duplicate
+  relations that never collapse owned instances.
+- `src/routing`: bounded rules, validation, explanations and read-only advice
+  shared by Pack and Unassigned flows. See [routing.md](routing.md).
+- `src/packs`: owned-pack policy, exact earned-reward correlation and opening.
+  See [pack-correlation.md](pack-correlation.md).
+- `src/sbc`: solver adapter plus reservation, conflict and sequential set
+  planning. See [set-planner.md](set-planner.md).
+- `src/recipes`: exact, preview-first duplicate-recycle compilation.
+- `src/activity`: qualitative rolling history, canonical guard and the
+  WorkflowEngine pre-dispatch scheduler.
 - `src/policies`: fodder, protected-player, pack, duplicate and target-project
   policies.
 - `src/workflow`: definitions, condition evaluator, persisted state machine and
@@ -48,6 +57,10 @@ checkpointed through the isolated storage bridge.
 - `src/presentation`: bounded serializable product view models.
 - `src/sidepanel`: Preact/TypeScript Side Panel with no EA internals.
 - `src/ui`: contextual actions, compact run HUD, and Advanced-only legacy panel.
+
+Evolution eligibility, immutable simulation, bounded beam/Pareto search,
+diversity, transparent role scoring and generation-bound Club Scan are covered
+in [evolution-engine.md](evolution-engine.md).
 
 The planning direction is one-way:
 

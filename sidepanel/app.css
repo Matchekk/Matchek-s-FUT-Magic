@@ -8,7 +8,7 @@
   --fm-bg-scrim: rgb(3 7 18 / 64%);
   --fm-text-primary: #e6edf5;
   --fm-text-secondary: #a7b2c9;
-  --fm-text-muted: #7f8ba4;
+  --fm-text-muted: #8793aa;
   --fm-text-on-accent: #07121b;
   --fm-text-pro: #b8adff;
   --fm-accent-primary: #00e6ff;
@@ -108,9 +108,9 @@
   --fm-radius-round: var(--fm-radius-pill);
   --fm-type-title: var(--fm-type-title-size);
   --fm-type-section: var(--fm-type-section-size);
-  --fm-type-body: var(--fm-type-label-size);
-  --fm-type-label: var(--fm-type-caption-size);
-  --fm-type-caption: 0.6875rem;
+  --fm-type-body: var(--fm-type-body-size);
+  --fm-type-label: var(--fm-type-label-size);
+  --fm-type-caption: var(--fm-type-caption-size);
   --fm-type-metric: 1.0625rem;
   --fm-motion-press: var(--fm-motion-instant);
   --fm-motion-screen: var(--fm-motion-standard);
@@ -293,6 +293,8 @@ p {
   margin: 0;
 }
 h1 {
+  width: max-content;
+  max-width: 100%;
   margin: var(--fm-space-3) 0 var(--fm-space-1);
   font-size: var(--fm-type-title);
   line-height: 1.5rem;

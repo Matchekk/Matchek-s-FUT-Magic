@@ -114,6 +114,35 @@ candidate/release state. A dirty tree can only produce a candidate.
   hosted privacy contact, exact tagged source, store media, and native release
   QA. These remain explicit commercial-readiness blockers.
 
+## Activity scheduler and failure circuit
+
+Every destructive workflow handler passes through the same persisted intent
+boundary and then `OperationScheduler.preflight()` before dispatch. The
+qualitative Activity Guard uses rolling 1m, 5m, 15m, 60m, 24h and session
+history, actual classified EA-response health and a per-operation consecutive
+failure circuit. It exposes NORMAL, ELEVATED, CAUTION, PAUSED and RECOVERY; it
+does not expose or imply an official “safe” action quota.
+
+The production runtime has no verified persistent FUT persona identifier. It
+therefore uses an opaque browser-tab session partition, kept in session storage,
+and stores each bounded ledger under a separate versioned key. Reloading the
+page restores only that partition; a different tab/session does not inherit it.
+Game-version filtering remains separate. This is an anonymous fallback, not a
+claim of account/persona verification. If the partition or stored snapshot
+cannot be restored safely, Activity Guard fails closed instead of silently
+starting from NORMAL.
+
+ELEVATED recent activity also applies a small centrally configured post-event
+spacing interval before the next EA dispatch. The interval is an interruptible
+reliability/pacing control, not an official EA quota or a guarantee against an
+account restriction.
+
+Scheduler failure after a verified operation never retries that operation. A
+ledger failure pauses future work while preserving the completed postcondition.
+Ambiguous or terminal EA responses move the guard to caution/recovery, and
+three consecutive classified failures in one operation family open the local
+circuit. These are reliability controls, not shadow-ban evasion promises.
+
 ## Milestone gate
 
 Run `npm ci`, `npm test`, `npm run test:browser`, `npm run check`, and

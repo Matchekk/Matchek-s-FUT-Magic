@@ -6,7 +6,7 @@ review, decisions, constraints, and follow-up debt are recorded.
 
 Active:
 
-- None.
+- `docs/exec-plans/active/fut-magic-competitive-feature-harvest.md`
 
 Completed:
 

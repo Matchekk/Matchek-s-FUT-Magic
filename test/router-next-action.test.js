@@ -211,6 +211,13 @@ test("game, read, move, route, and per-item evidence gates fail conservatively",
       itemId: "legacy", resourceId: "legacy-version", definitionId: "legacy-version",
       rating: 80, isTradeable: false,
     }],
+    routeSummary: { routeActions: [{
+      itemId: "legacy",
+      type: "SEND_TO_CLUB",
+      from: "unassigned",
+      to: "club",
+      reason: "not_duplicate",
+    }] },
   });
   const attention = recommendRouterNextAction(missingMoveEvidence);
   assert.equal(attention.state, RouterNextActionState.ATTENTION);

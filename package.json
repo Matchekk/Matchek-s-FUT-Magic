@@ -8,7 +8,7 @@
     "build:icons": "node scripts/build-icons.mjs",
     "build:runtime": "node scripts/build-runtime.mjs",
     "test": "node --test \"test/**/*.test.js\"",
-    "test:browser": "npm run build:runtime && node scripts/browser-test.mjs",
+    "test:browser": "npm run build:runtime && node scripts/browser-test.mjs && node scripts/native-workspace-browser-test.mjs",
     "check": "node scripts/verify.mjs && tsc --noEmit",
     "package": "npm run build:icons && npm run build:runtime && node scripts/package.mjs"
   },

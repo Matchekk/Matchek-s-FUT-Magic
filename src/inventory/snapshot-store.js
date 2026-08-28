@@ -79,8 +79,13 @@ export class InventorySnapshotStore {
     }
 
     const nextGeneration = current.generation + 1;
+    for (const source of ["club", "storage", "unassigned"]) {
+      if (!Array.isArray(input[source])) {
+        throw new TypeError(`${source} inventory source must be an explicit array`);
+      }
+    }
     const normalizeSource = (items, location) =>
-      (Array.isArray(items) ? items : []).map((item) =>
+      items.map((item) =>
         normalizeInventoryItem(item, { location }),
       );
 

@@ -84,12 +84,14 @@ export const planUnassignedResolution = (snapshot, policy = {}) => {
     );
 
     if (!duplicate) {
-      if (item.isMovable === false) {
+      if (item.hasMovableEvidence !== true || item.isMovable !== true) {
         actions.push(
           createAction(
             item,
             INVENTORY_RESOLUTION_ACTIONS.PAUSE,
-            "unassigned_item_not_movable",
+            item.hasMovableEvidence === true
+              ? "unassigned_item_not_movable"
+              : "unassigned_move_evidence_unverified",
           ),
         );
         paused = true;
@@ -118,20 +120,41 @@ export const planUnassignedResolution = (snapshot, policy = {}) => {
       continue;
     }
 
-    if (
-      effectivePolicy.preferSbcStorage &&
-      storageFreeSlots > 0 &&
-      item.isStorable !== false
-    ) {
+    if (effectivePolicy.preferSbcStorage && storageFreeSlots > 0) {
+      if (item.hasStorableEvidence !== true) {
+        actions.push(
+          createAction(
+            item,
+            INVENTORY_RESOLUTION_ACTIONS.PAUSE,
+            "duplicate_storage_evidence_unverified",
+          ),
+        );
+        paused = true;
+        continue;
+      }
+      if (item.isStorable === true) {
+        actions.push(
+          createAction(
+            item,
+            INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE,
+            "duplicate_storage_available",
+          ),
+        );
+        storageFreeSlots -= 1;
+        occupiedVersions.add(duplicateKey);
+        continue;
+      }
+    }
+
+    if (item.hasTradabilityEvidence !== true) {
       actions.push(
         createAction(
           item,
-          INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE,
-          "duplicate_storage_available",
+          INVENTORY_RESOLUTION_ACTIONS.PAUSE,
+          "duplicate_tradability_evidence_unverified",
         ),
       );
-      storageFreeSlots -= 1;
-      occupiedVersions.add(duplicateKey);
+      paused = true;
       continue;
     }
 

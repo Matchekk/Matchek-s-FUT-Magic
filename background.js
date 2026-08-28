@@ -16,7 +16,10 @@ const FUT_MAGIC_PANEL_REQUEST = "FUT_MAGIC_PANEL_REQUEST_V1";
 const FUT_MAGIC_TAB_REQUEST = "FUT_MAGIC_TAB_REQUEST_V1";
 const FUT_MAGIC_OPEN_PANEL_REQUEST = "FUT_MAGIC_OPEN_PANEL_V1";
 const FUT_MAGIC_SIDE_PANEL_PATH = "sidepanel/index.html";
-const ALLOWED_BRIDGE_INJECT_PATHS = new Set(["page/ea-data-bridge.js"]);
+const ALLOWED_BRIDGE_INJECT_PATHS = new Set([
+  "page/ea-data-bridge.js",
+  "page/fut-magic-ea-workspace.js",
+]);
 const EA_WEBAPP_URL_RE =
   /^https:\/\/www\.ea\.com(?:\/[^/?#]+)?\/ea-sports-fc\/ultimate-team\/web-app(?:\/|$)/i;
 const FUT_PRICE_API_URL = "https://www.fut.gg/api/fut/player-prices/26/";
@@ -997,6 +1000,7 @@ const handleFutPlayersRequest = (message, sendResponse) => {
 const GP_KEYS = Object.freeze({
   activeRun: "grindpilot.activeRun.v1",
   activity: "grindpilot.activity.v1",
+  activityLedger: "grindpilot.activity-ledger.v1",
   profiles: "grindpilot.profiles.v1",
   projects: "grindpilot.projects.v1",
   settings: "grindpilot.settings.v1",
@@ -1122,6 +1126,29 @@ const gpValidateActivity = (value) => {
     throw gpStateError("GP_STATE_INVALID", "Activity must contain at most 500 records");
   }
   return activity;
+};
+
+const gpActivityLedgerKey = (partitionKey) =>
+  `${GP_KEYS.activityLedger}:${gpSafeId(partitionKey, "Activity ledger partition")}`;
+
+const gpValidateActivityLedger = (value) => {
+  const snapshot = gpCloneJson(value, "Activity ledger");
+  if (!isRecord(snapshot) || snapshot.schemaVersion !== 1 || !Array.isArray(snapshot.events) || snapshot.events.length > 5000) {
+    throw gpStateError("GP_STATE_INVALID", "Activity ledger snapshot is invalid");
+  }
+  for (const event of snapshot.events) {
+    if (!isRecord(event)) throw gpStateError("GP_STATE_INVALID", "Activity ledger event is invalid");
+    for (const field of ["eventId", "personaKey", "gameVersion", "sessionId", "operationFamily"]) {
+      gpSafeId(event[field], `Activity ledger ${field}`);
+    }
+    if (!Number.isSafeInteger(event.timestamp) || event.timestamp < 0) {
+      throw gpStateError("GP_STATE_INVALID", "Activity ledger timestamp is invalid");
+    }
+    if (!["verified", "not_applied", "transient_failure", "terminal_failure", "ambiguous"].includes(event.outcome)) {
+      throw gpStateError("GP_STATE_INVALID", "Activity ledger outcome is invalid");
+    }
+  }
+  return snapshot;
 };
 
 const gpValidateProjects = (value) => {
@@ -1258,6 +1285,16 @@ const gpHandleStateAction = async (action, payload, sender) => {
     await gpStorageSet({ [GP_KEYS.activity]: gpValidateActivity(input.value) });
     return true;
   }
+  if (action === "ACTIVITY_LEDGER_LOAD") {
+    const key = gpActivityLedgerKey(input.partitionKey);
+    const stored = await gpStorageGet([key]);
+    return stored[key] == null ? null : gpValidateActivityLedger(stored[key]);
+  }
+  if (action === "ACTIVITY_LEDGER_SAVE") {
+    const key = gpActivityLedgerKey(input.partitionKey);
+    await gpStorageSet({ [key]: gpValidateActivityLedger(input.value) });
+    return true;
+  }
   if (action === "PROJECTS_SAVE") {
     await gpStorageSet({ [GP_KEYS.projects]: gpValidateProjects(input.value) });
     return true;
@@ -1337,7 +1374,8 @@ const handleGrindPilotStateCommand = (message, sender, sendResponse) => {
   const action = String(message?.action ?? "").toUpperCase();
   const requestId = normalizeRequestId(message?.requestId);
   const allowed = new Set([
-    "BOOTSTRAP_LOAD", "SETTINGS_SAVE", "ACTIVITY_SAVE", "PROJECTS_SAVE",
+    "BOOTSTRAP_LOAD", "SETTINGS_SAVE", "ACTIVITY_SAVE",
+    "ACTIVITY_LEDGER_LOAD", "ACTIVITY_LEDGER_SAVE", "PROJECTS_SAVE",
     "PROFILE_LIST", "PROFILE_GET", "PROFILE_PUT", "PROFILE_DELETE",
     "RUN_LOAD_ACTIVE", "RUN_LOAD", "RUN_CREATE", "RUN_SAVE",
     "RUN_ASSERT_OWNER", "RUN_CLEAR",

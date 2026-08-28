@@ -1,6 +1,8 @@
 const REDACTED = "[REDACTED]";
 const CIRCULAR = "[Circular]";
 const TRUNCATED = "[Truncated]";
+const OMITTED_ACCESSOR = "[Accessor omitted]";
+const UNREADABLE = "[Unreadable object]";
 const LEVELS = new Set(["debug", "info", "warn", "error"]);
 
 const normalizeSecretKey = (key) =>
@@ -113,10 +115,30 @@ export const redactSecrets = (
     if (seen.has(current)) return CIRCULAR;
     seen.add(current);
     if (Array.isArray(current)) {
-      const result = current
-        .slice(0, Math.max(0, maxArrayLength))
-        .map((entry) => visit(entry, depth + 1));
-      if (current.length > maxArrayLength) result.push(TRUNCATED);
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(current);
+      } catch {
+        return UNREADABLE;
+      }
+      const currentLength = Number.isSafeInteger(descriptors.length?.value)
+        ? descriptors.length.value
+        : 0;
+      const result = [];
+      for (
+        let index = 0;
+        index < Math.min(currentLength, Math.max(0, maxArrayLength));
+        index += 1
+      ) {
+        const descriptor = descriptors[index];
+        if (!descriptor) continue;
+        result.push(
+          "value" in descriptor
+            ? visit(descriptor.value, depth + 1)
+            : OMITTED_ACCESSOR,
+        );
+      }
+      if (currentLength > maxArrayLength) result.push(TRUNCATED);
       return result;
     }
     if (current instanceof Map) {
@@ -126,15 +148,30 @@ export const redactSecrets = (
       return visit([...current], depth + 1);
     }
     const result = {};
-    const entries = Object.entries(current);
-    for (const [entryKey, entryValue] of entries.slice(0, Math.max(0, maxObjectKeys))) {
-      result[entryKey] = visit(entryValue, depth + 1, entryKey);
+    let descriptors;
+    try {
+      descriptors = Object.getOwnPropertyDescriptors(current);
+    } catch {
+      return UNREADABLE;
+    }
+    const entries = Object.entries(descriptors);
+    for (const [entryKey, descriptor] of entries.slice(0, Math.max(0, maxObjectKeys))) {
+      result[entryKey] =
+        "value" in descriptor
+          ? visit(descriptor.value, depth + 1, entryKey)
+          : isSecretKey(entryKey)
+            ? REDACTED
+            : OMITTED_ACCESSOR;
     }
     if (entries.length > maxObjectKeys) result.__truncated__ = TRUNCATED;
     return result;
   };
 
-  return visit(value, 0);
+  try {
+    return visit(value, 0);
+  } catch {
+    return UNREADABLE;
+  }
 };
 
 const cloneLogValue = (value) => {

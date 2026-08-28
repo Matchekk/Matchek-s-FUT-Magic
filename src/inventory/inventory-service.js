@@ -1,4 +1,5 @@
 import { DuplicateService } from "./duplicate-service.js";
+import { buildDuplicateRelations } from "./duplicate-relations.js";
 import { normalizeIdentifier } from "./item-model.js";
 import { planUnassignedResolution } from "./resolution-policy.js";
 import { InventorySnapshotStore } from "./snapshot-store.js";
@@ -52,6 +53,10 @@ export class InventoryService {
 
   getDuplicateGroups() {
     return this.#duplicates.group(this.getSnapshot().items);
+  }
+
+  getDuplicateRelations() {
+    return buildDuplicateRelations(this.getSnapshot());
   }
 
   planUnassignedResolution(policy) {

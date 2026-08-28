@@ -405,23 +405,60 @@ const containsAll = (actual, required) => {
   return required.every((entry) => set.has(entry));
 };
 
-const eligibleForEdge = (state, edge) => {
+export const EvolutionEligibilityReason = Object.freeze({
+  POSITION_ANY_OF_MISSING: "POSITION_ANY_OF_MISSING",
+  POSITION_ALL_OF_MISSING: "POSITION_ALL_OF_MISSING",
+  ROLE_MISSING: "ROLE_MISSING",
+  PLAYSTYLE_MISSING: "PLAYSTYLE_MISSING",
+  PLAYSTYLE_PLUS_MISSING: "PLAYSTYLE_PLUS_MISSING",
+  RARITY_MISMATCH: "RARITY_MISMATCH",
+  ELIGIBILITY_TAG_MISSING: "ELIGIBILITY_TAG_MISSING",
+  EXCLUDED_ELIGIBILITY_TAG: "EXCLUDED_ELIGIBILITY_TAG",
+  OVERALL_BELOW_MINIMUM: "OVERALL_BELOW_MINIMUM",
+  OVERALL_ABOVE_MAXIMUM: "OVERALL_ABOVE_MAXIMUM",
+  ATTRIBUTE_BELOW_MINIMUM: "ATTRIBUTE_BELOW_MINIMUM",
+  ATTRIBUTE_ABOVE_MAXIMUM: "ATTRIBUTE_ABOVE_MAXIMUM",
+  EVOLUTION_ALREADY_APPLIED: "EVOLUTION_ALREADY_APPLIED",
+});
+
+const eligibilityReasons = (state, edge, pathHistory = []) => {
   const rule = edge.eligibility;
-  if (rule.positionsAnyOf.length && !rule.positionsAnyOf.some((entry) => state.positions.includes(entry))) return false;
-  if (!containsAll(state.positions, rule.positionsAllOf)) return false;
-  if (!containsAll(state.roles, rule.rolesAllOf)) return false;
-  if (!containsAll(state.playstyles, rule.playstylesAllOf)) return false;
-  if (!containsAll(state.playstylePlus, rule.playstylePlusAllOf)) return false;
-  if (rule.raritiesAnyOf.length && !rule.raritiesAnyOf.includes(state.rarity)) return false;
-  if (!containsAll(state.eligibilityTags, rule.eligibilityTagsAllOf)) return false;
-  if (rule.excludedEligibilityTags.some((entry) => state.eligibilityTags.includes(entry))) return false;
-  if (rule.overall.min != null && state.overall < rule.overall.min) return false;
-  if (rule.overall.max != null && state.overall > rule.overall.max) return false;
-  return rule.attributes.every((entry) => {
+  const reasons = [];
+  if (pathHistory.includes(edge.edgeKey) || state.appliedEvolutions.includes(edge.edgeKey)) {
+    reasons.push({ code: EvolutionEligibilityReason.EVOLUTION_ALREADY_APPLIED, field: "edgeKey" });
+  }
+  if (rule.positionsAnyOf.length && !rule.positionsAnyOf.some((entry) => state.positions.includes(entry))) {
+    reasons.push({ code: EvolutionEligibilityReason.POSITION_ANY_OF_MISSING, field: "positions" });
+  }
+  if (!containsAll(state.positions, rule.positionsAllOf)) reasons.push({ code: EvolutionEligibilityReason.POSITION_ALL_OF_MISSING, field: "positions" });
+  if (!containsAll(state.roles, rule.rolesAllOf)) reasons.push({ code: EvolutionEligibilityReason.ROLE_MISSING, field: "roles" });
+  if (!containsAll(state.playstyles, rule.playstylesAllOf)) reasons.push({ code: EvolutionEligibilityReason.PLAYSTYLE_MISSING, field: "playstyles" });
+  if (!containsAll(state.playstylePlus, rule.playstylePlusAllOf)) reasons.push({ code: EvolutionEligibilityReason.PLAYSTYLE_PLUS_MISSING, field: "playstylePlus" });
+  if (rule.raritiesAnyOf.length && !rule.raritiesAnyOf.includes(state.rarity)) reasons.push({ code: EvolutionEligibilityReason.RARITY_MISMATCH, field: "rarity" });
+  if (!containsAll(state.eligibilityTags, rule.eligibilityTagsAllOf)) reasons.push({ code: EvolutionEligibilityReason.ELIGIBILITY_TAG_MISSING, field: "eligibilityTags" });
+  if (rule.excludedEligibilityTags.some((entry) => state.eligibilityTags.includes(entry))) reasons.push({ code: EvolutionEligibilityReason.EXCLUDED_ELIGIBILITY_TAG, field: "eligibilityTags" });
+  if (rule.overall.min != null && state.overall < rule.overall.min) reasons.push({ code: EvolutionEligibilityReason.OVERALL_BELOW_MINIMUM, field: "overall" });
+  if (rule.overall.max != null && state.overall > rule.overall.max) reasons.push({ code: EvolutionEligibilityReason.OVERALL_ABOVE_MAXIMUM, field: "overall" });
+  for (const entry of rule.attributes) {
     const current = state.attributes[entry.attribute];
-    return (entry.min == null || current >= entry.min) && (entry.max == null || current <= entry.max);
-  });
+    if (entry.min != null && current < entry.min) reasons.push({ code: EvolutionEligibilityReason.ATTRIBUTE_BELOW_MINIMUM, field: entry.attribute });
+    if (entry.max != null && current > entry.max) reasons.push({ code: EvolutionEligibilityReason.ATTRIBUTE_ABOVE_MAXIMUM, field: entry.attribute });
+  }
+  return reasons;
 };
+
+const eligibleForEdge = (state, edge) => eligibilityReasons(state, edge).length === 0;
+
+export function evaluateEvolutionEligibility({ playerState, evolution, pathHistory = [] } = {}) {
+  if (!Array.isArray(pathHistory) || pathHistory.length > EVOLUTION_PLANNER_HARD_LIMITS.maxDepth) {
+    fail(EvolutionPlannerErrorCode.BOUND_EXCEEDED, "Path history exceeds its bound", "$evolutionPlanner.pathHistory");
+  }
+  const state = normalizeEvolutionPlayerState(playerState);
+  const edge = normalizeEdge(evolution, 0);
+  const history = sortedUniqueTokens(pathHistory, "$evolutionPlanner.pathHistory");
+  const reasons = eligibilityReasons(state, edge, history);
+  return cloneAndFreeze({ eligible: reasons.length === 0, reasons });
+}
 
 const union = (left, right) => [...new Set([...left, ...right])].sort(compareText);
 
@@ -454,6 +491,24 @@ const applyEdge = (state, edge) => {
     appliedEvolutions: union(state.appliedEvolutions, [edge.edgeKey]),
   }, "$evolutionPlanner.transformedState");
 };
+
+export function applyEvolution({
+  playerState,
+  evolution,
+  pathHistory = [],
+  rulesVersion = "evolution_rules.v1",
+} = {}) {
+  if (rulesVersion !== "evolution_rules.v1") {
+    fail(EvolutionPlannerErrorCode.INVALID_TRANSFORMATION, "Unsupported Evolution rules version", "$evolutionPlanner.rulesVersion");
+  }
+  const state = normalizeEvolutionPlayerState(playerState);
+  const edge = normalizeEdge(evolution, 0);
+  const eligibility = evaluateEvolutionEligibility({ playerState: state, evolution, pathHistory });
+  if (!eligibility.eligible) {
+    fail(EvolutionPlannerErrorCode.INVALID_INPUT, "Evolution is not eligible for this player state", "$evolutionPlanner.evolution");
+  }
+  return applyEdge(state, edge);
+}
 
 const semanticState = (state) => ({
   overall: state.overall,
@@ -668,6 +723,7 @@ export const planEvolutionPaths = (request = {}) => {
   };
   const inputFingerprint = stableFingerprint(inputCanonical);
   const baseline = {
+    overall: normalizedState.overall,
     stateFingerprint: fingerprintEvolutionPlayerState(normalizedState),
     objectiveVector: objectiveVector(initial, normalizedObjective),
   };

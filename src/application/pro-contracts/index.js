@@ -1,4 +1,5 @@
 export * from "./auth-provider.js";
+export * from "./auth-single-flight.js";
 export * from "./cloud-planner-provider.js";
 export * from "./compatibility-config.js";
 export * from "./entitlement-provider.js";

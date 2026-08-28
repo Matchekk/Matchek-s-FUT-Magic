@@ -2,6 +2,7 @@ const COMMAND_TYPE = "GRINDPILOT_STATE_COMMAND_V2";
 const DEFAULT_TIMEOUT_MS = 5_000;
 const STORAGE_KEYS = Object.freeze({
   activity: "grindpilot.activity.v1",
+  activityLedger: "grindpilot.activity-ledger.v1",
   profiles: "grindpilot.profiles.v1",
   projects: "grindpilot.projects.v1",
   settings: "grindpilot.settings.v1",
@@ -11,6 +12,8 @@ const DIRECT_STORAGE_ACTIONS = new Set([
   "BOOTSTRAP_LOAD",
   "SETTINGS_SAVE",
   "ACTIVITY_SAVE",
+  "ACTIVITY_LEDGER_LOAD",
+  "ACTIVITY_LEDGER_SAVE",
   "PROJECTS_SAVE",
   "PROFILE_LIST",
   "PROFILE_GET",
@@ -21,6 +24,14 @@ const DIRECT_STORAGE_ACTIONS = new Set([
 const requestId = () =>
   globalThis.crypto?.randomUUID?.() ??
   `gp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const activityLedgerKey = (partitionKey) => {
+  const token = String(partitionKey ?? "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(token)) {
+    throw new TypeError("Activity ledger partition is invalid");
+  }
+  return `${STORAGE_KEYS.activityLedger}:${token}`;
+};
 
 /**
  * Narrow state client used from the extension's isolated content-script world.
@@ -140,6 +151,16 @@ export class PageStorageArea {
       await this.storageCall("set", { [STORAGE_KEYS.activity]: input.value });
       return true;
     }
+    if (action === "ACTIVITY_LEDGER_LOAD") {
+      const key = activityLedgerKey(input.partitionKey);
+      const stored = await this.storageCall("get", [key]);
+      return stored?.[key] ?? null;
+    }
+    if (action === "ACTIVITY_LEDGER_SAVE") {
+      const key = activityLedgerKey(input.partitionKey);
+      await this.storageCall("set", { [key]: input.value });
+      return true;
+    }
     if (action === "PROJECTS_SAVE") {
       await this.storageCall("set", { [STORAGE_KEYS.projects]: input.value });
       return true;
@@ -173,6 +194,12 @@ export class PageStorageArea {
   loadBootstrap() { return this.command("BOOTSTRAP_LOAD"); }
   saveSettings(value) { return this.command("SETTINGS_SAVE", { value }); }
   saveActivity(value) { return this.command("ACTIVITY_SAVE", { value }); }
+  loadActivityLedger(partitionKey) {
+    return this.command("ACTIVITY_LEDGER_LOAD", { partitionKey });
+  }
+  saveActivityLedger(partitionKey, value) {
+    return this.command("ACTIVITY_LEDGER_SAVE", { partitionKey, value });
+  }
   saveProjects(value) { return this.command("PROJECTS_SAVE", { value }); }
 
   listProfiles() { return this.command("PROFILE_LIST"); }

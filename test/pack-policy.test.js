@@ -53,3 +53,11 @@ test("reward identification refuses ambiguous pack snapshot changes", () => {
     ],
   }), (error) => error instanceof PackPolicyError && error.code === "REWARD_PACK_AMBIGUOUS");
 });
+
+test("reward identification refuses a plus-two delta on one pack ID", () => {
+  assert.throws(() => identifyClaimedRewardPack({
+    claim: { success: true },
+    packsBefore: [{ packId: "a", count: 1, owned: true, source: "reward" }],
+    packsAfter: [{ packId: "a", count: 3, owned: true, source: "reward" }],
+  }), (error) => error instanceof PackPolicyError && error.code === "REWARD_PACK_AMBIGUOUS");
+});

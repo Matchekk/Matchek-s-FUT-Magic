@@ -32,6 +32,8 @@ already shipped and validated in the public client.
 The modules in `src/application/pro-contracts/` define:
 
 - token-free authentication state and a not-configured provider;
+- a provider-neutral single-flight refresh wrapper that validates the same
+  token-free snapshot and clears failed in-flight work before a later retry;
 - evidence-backed, expiring entitlement state that fails to Free;
 - request-local random handle scopes for items, groups, projects and
   requirements;

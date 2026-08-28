@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FUT Magic EA-native workspace harness</title>
+    <link rel="stylesheet" href="../page/ea-data-bridge.css">
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { min-height: 100%; margin: 0; }
+      body {
+        overflow: auto;
+        color: #e6edf5;
+        background: #070b16;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      button, input, select { font: inherit; }
+      .harness-shell { min-height: 100vh; display: grid; grid-template: 68px 1fr / 88px 1fr; }
+      .harness-topbar {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        padding: 0 28px;
+        border-bottom: 1px solid rgba(167, 178, 201, .15);
+        background: #111521;
+      }
+      .harness-topbar__mark {
+        width: 34px;
+        height: 34px;
+        display: grid;
+        place-items: center;
+        border: 1px solid rgba(0, 230, 255, .35);
+        border-radius: 10px;
+        color: #00e6ff;
+        font-weight: 800;
+      }
+      #native-title { font-size: 22px; font-weight: 680; letter-spacing: -.02em; }
+      .harness-status { margin-left: auto; color: #a7b2c9; font-size: 13px; }
+      .harness-status::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: #26ffc2; }
+      .harness-sidebar {
+        grid-row: 2;
+        padding: 22px 10px;
+        border-right: 1px solid rgba(167, 178, 201, .12);
+        background: #0b0f19;
+      }
+      .harness-sidebar span { display: block; padding: 12px 0; color: #758198; text-align: center; font-size: 11px; }
+      #ea-content { grid-column: 2; min-width: 0; min-height: calc(100vh - 68px); }
+      .home-view { min-height: calc(100vh - 68px); padding: 44px; background: radial-gradient(circle at 75% 10%, rgba(38,255,194,.12), transparent 31%), #0b1020; }
+      .home-view h1 { margin: 0 0 8px; font-size: 28px; }
+      .home-view p { margin: 0 0 28px; color: #a7b2c9; }
+      .layout-hub.grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 360px)); gap: 16px; }
+      .ut-tile-view--with-gfx {
+        min-height: 164px;
+        padding: 0;
+        overflow: hidden;
+        border: 1px solid rgba(167, 178, 201, .2);
+        border-radius: 16px;
+        color: inherit;
+        background: #151c2d;
+        text-align: left;
+        cursor: pointer;
+      }
+      .ut-tile-view--with-gfx > .tile-title { display: none; }
+      .native-placeholder { display: grid; place-items: center; min-height: 164px; color: #a7b2c9; }
+      .fixture-stage { margin: 0; }
+      @media (max-width: 760px) {
+        .harness-shell { grid-template-columns: 0 1fr; }
+        .harness-sidebar { overflow: hidden; padding: 0; }
+        .home-view { padding: 24px; }
+        .layout-hub.grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="harness-shell">
+      <header class="harness-topbar">
+        <span class="harness-topbar__mark" aria-hidden="true">FM</span>
+        <span id="native-title">Home</span>
+        <span class="harness-status">Connected test shell</span>
+      </header>
+      <nav class="harness-sidebar" aria-label="Game navigation">
+        <span>Home</span><span>SBCs</span><span>Club</span><span>Store</span>
+      </nav>
+      <main id="ea-content"></main>
+    </div>
+    <script>
+      (() => {
+        const content = document.querySelector("#ea-content");
+        const title = document.querySelector("#native-title");
+        const makeHomeRoot = () => {
+          const root = document.createElement("section");
+          root.className = "home-view";
+          root.innerHTML = '<h1>Ultimate Team</h1><p>Choose where you want to continue.</p><div class="layout-hub grid"><button class="ut-tile-view--with-gfx native-placeholder" type="button">Squad Building Challenges</button></div>';
+          return root;
+        };
+
+        window.JSUtils = {
+          inherits(child, parent) {
+            child.prototype = Object.create(parent.prototype);
+            child.prototype.constructor = child;
+          },
+        };
+        window.EventType = { TAP: "tap" };
+        window.EAView = function EAView() {};
+        window.EAViewController = function EAViewController() {
+          this.initialized = false;
+          this.view = null;
+        };
+        window.EAViewController.prototype.init = function () {
+          this.view = this._getViewInstanceFromData?.() ?? null;
+          this.view?.getRootElement?.();
+          this.initialized = true;
+        };
+        window.EAViewController.prototype.getView = function () { return this.view; };
+        window.EAViewController.prototype.getNavigationController = function () { return navigation; };
+        window.EAViewController.prototype.viewDidAppear = function () {};
+        window.EAViewController.prototype.viewWillDisappear = function () {};
+
+        window.UTTileView = function UTTileView() {
+          this.root = document.createElement("button");
+          this.root.type = "button";
+          this.titleNode = document.createElement("span");
+          this.titleNode.className = "tile-title";
+          this.root.appendChild(this.titleNode);
+        };
+        window.UTTileView.prototype.init = function () {};
+        window.UTTileView.prototype.setTitle = function (value) { this.titleNode.textContent = value; };
+        window.UTTileView.prototype.getRootElement = function () { return this.root; };
+        window.UTTileView.prototype.addTarget = function (_target, handler) {
+          this.__handler = handler;
+          this.root.addEventListener("click", handler);
+        };
+        window.UTTileView.prototype.removeTarget = function (_target, handler) {
+          this.root.removeEventListener("click", handler);
+        };
+
+        window.UTHomeHubView = function UTHomeHubView() { this.__root = null; };
+        window.UTHomeHubView.prototype._generate = function () {
+          if (!this.__root) this.__root = makeHomeRoot();
+        };
+        window.UTHomeHubView.prototype.getRootElement = function () {
+          this._generate();
+          return this.__root;
+        };
+        window.UTHomeHubViewController = function UTHomeHubViewController() {
+          this.view = new window.UTHomeHubView();
+          this.view._generate();
+        };
+        window.UTHomeHubViewController.prototype.getView = function () { return this.view; };
+        window.UTHomeHubViewController.prototype.getNavigationController = function () { return navigation; };
+        window.UTHomeHubViewController.prototype.viewDidAppear = function () {};
+        window.UTHomeHubViewController.prototype.viewWillDisappear = function () {};
+
+        const home = new window.UTHomeHubViewController();
+        let current = home;
+        const navigation = {
+          pushViewController(controller) {
+            current.viewWillDisappear?.();
+            current = controller;
+            content.replaceChildren(controller.getView().getRootElement());
+            title.textContent = controller.getNavigationTitle?.() ?? "Workspace";
+            controller.viewDidAppear?.();
+          },
+          popViewController() {
+            current.viewWillDisappear?.();
+            current = home;
+            content.replaceChildren(home.getView().getRootElement());
+            title.textContent = "Home";
+            home.viewDidAppear?.();
+          },
+          setNavigationVisibility() {},
+        };
+        window.getAppMain = () => ({
+          getRootViewController: () => ({
+            getPresentedViewController: () => ({
+              getCurrentViewController: () => current,
+            }),
+          }),
+        });
+
+        let planner = null;
+        window.eaData = {
+          async openSequenceSolver(options = {}) {
+            if (options.presentation !== "native" || !(options.mount instanceof HTMLElement)) return false;
+            planner = document.createElement("div");
+            planner.className = "ea-data-overlay-shell ea-data-overlay-shell--sequence is-open fixture-stage";
+            planner.dataset.presentation = "native";
+            planner.setAttribute("role", "region");
+            planner.setAttribute("aria-hidden", "false");
+            planner.style.display = "flex";
+            planner.innerHTML = `
+              <div class="ea-data-sequence-modal" role="region" aria-labelledby="ea-data-sequence-title">
+                <div class="ea-data-sequence-header">
+                  <div class="ea-data-sequence-title-wrap">
+                    <div class="ea-data-sequence-brandline"><span class="ea-data-sequence-brandmark" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M14 8h22l-3 7H20l-4 21h15l5-6"/><path d="M9 39c11 2 22-1 30-10"/><path d="M34 5v8M30 9h8"/></svg></span><span>FUT <strong>Magic</strong></span></div>
+                    <div class="ea-data-sequence-title" id="ea-data-sequence-title" tabindex="-1">Grind planner</div>
+                    <div class="ea-data-sequence-subtitle">Protected routes with a preview before every submission.</div>
+                  </div>
+                  <div class="ea-data-sequence-header-meta"><div class="ea-data-sequence-badge ea-data-sequence-badge--accent">Saved</div><div class="ea-data-sequence-badge">Idle</div></div>
+                </div>
+                <div class="ea-data-sequence-body">
+                  <aside class="ea-data-sequence-sidebar">
+                    <div class="ea-data-sequence-sidebar-head"><div class="ea-data-sequence-sidebar-title">Grind plans</div><div class="ea-data-sequence-sidebar-copy">1 saved locally</div></div>
+                    <div class="ea-data-sequence-sidebar-actions"><button class="ea-data-sequence-sidebar-btn" type="button">+ New plan</button></div>
+                    <div class="ea-data-sequence-plan-list"><div class="ea-data-sequence-plan-card is-active"><div class="ea-data-sequence-plan-card-row"><div class="ea-data-sequence-plan-name">Neymar route</div><button class="ea-data-sequence-plan-delete-btn" type="button" aria-label="Delete plan">×</button></div><div class="ea-data-sequence-plan-meta"><span>2 active</span><span>Draft</span></div></div></div>
+                    <div class="ea-data-sequence-sidebar-footer"><button class="ea-data-sequence-sidebar-btn ea-data-sequence-sidebar-btn--close" type="button">Back</button></div>
+                  </aside>
+                  <div class="ea-data-sequence-main">
+                    <nav class="ea-data-sequence-tabs" aria-label="Planner sections">
+                      <button class="ea-data-sequence-tab is-active" type="button"><span class="ea-data-sequence-tab-label">Steps<span class="ea-data-sequence-tab-indicator">2</span></span></button>
+                      <button class="ea-data-sequence-tab" type="button"><span class="ea-data-sequence-tab-label">Settings</span></button>
+                      <button class="ea-data-sequence-tab" type="button"><span class="ea-data-sequence-tab-label">Execution</span></button>
+                    </nav>
+                    <div class="ea-data-sequence-status-bar"><div class="ea-data-sequence-status-text">Ready to preview · Activity Guard normal</div></div>
+                    <div class="ea-data-sequence-panels"><div class="ea-data-sequence-tab-panel is-active"><div class="ea-data-sequence-tab-panel-inner">
+                      <div class="ea-data-sequence-surface"><div class="ea-data-sequence-surface__head"><div><div class="ea-data-sequence-surface__title">Neymar route</div><div class="ea-data-sequence-surface__copy">Recycle upgrade rewards while protected players stay locked.</div></div><div class="ea-data-sequence-badge">4 loops</div></div></div>
+                      <div class="ea-data-sequence-step-card is-expanded"><div class="ea-data-sequence-step-summary"><div class="ea-data-sequence-step-summary-left"><div class="ea-data-sequence-step-chevron">▶</div><div class="ea-data-sequence-step-title">Step 1</div><div class="ea-data-sequence-step-meta">Solve 85×10 upgrade</div></div><div class="ea-data-sequence-step-summary-right"><div class="ea-data-sequence-step-badge">Ready</div></div></div><div class="ea-data-sequence-step-detail"><div class="ea-data-sequence-step-detail-body"><div class="ea-data-sequence-step-grid ea-data-sequence-step-grid--triple"><div class="ea-data-sequence-field"><label class="ea-data-sequence-label">Target</label><select class="ea-data-sequence-select"><option>85×10 Upgrade</option></select></div><div class="ea-data-sequence-field"><label class="ea-data-sequence-label">Loops</label><input class="ea-data-sequence-input" value="4"></div><div class="ea-data-sequence-field"><label class="ea-data-sequence-label">Submission</label><select class="ea-data-sequence-select"><option>Review first</option></select></div></div></div></div></div>
+                      <div class="ea-data-sequence-step-card"><div class="ea-data-sequence-step-summary"><div class="ea-data-sequence-step-summary-left"><div class="ea-data-sequence-step-chevron">▶</div><div class="ea-data-sequence-step-title">Step 2</div><div class="ea-data-sequence-step-meta">Route rewards and duplicates</div></div><div class="ea-data-sequence-step-summary-right"><div class="ea-data-sequence-step-badge">Next</div></div></div></div>
+                    </div></div></div>
+                    <div class="ea-data-sequence-footer"><div class="ea-data-sequence-footer-group"><button class="ea-data-btn ea-data-btn--info" id="ea-data-sequence-add-step-footer-btn" type="button">+ Add step</button></div><div class="ea-data-sequence-footer-group"><button class="ea-data-btn ea-data-btn--primary" id="ea-data-sequence-save-btn" type="button">Save</button><button class="ea-data-btn ea-data-btn--success" id="ea-data-sequence-start-btn" type="button" disabled>Planning only</button></div></div>
+                  </div>
+                </div>
+              </div>`;
+            planner.querySelector(".ea-data-sequence-sidebar-btn--close").addEventListener("click", () => options.onRequestClose?.());
+            options.mount.replaceChildren(planner);
+            window.__lastNativeOpen = options;
+            return true;
+          },
+          closeSequenceSolver() {
+            planner?.remove();
+            planner = null;
+            return true;
+          },
+        };
+
+        content.replaceChildren(home.getView().getRootElement());
+        window.__nativeHarnessReady = true;
+      })();
+    </script>
+    <script src="../page/fut-magic-ea-workspace.js"></script>
+  </body>
+</html>

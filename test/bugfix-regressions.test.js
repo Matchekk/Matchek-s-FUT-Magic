@@ -78,17 +78,17 @@ test("organizer apply preserves exact unassigned item IDs", () => {
   assert.match(bridgeSource, /filter\(\(id\) => Boolean\(id\) && id !== "0"\)/);
 });
 
-test("Recycle Cards always hands unresolved leftovers to Organizer", () => {
+test("Recycle Cards never hands unresolved leftovers to Organizer without review", () => {
   const runtimeSource = readFileSync(
     new URL("../src/grindpilot-main.js", import.meta.url),
     "utf8",
   );
-  assert.match(runtimeSource, /allowPartial: true,\s*allowUnresolved: true/);
-  assert.match(runtimeSource, /id: "organize-remaining-items"/);
-  assert.doesNotMatch(
-    runtimeSource,
-    /plan\.requiresUserAction\s*\?\s*\[\{\s*id: "organize-remaining-items"/,
+  assert.match(runtimeSource, /allowPartial: true,\s*allowUnresolved: false/);
+  const recycleMethod = runtimeSource.slice(
+    runtimeSource.indexOf("async recycleCards()"),
+    runtimeSource.indexOf("async getOrganizerTarget()"),
   );
+  assert.doesNotMatch(recycleMethod, /ORGANIZE_ITEMS|organize-remaining-items/);
 });
 import { readFileSync } from "node:fs";
 
@@ -204,12 +204,17 @@ test("isolated-world state client uses AutoSBC direct storage for local GrindPil
   const storage = new PageStorageArea({ runtime, storage: directStorage, timeoutMs: 100 });
 
   await storage.saveActivity([{ level: "info", action: "Solve" }]);
+  await storage.saveActivityLedger("session:test", { schemaVersion: 1, prunedBefore: null, events: [] });
   await storage.saveSettings({ mode: "REVIEW" });
   const bootstrap = await storage.loadBootstrap();
 
   assert.deepEqual(bootstrap.activity, [{ level: "info", action: "Solve" }]);
   assert.deepEqual(bootstrap.settings, { mode: "REVIEW" });
   assert.deepEqual(bootstrap.projects, []);
+  assert.deepEqual(
+    await storage.loadActivityLedger("session:test"),
+    { schemaVersion: 1, prunedBefore: null, events: [] },
+  );
   assert.equal(messages.length, 0);
 
   await storage.loadActiveRun("owner-1");

@@ -69,3 +69,8 @@ The truthful release statement is:
 > This release includes a deterministic local Evolution path-planning engine
 > and synthetic contract fixtures. It does not include a live Evolution
 > catalog, provider connection, price feed, activation, or execution.
+
+The newer bounded beam strategy, named comparison modes, transparent FUT Magic
+role profiles and Club Scan coordinator are specified in
+[evolution-engine.md](evolution-engine.md). The original Pareto planner remains
+the exhaustive-within-bounds oracle; beam results never claim completeness.

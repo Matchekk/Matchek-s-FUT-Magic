@@ -27,6 +27,7 @@ test("active-squad protection cannot be disabled by stored or UI settings", asyn
     profileRepository: new InMemoryProfileRepository(),
     enableUi: false,
     enableActivityPersistence: false,
+    minimumActivitySpacingMs: 0,
     root: {},
     origin: "https://fake.invalid",
   });
@@ -61,6 +62,7 @@ test("fake EA completes 20 grind iterations and reconciles every destructive rel
     profileRepository,
     enableUi: false,
     enableActivityPersistence: false,
+    minimumActivitySpacingMs: 0,
     confirm: () => true,
     root: {},
     origin: "https://fake.invalid",
@@ -180,7 +182,7 @@ test("Recycle Cards quick action moves only safe unassigned cards without a seco
   assert.deepEqual(confirmations, []);
 });
 
-test("Organizer never targets full SBC Storage and consumes the exact leftover cards in the chosen SBC", async () => {
+test("legacy Recycle Cards never sends full-storage leftovers to Organizer without a reviewed recipe", async () => {
   const adapter = new FakeEaAdapter({ iterations: 1 });
   const duplicateSource = adapter.club[20];
   adapter.storage = [{
@@ -236,19 +238,17 @@ test("Organizer never targets full SBC Storage and consumes the exact leftover c
 
   const run = await runtime.recycleCards();
 
-  assert.equal(run.status, "completed");
+  assert.equal(run.status, "paused");
   assert.equal(adapter.calls.resolve, 1);
-  assert.equal(adapter.calls.organize, 1);
+  assert.equal(adapter.calls.organize, 0);
   assert.ok(adapter.club.some((item) => item.itemId === "organizer-normal"));
   assert.equal(adapter.storage.length, 1, "full storage must not receive another card");
   assert.ok(!adapter.storage.some((item) => item.itemId === "organizer-leftover"));
-  assert.ok(!adapter.unassigned.some((item) => item.itemId === "organizer-leftover"));
-  const organizerNode = run.nodes.find((node) => node.step.type === "ORGANIZE_ITEMS");
-  assert.deepEqual(organizerNode.intent.requiredItemIds, ["organizer-leftover"]);
-  assert.deepEqual(organizerNode.result.organizedItemIds, ["organizer-leftover"]);
+  assert.ok(adapter.unassigned.some((item) => item.itemId === "organizer-leftover"));
+  assert.equal(run.nodes.some((node) => node.step.type === "ORGANIZE_ITEMS"), false);
 });
 
-test("Organizer discovers 10x85 automatically when no Target Project exists", async () => {
+test("legacy Recycle Cards never guesses an Organizer target", async () => {
   const adapter = new FakeEaAdapter({ iterations: 1 });
   const duplicateSource = adapter.club[20];
   adapter.storageCapacity = 1;
@@ -286,13 +286,10 @@ test("Organizer discovers 10x85 automatically when no Target Project exists", as
 
   const run = await runtime.recycleCards();
 
-  assert.equal(run.status, "completed");
-  assert.equal(adapter.calls.organize, 1);
-  assert.equal(adapter.unassigned.length, 0);
-  const organizerNode = run.nodes.find((node) => node.step.type === "ORGANIZE_ITEMS");
-  assert.equal(organizerNode.intent.target.setId, adapter.setId);
-  assert.equal(organizerNode.intent.target.challengeId, "challenge-1");
-  assert.deepEqual(organizerNode.intent.requiredItemIds, ["auto-target-leftover"]);
+  assert.equal(run.status, "paused");
+  assert.equal(adapter.calls.organize, 0);
+  assert.equal(adapter.unassigned.length, 1);
+  assert.equal(run.nodes.some((node) => node.step.type === "ORGANIZE_ITEMS"), false);
 });
 
 test("Quick Open opens exactly one verified owned pack and never buys one", async () => {

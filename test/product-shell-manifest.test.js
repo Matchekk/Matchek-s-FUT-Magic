@@ -12,6 +12,10 @@ test("manifest exposes the native FUT Magic Side Panel with scoped MV3 permissio
   assert.equal(existsSync(new URL("../sidepanel/index.html", import.meta.url)), true);
   assert.equal(existsSync(new URL("../sidepanel/app.js", import.meta.url)), true);
   assert.doesNotMatch(readFileSync(new URL("../sidepanel/index.html", import.meta.url), "utf8"), /https?:\/\/[^\s"']+\.js/i);
+  const resources = manifest.web_accessible_resources.flatMap(
+    (entry) => entry.resources ?? [],
+  );
+  assert.ok(resources.includes("page/fut-magic-ea-workspace.js"));
 });
 
 test("legacy GrindPilot storage keys remain present for backward compatibility", () => {

@@ -155,6 +155,10 @@ export class EaSurfaceActions {
     this.state = runtime.getState();
     this.syncQueued = false;
     this.packRefreshToken = 0;
+    this.organizeSurface = null;
+    this.organizeRefreshToken = 0;
+    this.organizeRefreshTimer = null;
+    this.organizeInventoryRefreshing = false;
     this.unsubscribe = runtime.subscribe((state) => {
       this.state = state;
       this.scheduleSync();
@@ -285,12 +289,18 @@ export class EaSurfaceActions {
   }
 
   mountOrganizeButton() {
+    const menu = findItemsMenu(this.root);
+    if (!menu?.parentElement) {
+      this.organizeSurface = null;
+      return;
+    }
+    const enteredSurface = this.organizeSurface !== menu.parentElement;
+    this.organizeSurface = menu.parentElement;
+    if (enteredSurface) this.queueOrganizeInventoryRefresh();
     if (this.root.querySelector(".grindpilot-organize-native")) {
       this.updateOrganizeButton();
       return;
     }
-    const menu = findItemsMenu(this.root);
-    if (!menu?.parentElement) return;
     const organize = createNativePeer(menu, {
       className: "grindpilot-organize-native",
       label: "Organize",
@@ -316,26 +326,61 @@ export class EaSurfaceActions {
     this.updateOrganizeButton();
   }
 
+  queueOrganizeInventoryRefresh() {
+    const token = ++this.organizeRefreshToken;
+    if (this.organizeRefreshTimer != null) clearTimeout(this.organizeRefreshTimer);
+    this.organizeInventoryRefreshing = true;
+    this.updateOrganizeButton();
+    this.organizeRefreshTimer = setTimeout(async () => {
+      this.organizeRefreshTimer = null;
+      try {
+        await this.runtime.refreshInventory({ requireNewer: true });
+      } catch (error) {
+        this.runtime.reportUiError(error);
+      } finally {
+        if (token === this.organizeRefreshToken) {
+          this.organizeInventoryRefreshing = false;
+          this.scheduleSync();
+        }
+      }
+    }, 120);
+  }
+
   updateOrganizeButton() {
     const organize = this.root.querySelector(".grindpilot-organize-native");
     if (!organize) return;
     const count = Number(this.state.unassignedCount || 0);
     const runIdle = isIdleStatus(this.state.runStatus);
-    const label = count < 1
-      ? "Organize · No items"
-      : !runIdle
-        ? "Organize · Run active"
-        : `Organize (${count})`;
+    const available = this.state.inventoryAvailable === true;
+    const checking = this.organizeInventoryRefreshing;
+    const label = checking
+      ? "Organize · Checking…"
+      : !available
+        ? "Organize · Unavailable"
+        : count < 1
+          ? "Organize · No items"
+          : !runIdle
+            ? "Organize · Run active"
+            : `Organize (${count})`;
     setVisibleLabel(organize, label);
-    organize.disabled = count < 1 || !runIdle;
-    organize.setAttribute("aria-label", count < 1
-      ? "Organize with FUT Magic unavailable: no Unassigned items"
-      : !runIdle
-        ? "Organize with FUT Magic unavailable: finish or stop the active run first"
-        : `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic`);
-    organize.title = count > 0 && runIdle
-      ? `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic: Club/Storage first, then only a verified SBC`
-      : count < 1 ? "No Unassigned items" : "Finish or stop the active run first";
+    organize.disabled = checking || !available || count < 1 || !runIdle;
+    organize.toggleAttribute("aria-busy", checking);
+    organize.setAttribute("aria-label", checking
+      ? "Organize with FUT Magic unavailable: checking Unassigned items"
+      : !available
+        ? "Organize with FUT Magic unavailable: inventory could not be verified"
+        : count < 1
+          ? "Organize with FUT Magic unavailable: no Unassigned items"
+          : !runIdle
+            ? "Organize with FUT Magic unavailable: finish or stop the active run first"
+            : `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic`);
+    organize.title = checking
+      ? "Checking Unassigned items"
+      : !available
+        ? "Unassigned items could not be verified"
+        : count > 0 && runIdle
+          ? `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic: Club/Storage first, then only a verified SBC`
+          : count < 1 ? "No Unassigned items" : "Finish or stop the active run first";
   }
 
   mountOpenPanelButton() {
@@ -367,6 +412,8 @@ export class EaSurfaceActions {
 
   dispose() {
     this.packRefreshToken += 1;
+    this.organizeRefreshToken += 1;
+    if (this.organizeRefreshTimer != null) clearTimeout(this.organizeRefreshTimer);
     this.observer?.disconnect();
     this.unsubscribe?.();
     this.root.querySelectorAll(".grindpilot-quick-open-native,.grindpilot-organize-native,.fut-magic-open-panel-native")

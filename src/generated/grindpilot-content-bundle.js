@@ -4,6 +4,8 @@
   var REDACTED = "[REDACTED]";
   var CIRCULAR = "[Circular]";
   var TRUNCATED = "[Truncated]";
+  var OMITTED_ACCESSOR = "[Accessor omitted]";
+  var UNREADABLE = "[Unreadable object]";
   var LEVELS = /* @__PURE__ */ new Set(["debug", "info", "warn", "error"]);
   var normalizeSecretKey = (key) => String(key).normalize("NFKC").replace(/[^a-z0-9]/gi, "").toLowerCase();
   var SECRET_KEYS = /* @__PURE__ */ new Set([
@@ -79,8 +81,22 @@
       if (seen.has(current)) return CIRCULAR;
       seen.add(current);
       if (Array.isArray(current)) {
-        const result2 = current.slice(0, Math.max(0, maxArrayLength)).map((entry) => visit(entry, depth + 1));
-        if (current.length > maxArrayLength) result2.push(TRUNCATED);
+        let descriptors2;
+        try {
+          descriptors2 = Object.getOwnPropertyDescriptors(current);
+        } catch {
+          return UNREADABLE;
+        }
+        const currentLength = Number.isSafeInteger(descriptors2.length?.value) ? descriptors2.length.value : 0;
+        const result2 = [];
+        for (let index = 0; index < Math.min(currentLength, Math.max(0, maxArrayLength)); index += 1) {
+          const descriptor = descriptors2[index];
+          if (!descriptor) continue;
+          result2.push(
+            "value" in descriptor ? visit(descriptor.value, depth + 1) : OMITTED_ACCESSOR
+          );
+        }
+        if (currentLength > maxArrayLength) result2.push(TRUNCATED);
         return result2;
       }
       if (current instanceof Map) {
@@ -90,14 +106,24 @@
         return visit([...current], depth + 1);
       }
       const result = {};
-      const entries = Object.entries(current);
-      for (const [entryKey, entryValue] of entries.slice(0, Math.max(0, maxObjectKeys))) {
-        result[entryKey] = visit(entryValue, depth + 1, entryKey);
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(current);
+      } catch {
+        return UNREADABLE;
+      }
+      const entries = Object.entries(descriptors);
+      for (const [entryKey, descriptor] of entries.slice(0, Math.max(0, maxObjectKeys))) {
+        result[entryKey] = "value" in descriptor ? visit(descriptor.value, depth + 1, entryKey) : isSecretKey(entryKey) ? REDACTED : OMITTED_ACCESSOR;
       }
       if (entries.length > maxObjectKeys) result.__truncated__ = TRUNCATED;
       return result;
     };
-    return visit(value, 0);
+    try {
+      return visit(value, 0);
+    } catch {
+      return UNREADABLE;
+    }
   };
   var cloneLogValue = (value) => {
     if (typeof structuredClone === "function") return structuredClone(value);
@@ -210,6 +236,295 @@
     }
   };
 
+  // src/activity/activity-ledger.js
+  var ActivityOutcome = Object.freeze({
+    VERIFIED: "verified",
+    NOT_APPLIED: "not_applied",
+    TRANSIENT_FAILURE: "transient_failure",
+    TERMINAL_FAILURE: "terminal_failure",
+    AMBIGUOUS: "ambiguous"
+  });
+  var ActivityWindow = Object.freeze({
+    ONE_MINUTE: 6e4,
+    FIVE_MINUTES: 5 * 6e4,
+    FIFTEEN_MINUTES: 15 * 6e4,
+    ONE_HOUR: 60 * 6e4,
+    ONE_DAY: 24 * 60 * 6e4
+  });
+  var OUTCOMES = new Set(Object.values(ActivityOutcome));
+  var safeToken = (value, field) => {
+    if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(value)) {
+      throw new TypeError(`${field} must be a safe non-empty token`);
+    }
+    return value;
+  };
+  var normalizeEvent = (event) => {
+    if (!event || typeof event !== "object" || Array.isArray(event)) {
+      throw new TypeError("Activity event must be an object");
+    }
+    const timestamp = Number(event.timestamp);
+    if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new TypeError("Activity timestamp is invalid");
+    const outcome2 = String(event.outcome);
+    if (!OUTCOMES.has(outcome2)) throw new TypeError("Activity outcome is unsupported");
+    return Object.freeze({
+      eventId: safeToken(event.eventId, "eventId"),
+      timestamp,
+      personaKey: safeToken(event.personaKey, "personaKey"),
+      gameVersion: safeToken(event.gameVersion, "gameVersion"),
+      sessionId: safeToken(event.sessionId, "sessionId"),
+      operationFamily: safeToken(event.operationFamily, "operationFamily"),
+      outcome: outcome2,
+      failureClass: event.failureClass == null ? null : safeToken(event.failureClass, "failureClass")
+    });
+  };
+  var ActivityLedger = class {
+    #events = [];
+    #prunedBefore = null;
+    constructor({ maxEvents = 5e3, clock = () => Date.now(), snapshot = null } = {}) {
+      if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 2e4) {
+        throw new TypeError("maxEvents must be between 1 and 20000");
+      }
+      if (typeof clock !== "function") throw new TypeError("clock must be a function");
+      this.maxEvents = maxEvents;
+      this.clock = clock;
+      if (snapshot) this.restore(snapshot);
+    }
+    restore(snapshot) {
+      if (snapshot?.schemaVersion !== 1 || !Array.isArray(snapshot.events)) {
+        throw new TypeError("Activity ledger snapshot is invalid");
+      }
+      const events = snapshot.events.map(normalizeEvent).sort((left, right) => left.timestamp - right.timestamp || left.eventId.localeCompare(right.eventId));
+      const ids = /* @__PURE__ */ new Set();
+      for (const event of events) {
+        if (ids.has(event.eventId)) throw new TypeError("Activity ledger event IDs must be unique");
+        ids.add(event.eventId);
+      }
+      this.#events = events.slice(-this.maxEvents);
+      this.#prunedBefore = snapshot.prunedBefore == null ? null : Number(snapshot.prunedBefore);
+      if (events.length > this.maxEvents) {
+        this.#prunedBefore = events[events.length - this.maxEvents - 1].timestamp;
+      }
+    }
+    append(input) {
+      const event = normalizeEvent(input);
+      const now = Number(this.clock());
+      if (!Number.isSafeInteger(now) || now < 0 || event.timestamp > now + 6e4) {
+        throw new TypeError("Activity event time is unavailable or future-dated");
+      }
+      if (this.#events.some(({ eventId }) => eventId === event.eventId)) {
+        throw new TypeError("Activity event ID already exists");
+      }
+      this.#events.push(event);
+      this.#events.sort((left, right) => left.timestamp - right.timestamp || left.eventId.localeCompare(right.eventId));
+      if (this.#events.length > this.maxEvents) {
+        const removed = this.#events.splice(0, this.#events.length - this.maxEvents);
+        this.#prunedBefore = removed.at(-1)?.timestamp ?? this.#prunedBefore;
+      }
+      return Object.freeze({ ...event });
+    }
+    query({ personaKey, gameVersion, sessionId = null, windowMs, now = this.clock() } = {}) {
+      const persona = safeToken(personaKey, "personaKey");
+      const game = safeToken(gameVersion, "gameVersion");
+      const session = sessionId == null ? null : safeToken(sessionId, "sessionId");
+      const current = Number(now);
+      if (!Number.isSafeInteger(current) || current < 0) throw new TypeError("Activity query time is invalid");
+      if (!Number.isSafeInteger(windowMs) || windowMs < 1 || windowMs > ActivityWindow.ONE_DAY) {
+        throw new TypeError("Activity window is invalid");
+      }
+      const from = current - windowMs;
+      const events = this.#events.filter(
+        (event) => event.personaKey === persona && event.gameVersion === game && (session == null || event.sessionId === session) && event.timestamp > from && event.timestamp <= current
+      );
+      const complete = this.#prunedBefore == null || this.#prunedBefore <= from;
+      return Object.freeze({
+        from,
+        to: current,
+        complete,
+        total: events.length,
+        verified: events.filter(({ outcome: outcome2 }) => outcome2 === ActivityOutcome.VERIFIED).length,
+        failures: events.filter(({ outcome: outcome2 }) => [
+          ActivityOutcome.TRANSIENT_FAILURE,
+          ActivityOutcome.TERMINAL_FAILURE,
+          ActivityOutcome.AMBIGUOUS
+        ].includes(outcome2)).length,
+        events: Object.freeze(events.map((event) => Object.freeze({ ...event })))
+      });
+    }
+    consecutiveFailures({ personaKey, gameVersion, sessionId, operationFamily: operationFamily2 }) {
+      const matching = this.#events.filter(
+        (event) => event.personaKey === personaKey && event.gameVersion === gameVersion && event.sessionId === sessionId && event.operationFamily === operationFamily2
+      );
+      let count = 0;
+      for (let index = matching.length - 1; index >= 0; index -= 1) {
+        const outcome2 = matching[index].outcome;
+        if (outcome2 === ActivityOutcome.VERIFIED) break;
+        if ([ActivityOutcome.TRANSIENT_FAILURE, ActivityOutcome.TERMINAL_FAILURE, ActivityOutcome.AMBIGUOUS].includes(outcome2)) {
+          count += 1;
+        }
+      }
+      return count;
+    }
+    snapshot() {
+      return Object.freeze({
+        schemaVersion: 1,
+        prunedBefore: this.#prunedBefore,
+        events: Object.freeze(this.#events.map((event) => Object.freeze({ ...event })))
+      });
+    }
+    publicSummary({ personaKey, gameVersion, sessionId, now = this.clock() }) {
+      const windows = Object.fromEntries(Object.entries(ActivityWindow).map(([key, windowMs]) => [
+        key,
+        this.query({ personaKey, gameVersion, sessionId, windowMs, now }).total
+      ]));
+      return Object.freeze({ schemaVersion: 1, windows: Object.freeze(windows) });
+    }
+  };
+
+  // src/activity/activity-guard.js
+  var ActivityGuardState = Object.freeze({
+    NORMAL: "NORMAL",
+    ELEVATED: "ELEVATED",
+    CAUTION: "CAUTION",
+    PAUSED: "PAUSED",
+    RECOVERY: "RECOVERY"
+  });
+  function evaluateActivityGuard({
+    ledger,
+    activityContext,
+    now = Date.now(),
+    recoveryRequired = false,
+    circuitOpen = false
+  } = {}) {
+    if (recoveryRequired) return Object.freeze({ state: ActivityGuardState.RECOVERY, reason: "RECOVERY_REQUIRED" });
+    if (circuitOpen) return Object.freeze({ state: ActivityGuardState.PAUSED, reason: "FAILURE_STREAK" });
+    if (!ledger || !activityContext?.personaKey || !activityContext?.gameVersion || !activityContext?.sessionId) {
+      return Object.freeze({ state: ActivityGuardState.CAUTION, reason: "ACTIVITY_EVIDENCE_UNAVAILABLE" });
+    }
+    const fiveMinutes = ledger.query({ ...activityContext, windowMs: ActivityWindow.FIVE_MINUTES, now });
+    if (!fiveMinutes.complete) {
+      return Object.freeze({ state: ActivityGuardState.CAUTION, reason: "ACTIVITY_WINDOW_INCOMPLETE" });
+    }
+    const latest = fiveMinutes.events.at(-1) ?? null;
+    if (latest && [ActivityOutcome.AMBIGUOUS, ActivityOutcome.TERMINAL_FAILURE].includes(latest.outcome)) {
+      return Object.freeze({ state: ActivityGuardState.CAUTION, reason: "EA_RESPONSE_HEALTH" });
+    }
+    if (fiveMinutes.failures > 0) {
+      return Object.freeze({ state: ActivityGuardState.CAUTION, reason: "RECENT_CLASSIFIED_FAILURE" });
+    }
+    const oneMinute = ledger.query({ ...activityContext, windowMs: ActivityWindow.ONE_MINUTE, now });
+    if (oneMinute.total > 0) {
+      return Object.freeze({ state: ActivityGuardState.ELEVATED, reason: "RECENT_ACTIVITY", lastEventAt: oneMinute.events.at(-1).timestamp });
+    }
+    return Object.freeze({ state: ActivityGuardState.NORMAL, reason: "CURRENT_EVIDENCE_QUIET" });
+  }
+
+  // src/activity/operation-scheduler.js
+  var SchedulerDecision = Object.freeze({
+    ALLOW: "ALLOW",
+    WAIT_UNTIL: "WAIT_UNTIL",
+    PAUSE: "PAUSE"
+  });
+  var operationFamily = (stepType) => String(stepType ?? "UNKNOWN").toUpperCase();
+  var OperationScheduler = class {
+    constructor({
+      ledger,
+      activityContextProvider,
+      clock = () => Date.now(),
+      idFactory = () => `activity-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      failureThreshold = 3,
+      minimumSpacingMs = 0,
+      persistSnapshot = null
+    } = {}) {
+      if (!ledger?.append || !ledger?.consecutiveFailures) throw new TypeError("OperationScheduler requires an ActivityLedger");
+      if (typeof activityContextProvider !== "function") throw new TypeError("OperationScheduler requires an activity context provider");
+      if (!Number.isSafeInteger(failureThreshold) || failureThreshold < 1 || failureThreshold > 10) {
+        throw new TypeError("failureThreshold must be between 1 and 10");
+      }
+      this.ledger = ledger;
+      this.activityContextProvider = activityContextProvider;
+      this.clock = clock;
+      this.idFactory = idFactory;
+      this.failureThreshold = failureThreshold;
+      this.minimumSpacingMs = Math.max(0, Math.min(6e4, Number(minimumSpacingMs) || 0));
+      if (persistSnapshot != null && typeof persistSnapshot !== "function") {
+        throw new TypeError("persistSnapshot must be a function");
+      }
+      this.persistSnapshot = persistSnapshot;
+    }
+    #context() {
+      const context = this.activityContextProvider();
+      return {
+        personaKey: String(context?.personaKey ?? ""),
+        gameVersion: String(context?.gameVersion ?? ""),
+        sessionId: String(context?.sessionId ?? "")
+      };
+    }
+    currentGuard({ stepType = "UNKNOWN", recoveryRequired = false } = {}) {
+      const context = this.#context();
+      const circuitOpen = context.personaKey && context.gameVersion && context.sessionId ? this.ledger.consecutiveFailures({
+        ...context,
+        operationFamily: operationFamily(stepType)
+      }) >= this.failureThreshold : false;
+      return evaluateActivityGuard({
+        ledger: this.ledger,
+        activityContext: context,
+        now: this.clock(),
+        recoveryRequired,
+        circuitOpen
+      });
+    }
+    async preflight({ node, run } = {}) {
+      const recoveryRequired = run?.status === "recovery_required";
+      const guard = this.currentGuard({ stepType: node?.step?.type, recoveryRequired });
+      if (guard.state === ActivityGuardState.RECOVERY || guard.state === ActivityGuardState.PAUSED || guard.state === ActivityGuardState.CAUTION && guard.reason !== "RECENT_CLASSIFIED_FAILURE") {
+        return Object.freeze({ decision: SchedulerDecision.PAUSE, code: guard.reason, guard });
+      }
+      if (guard.state === ActivityGuardState.ELEVATED && this.minimumSpacingMs > 0 && Number.isSafeInteger(guard.lastEventAt) && guard.lastEventAt + this.minimumSpacingMs > this.clock()) {
+        return Object.freeze({
+          decision: SchedulerDecision.WAIT_UNTIL,
+          waitUntil: guard.lastEventAt + this.minimumSpacingMs,
+          code: "ACTIVITY_SPACING",
+          guard
+        });
+      }
+      return Object.freeze({ decision: SchedulerDecision.ALLOW, guard });
+    }
+    async recordSuccess({ node }) {
+      return this.#record(node, ActivityOutcome.VERIFIED, null);
+    }
+    async recordNotApplied({ node }) {
+      return this.#record(node, ActivityOutcome.NOT_APPLIED, null);
+    }
+    async recordFailure({ node, error, ambiguous = false }) {
+      const outcome2 = ambiguous ? ActivityOutcome.AMBIGUOUS : error?.safeToRetry === true ? ActivityOutcome.TRANSIENT_FAILURE : ActivityOutcome.TERMINAL_FAILURE;
+      return this.#record(node, outcome2, String(error?.code ?? "UNCLASSIFIED_FAILURE"));
+    }
+    async recordOutcome({ node, outcome: outcome2, code = null } = {}) {
+      if (!Object.values(ActivityOutcome).includes(outcome2)) {
+        throw new TypeError("Operation outcome is unsupported");
+      }
+      const failureClass = [
+        ActivityOutcome.TRANSIENT_FAILURE,
+        ActivityOutcome.TERMINAL_FAILURE,
+        ActivityOutcome.AMBIGUOUS
+      ].includes(outcome2) ? String(code ?? "UNCLASSIFIED_FAILURE") : null;
+      return this.#record(node, outcome2, failureClass);
+    }
+    async #record(node, outcome2, failureClass) {
+      const context = this.#context();
+      const event = this.ledger.append({
+        eventId: String(this.idFactory()),
+        timestamp: Number(this.clock()),
+        ...context,
+        operationFamily: operationFamily(node?.step?.type),
+        outcome: outcome2,
+        failureClass
+      });
+      if (this.persistSnapshot) await this.persistSnapshot(this.ledger.snapshot());
+      return event;
+    }
+  };
+
   // src/analytics/run-analytics.js
   var STEP = Object.freeze({
     SOLVE: "SOLVE_SBC",
@@ -294,12 +609,12 @@
   // src/application/immutable.js
   var cloneAndFreeze = (value) => {
     const clone4 = value == null ? value : structuredClone(value);
-    const freeze = (entry) => {
+    const freeze2 = (entry) => {
       if (!entry || typeof entry !== "object" || Object.isFrozen(entry)) return entry;
-      Object.values(entry).forEach(freeze);
+      Object.values(entry).forEach(freeze2);
       return Object.freeze(entry);
     };
-    return freeze(clone4);
+    return freeze2(clone4);
   };
   var stableStringify = (value) => JSON.stringify(value, (_key, entry) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
@@ -637,12 +952,12 @@
         item.isDuplicate || duplicateKey && occupiedVersions.has(duplicateKey)
       );
       if (!duplicate) {
-        if (item.isMovable === false) {
+        if (item.hasMovableEvidence !== true || item.isMovable !== true) {
           actions.push(
             createAction(
               item,
               INVENTORY_RESOLUTION_ACTIONS.PAUSE,
-              "unassigned_item_not_movable"
+              item.hasMovableEvidence === true ? "unassigned_item_not_movable" : "unassigned_move_evidence_unverified"
             )
           );
           paused2 = true;
@@ -669,16 +984,40 @@
         paused2 = true;
         continue;
       }
-      if (effectivePolicy.preferSbcStorage && storageFreeSlots > 0 && item.isStorable !== false) {
+      if (effectivePolicy.preferSbcStorage && storageFreeSlots > 0) {
+        if (item.hasStorableEvidence !== true) {
+          actions.push(
+            createAction(
+              item,
+              INVENTORY_RESOLUTION_ACTIONS.PAUSE,
+              "duplicate_storage_evidence_unverified"
+            )
+          );
+          paused2 = true;
+          continue;
+        }
+        if (item.isStorable === true) {
+          actions.push(
+            createAction(
+              item,
+              INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE,
+              "duplicate_storage_available"
+            )
+          );
+          storageFreeSlots -= 1;
+          occupiedVersions.add(duplicateKey);
+          continue;
+        }
+      }
+      if (item.hasTradabilityEvidence !== true) {
         actions.push(
           createAction(
             item,
-            INVENTORY_RESOLUTION_ACTIONS.MOVE_TO_SBC_STORAGE,
-            "duplicate_storage_available"
+            INVENTORY_RESOLUTION_ACTIONS.PAUSE,
+            "duplicate_tradability_evidence_unverified"
           )
         );
-        storageFreeSlots -= 1;
-        occupiedVersions.add(duplicateKey);
+        paused2 = true;
         continue;
       }
       const fallback = item.isTradable ? effectivePolicy.tradableWhenStorageUnavailable : effectivePolicy.untradeableWhenStorageUnavailable;
@@ -937,6 +1276,12 @@
         blockers.push({
           code: "ROUTING_CAPABILITY_EVIDENCE_MISSING",
           message: "EA did not provide verified SBC Storage evidence for every proposed card."
+        });
+      }
+      if (action.type === INVENTORY_RESOLUTION_ACTIONS.PAUSE && String(action.reason || "").endsWith("_evidence_unverified")) {
+        blockers.push({
+          code: "ROUTING_CAPABILITY_EVIDENCE_MISSING",
+          message: "EA did not provide verified movement evidence for every proposed card."
         });
       }
     }
@@ -1243,6 +1588,49 @@
   var OBJECTIVE_DIMENSIONS = new Set(Object.values(EvolutionObjectiveDimension));
   var DIRECTIONS = new Set(Object.values(EvolutionObjectiveDirection));
   var TRANSFORM_OPERATIONS = new Set(Object.values(EvolutionTransformOperation));
+  var EvolutionEligibilityReason = Object.freeze({
+    POSITION_ANY_OF_MISSING: "POSITION_ANY_OF_MISSING",
+    POSITION_ALL_OF_MISSING: "POSITION_ALL_OF_MISSING",
+    ROLE_MISSING: "ROLE_MISSING",
+    PLAYSTYLE_MISSING: "PLAYSTYLE_MISSING",
+    PLAYSTYLE_PLUS_MISSING: "PLAYSTYLE_PLUS_MISSING",
+    RARITY_MISMATCH: "RARITY_MISMATCH",
+    ELIGIBILITY_TAG_MISSING: "ELIGIBILITY_TAG_MISSING",
+    EXCLUDED_ELIGIBILITY_TAG: "EXCLUDED_ELIGIBILITY_TAG",
+    OVERALL_BELOW_MINIMUM: "OVERALL_BELOW_MINIMUM",
+    OVERALL_ABOVE_MAXIMUM: "OVERALL_ABOVE_MAXIMUM",
+    ATTRIBUTE_BELOW_MINIMUM: "ATTRIBUTE_BELOW_MINIMUM",
+    ATTRIBUTE_ABOVE_MAXIMUM: "ATTRIBUTE_ABOVE_MAXIMUM",
+    EVOLUTION_ALREADY_APPLIED: "EVOLUTION_ALREADY_APPLIED"
+  });
+
+  // src/application/evolution-analysis.js
+  var EvolutionResultMode = Object.freeze({
+    BEST_FINAL_OVR: "BEST_FINAL_OVR",
+    BIGGEST_UPGRADE: "BIGGEST_UPGRADE",
+    SHORTEST_STRONG_PATH: "SHORTEST_STRONG_PATH",
+    BEST_FOR_ROLE: "BEST_FOR_ROLE"
+  });
+  var FUT_MAGIC_ROLE_PROFILES_V1 = Object.freeze({
+    ST: Object.freeze({ pace: 2, shooting: 4, passing: 1, dribbling: 2, defending: 0, physical: 1 }),
+    CAM: Object.freeze({ pace: 1, shooting: 2, passing: 3, dribbling: 3, defending: 0, physical: 1 }),
+    RW: Object.freeze({ pace: 3, shooting: 2, passing: 2, dribbling: 3, defending: 0, physical: 0 }),
+    LW: Object.freeze({ pace: 3, shooting: 2, passing: 2, dribbling: 3, defending: 0, physical: 0 }),
+    CM: Object.freeze({ pace: 1, shooting: 1, passing: 3, dribbling: 2, defending: 2, physical: 1 }),
+    CDM: Object.freeze({ pace: 1, shooting: 0, passing: 2, dribbling: 1, defending: 4, physical: 2 }),
+    CB: Object.freeze({ pace: 1, shooting: 0, passing: 1, dribbling: 0, defending: 5, physical: 3 }),
+    LB: Object.freeze({ pace: 3, shooting: 0, passing: 2, dribbling: 1, defending: 3, physical: 1 }),
+    RB: Object.freeze({ pace: 3, shooting: 0, passing: 2, dribbling: 1, defending: 3, physical: 1 }),
+    GK: Object.freeze({ pace: 0, shooting: 0, passing: 1, dribbling: 0, defending: 5, physical: 4 })
+  });
+
+  // src/application/evolution-beam-search.js
+  var EvolutionBeamStatus = Object.freeze({
+    HEURISTIC_COMPLETE: "HEURISTIC_COMPLETE",
+    NO_VERIFIED_PATH: "NO_VERIFIED_PATH",
+    BOUNDED: "BOUNDED"
+  });
+  var HARD = Object.freeze({ maxDepth: 8, beamWidth: 64, topResults: 20, maxNodes: 2e3, maxEdgeEvaluations: 5e4, maxEdges: 512 });
 
   // src/sbc/solver/item-identity.js
   var firstDefined = (...values) => values.find((value) => value !== null && value !== void 0 && value !== "");
@@ -3781,6 +4169,26 @@
     });
   };
 
+  // src/application/solver-presets.js
+  var SolverPresetId = Object.freeze({
+    BALANCED: "BALANCED",
+    CONSERVATIVE: "CONSERVATIVE",
+    DUPLICATES_FIRST: "DUPLICATES_FIRST",
+    STORAGE_FIRST: "STORAGE_FIRST"
+  });
+  var SbcStorageMode = Object.freeze({
+    SMART: "SMART",
+    PREFER: "PREFER",
+    ONLY: "ONLY",
+    AVOID: "AVOID"
+  });
+  var PRESETS = Object.freeze({
+    BALANCED: Object.freeze({ id: "BALANCED", translationKey: "solver.preset.balanced", fodderPolicy: Object.freeze({ preferDuplicates: true, preferSbcStorage: true, preferUntradeables: true, protectTradables: false }), storageMode: "SMART" }),
+    CONSERVATIVE: Object.freeze({ id: "CONSERVATIVE", translationKey: "solver.preset.conservative", fodderPolicy: Object.freeze({ preferDuplicates: true, preferSbcStorage: true, preferUntradeables: true, protectTradables: true }), storageMode: "SMART" }),
+    DUPLICATES_FIRST: Object.freeze({ id: "DUPLICATES_FIRST", translationKey: "solver.preset.duplicatesFirst", fodderPolicy: Object.freeze({ preferDuplicates: true, preferSbcStorage: false, preferUntradeables: true, protectTradables: false }), storageMode: "AVOID" }),
+    STORAGE_FIRST: Object.freeze({ id: "STORAGE_FIRST", translationKey: "solver.preset.storageFirst", fodderPolicy: Object.freeze({ preferDuplicates: true, preferSbcStorage: true, preferUntradeables: true, protectTradables: false }), storageMode: "PREFER" })
+  });
+
   // src/application/surface-slot-registry.js
   var SurfaceSlot = Object.freeze({
     PACK_ACTIONS: "ea.pack.actions",
@@ -3788,6 +4196,440 @@
     SBC_HEADER: "ea.sbc.header",
     GLOBAL_HEADER: "ea.global.header"
   });
+
+  // src/routing/routing-rule.js
+  var RoutingDestination = Object.freeze({
+    CLUB: "CLUB",
+    SBC_STORAGE: "SBC_STORAGE",
+    TRANSFER_LIST: "TRANSFER_LIST",
+    ACTIVE_RECIPE: "ACTIVE_RECIPE",
+    KEEP_UNASSIGNED: "KEEP_UNASSIGNED",
+    ASK_USER: "ASK_USER"
+  });
+  var RoutingEffect = Object.freeze({
+    PRESERVE: "preserve",
+    CONSUME: "consume",
+    MANUAL: "manual"
+  });
+  var RoutingTradeability = Object.freeze({
+    TRADEABLE: "tradeable",
+    UNTRADEABLE: "untradeable",
+    UNKNOWN: "unknown"
+  });
+  var DESTINATIONS = new Set(Object.values(RoutingDestination));
+  var CRITERIA_KEYS = /* @__PURE__ */ new Set([
+    "locations",
+    "duplicate",
+    "tradeability",
+    "minRating",
+    "maxRating",
+    "rarities",
+    "cardTypes",
+    "itemTypes"
+  ]);
+  var RULE_KEYS = /* @__PURE__ */ new Set(["id", "priority", "destination", "criteria", "enabled"]);
+  var exactKeys = (value, allowed, path) => {
+    for (const key of Object.keys(value)) {
+      if (!allowed.has(key)) throw new TypeError(`${path}.${key} is not supported`);
+    }
+  };
+  var stringList = (value, field) => {
+    if (value == null) return Object.freeze([]);
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw new TypeError(`${field} must be an array of non-empty strings`);
+    }
+    return Object.freeze([...new Set(value.map((entry) => entry.trim()))].sort());
+  };
+  function normalizeRoutingRule(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("Routing rule must be an object");
+    }
+    exactKeys(input, RULE_KEYS, "$routingRule");
+    if (typeof input.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(input.id)) {
+      throw new TypeError("Routing rule id must be a safe identifier");
+    }
+    if (!Number.isSafeInteger(input.priority) || input.priority < 0 || input.priority > 1e4) {
+      throw new TypeError("Routing rule priority must be an integer from 0 to 10000");
+    }
+    if (!DESTINATIONS.has(input.destination)) {
+      throw new TypeError(`Unsupported routing destination: ${String(input.destination)}`);
+    }
+    const rawCriteria = input.criteria ?? {};
+    if (!rawCriteria || typeof rawCriteria !== "object" || Array.isArray(rawCriteria)) {
+      throw new TypeError("Routing rule criteria must be an object");
+    }
+    exactKeys(rawCriteria, CRITERIA_KEYS, "$routingRule.criteria");
+    const number = (value, field) => {
+      if (value == null) return null;
+      if (!Number.isFinite(value) || value < 0 || value > 100) {
+        throw new TypeError(`${field} must be between 0 and 100`);
+      }
+      return Number(value);
+    };
+    const criteria = Object.freeze({
+      locations: stringList(rawCriteria.locations, "criteria.locations"),
+      duplicate: rawCriteria.duplicate == null ? null : Boolean(rawCriteria.duplicate),
+      tradeability: rawCriteria.tradeability == null ? null : String(rawCriteria.tradeability).toLowerCase(),
+      minRating: number(rawCriteria.minRating, "criteria.minRating"),
+      maxRating: number(rawCriteria.maxRating, "criteria.maxRating"),
+      rarities: stringList(rawCriteria.rarities, "criteria.rarities"),
+      cardTypes: stringList(rawCriteria.cardTypes, "criteria.cardTypes"),
+      itemTypes: stringList(rawCriteria.itemTypes, "criteria.itemTypes")
+    });
+    if (criteria.tradeability != null && !Object.values(RoutingTradeability).includes(criteria.tradeability)) {
+      throw new TypeError("criteria.tradeability is unsupported");
+    }
+    if (criteria.minRating != null && criteria.maxRating != null && criteria.minRating > criteria.maxRating) {
+      throw new TypeError("criteria.minRating cannot exceed maxRating");
+    }
+    return Object.freeze({
+      id: input.id,
+      priority: input.priority,
+      destination: input.destination,
+      criteria,
+      enabled: input.enabled !== false
+    });
+  }
+  function routingRuleMatches(rule, context) {
+    const { criteria } = rule;
+    const includes = (list, value) => list.length === 0 || list.includes(String(value ?? ""));
+    if (!includes(criteria.locations, context.location)) return false;
+    if (criteria.duplicate != null && criteria.duplicate !== context.duplicate) return false;
+    if (criteria.tradeability != null && criteria.tradeability !== context.tradeability) return false;
+    if (criteria.minRating != null && context.rating < criteria.minRating) return false;
+    if (criteria.maxRating != null && context.rating > criteria.maxRating) return false;
+    if (!includes(criteria.rarities, context.rarity)) return false;
+    if (!includes(criteria.cardTypes, context.cardType)) return false;
+    if (!includes(criteria.itemTypes, context.itemType)) return false;
+    return true;
+  }
+
+  // src/routing/routing-ruleset.js
+  var ROUTING_RULESET_SCHEMA_VERSION = 1;
+  var ROUTING_LIMITS = Object.freeze({ maxRules: 100, maxItems: 5e3 });
+  function normalizeRoutingRuleset(input = {}) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("Routing ruleset must be an object");
+    }
+    for (const key of Object.keys(input)) {
+      if (!["schemaVersion", "id", "rules"].includes(key)) {
+        throw new TypeError(`Unsupported routing ruleset field: ${key}`);
+      }
+    }
+    if ((input.schemaVersion ?? ROUTING_RULESET_SCHEMA_VERSION) !== ROUTING_RULESET_SCHEMA_VERSION) {
+      throw new TypeError("Unsupported routing ruleset schema version");
+    }
+    if (typeof input.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(input.id)) {
+      throw new TypeError("Routing ruleset id must be a safe identifier");
+    }
+    if (!Array.isArray(input.rules) || input.rules.length > ROUTING_LIMITS.maxRules) {
+      throw new TypeError(`Routing ruleset supports at most ${ROUTING_LIMITS.maxRules} rules`);
+    }
+    const rules = input.rules.map(normalizeRoutingRule);
+    const ids = /* @__PURE__ */ new Set();
+    for (const rule of rules) {
+      if (ids.has(rule.id)) throw new TypeError(`Duplicate routing rule id: ${rule.id}`);
+      ids.add(rule.id);
+    }
+    rules.sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id));
+    return Object.freeze({
+      schemaVersion: ROUTING_RULESET_SCHEMA_VERSION,
+      id: input.id,
+      rules: Object.freeze(rules)
+    });
+  }
+
+  // src/inventory/duplicate-relations.js
+  var LOCATION_BUCKET = Object.freeze({
+    club: "club",
+    sbc_storage: "sbcStorage",
+    unassigned: "unassigned"
+  });
+  var freezeRef = (item) => Object.freeze({
+    itemId: String(item.itemId),
+    location: String(item.location),
+    resourceId: item.resourceId == null ? null : String(item.resourceId),
+    definitionId: item.definitionId == null ? null : String(item.definitionId)
+  });
+  var byItemId = (left, right) => left.itemId.localeCompare(right.itemId);
+  function buildDuplicateRelations(snapshot = {}) {
+    const items = Array.isArray(snapshot.items) ? snapshot.items : [
+      ...snapshot.club?.items ?? [],
+      ...snapshot.storage?.items ?? [],
+      ...snapshot.unassigned?.items ?? []
+    ];
+    const groups = /* @__PURE__ */ new Map();
+    const ambiguousItemRefs = [];
+    for (const item of items) {
+      if (!item?.itemId) continue;
+      const key = getDuplicateKey(item);
+      if (!key) {
+        if (item.isDuplicate === true) ambiguousItemRefs.push(freezeRef(item));
+        continue;
+      }
+      const group = groups.get(key) ?? [];
+      group.push(item);
+      groups.set(key, group);
+    }
+    const relations = [];
+    for (const [relationKey, group] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const shouldInclude = group.length > 1 || group.some(
+        (item) => item.location === "unassigned" && item.isDuplicate === true
+      );
+      if (!shouldInclude) continue;
+      const copies = { club: [], sbcStorage: [], unassigned: [] };
+      for (const item of group) {
+        const bucket = LOCATION_BUCKET[item.location];
+        if (bucket) copies[bucket].push(freezeRef(item));
+      }
+      for (const bucket of Object.values(copies)) bucket.sort(byItemId);
+      const unassigned = copies.unassigned;
+      relations.push(Object.freeze({
+        relationKey,
+        resourceId: group[0]?.resourceId == null ? null : String(group[0].resourceId),
+        definitionId: group[0]?.definitionId == null ? null : String(group[0].definitionId),
+        copies: Object.freeze({
+          club: Object.freeze(copies.club),
+          sbcStorage: Object.freeze(copies.sbcStorage),
+          unassigned: Object.freeze(unassigned),
+          transfer: null
+        }),
+        blockingUnassignedItemIds: Object.freeze(unassigned.map(({ itemId }) => itemId)),
+        evidenceState: group.length > 1 ? "verified" : "reported_only"
+      }));
+    }
+    return Object.freeze({
+      schemaVersion: 1,
+      inventoryGeneration: Number.isSafeInteger(snapshot.generation) ? snapshot.generation : null,
+      relations: Object.freeze(relations),
+      ambiguousItemRefs: Object.freeze(ambiguousItemRefs.sort(byItemId)),
+      transferSourceAvailable: false
+    });
+  }
+
+  // src/routing/routing-explainer.js
+  var RoutingReason = Object.freeze({
+    RULE_MATCHED: "RULE_MATCHED",
+    PROTECTED_FROM_CONSUMPTION: "PROTECTED_FROM_CONSUMPTION",
+    DUPLICATE_IDENTITY_AMBIGUOUS: "DUPLICATE_IDENTITY_AMBIGUOUS",
+    MOVE_EVIDENCE_MISSING: "MOVE_EVIDENCE_MISSING",
+    STORAGE_EVIDENCE_MISSING: "STORAGE_EVIDENCE_MISSING",
+    STORAGE_UNAVAILABLE: "STORAGE_UNAVAILABLE",
+    TRADEABILITY_UNVERIFIED: "TRADEABILITY_UNVERIFIED",
+    TRANSFER_SOURCE_UNAVAILABLE: "TRANSFER_SOURCE_UNAVAILABLE",
+    RECIPE_UNVERIFIED: "RECIPE_UNVERIFIED",
+    NON_DUPLICATE_TO_CLUB: "NON_DUPLICATE_TO_CLUB",
+    DUPLICATE_TO_STORAGE: "DUPLICATE_TO_STORAGE",
+    TRADEABLE_DUPLICATE_PRESERVED: "TRADEABLE_DUPLICATE_PRESERVED",
+    USER_DECISION_REQUIRED: "USER_DECISION_REQUIRED",
+    ACTIVITY_GUARD_BLOCKED: "ACTIVITY_GUARD_BLOCKED"
+  });
+  var COPY = Object.freeze({
+    [RoutingReason.RULE_MATCHED]: "Matched the first eligible routing rule.",
+    [RoutingReason.PROTECTED_FROM_CONSUMPTION]: "This item is protected from consuming routes.",
+    [RoutingReason.DUPLICATE_IDENTITY_AMBIGUOUS]: "Duplicate identity could not be verified.",
+    [RoutingReason.MOVE_EVIDENCE_MISSING]: "FUT Magic could not verify that this item can move.",
+    [RoutingReason.STORAGE_EVIDENCE_MISSING]: "SBC Storage eligibility is unverified.",
+    [RoutingReason.STORAGE_UNAVAILABLE]: "SBC Storage has no verified free slot.",
+    [RoutingReason.TRADEABILITY_UNVERIFIED]: "Tradeability evidence is missing.",
+    [RoutingReason.TRANSFER_SOURCE_UNAVAILABLE]: "Transfer List state is not part of the verified inventory snapshot.",
+    [RoutingReason.RECIPE_UNVERIFIED]: "No verified active recipe accepts this item.",
+    [RoutingReason.NON_DUPLICATE_TO_CLUB]: "This verified non-duplicate can move to Club.",
+    [RoutingReason.DUPLICATE_TO_STORAGE]: "This duplicate has a verified SBC Storage destination.",
+    [RoutingReason.TRADEABLE_DUPLICATE_PRESERVED]: "This tradeable duplicate is preserved for a user decision.",
+    [RoutingReason.USER_DECISION_REQUIRED]: "FUT Magic needs a user decision before continuing.",
+    [RoutingReason.ACTIVITY_GUARD_BLOCKED]: "Activity Guard is not ready for another planned action."
+  });
+  function explainRoutingDecision(reasonCodes = []) {
+    const unique = [...new Set(reasonCodes)];
+    return Object.freeze(unique.map((code) => Object.freeze({
+      code,
+      message: COPY[code] ?? COPY[RoutingReason.USER_DECISION_REQUIRED]
+    })));
+  }
+
+  // src/routing/routing-validator.js
+  var guardAllowsAdvice = (guard) => {
+    const state = String(guard?.state ?? "UNKNOWN").toUpperCase();
+    return ["IDLE", "NORMAL"].includes(state);
+  };
+  function validateRoutingDestination(destination, context) {
+    if (!guardAllowsAdvice(context.activityGuard)) {
+      return { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.ACTIVITY_GUARD_BLOCKED };
+    }
+    if (destination === RoutingDestination.CLUB) {
+      return context.item.hasMovableEvidence === true && context.item.isMovable === true ? { valid: true, effect: RoutingEffect.PRESERVE } : { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.MOVE_EVIDENCE_MISSING };
+    }
+    if (destination === RoutingDestination.SBC_STORAGE) {
+      if (context.item.hasStorableEvidence !== true || context.item.isStorable !== true) {
+        return { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.STORAGE_EVIDENCE_MISSING };
+      }
+      if (!context.duplicate || context.storageFreeSlots <= 0) {
+        return { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.STORAGE_UNAVAILABLE };
+      }
+      return { valid: true, effect: RoutingEffect.PRESERVE };
+    }
+    if (destination === RoutingDestination.TRANSFER_LIST) {
+      if (context.item.hasTradabilityEvidence !== true) {
+        return { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.TRADEABILITY_UNVERIFIED };
+      }
+      return context.transferSourceAvailable === true ? { valid: true, effect: RoutingEffect.PRESERVE } : { valid: false, fallback: RoutingDestination.KEEP_UNASSIGNED, reason: RoutingReason.TRANSFER_SOURCE_UNAVAILABLE };
+    }
+    if (destination === RoutingDestination.ACTIVE_RECIPE) {
+      if (context.protectedItemIds.has(context.item.itemId)) {
+        return { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.PROTECTED_FROM_CONSUMPTION };
+      }
+      const evidenceReady = [
+        "hasTradabilityEvidence",
+        "hasLockedEvidence",
+        "hasProtectedEvidence",
+        "hasStartingSquadEvidence",
+        "hasSpecialEvidence"
+      ].every((field) => context.item[field] === true);
+      if (!evidenceReady || context.recipeVerified !== true) {
+        return { valid: false, fallback: RoutingDestination.ASK_USER, reason: RoutingReason.RECIPE_UNVERIFIED };
+      }
+      return { valid: true, effect: RoutingEffect.CONSUME };
+    }
+    if (destination === RoutingDestination.KEEP_UNASSIGNED) {
+      return { valid: true, effect: RoutingEffect.PRESERVE };
+    }
+    return { valid: true, effect: RoutingEffect.MANUAL };
+  }
+
+  // src/routing/routing-engine.js
+  var stable = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  var fingerprint = (value) => {
+    const input = stable(value);
+    let hash = 2166136261;
+    for (let index = 0; index < input.length; index += 1) {
+      hash ^= input.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  };
+  var defaultDecision = (context) => {
+    if (context.ambiguousDuplicate) {
+      return [RoutingDestination.ASK_USER, RoutingReason.DUPLICATE_IDENTITY_AMBIGUOUS];
+    }
+    if (!context.duplicate) {
+      return [RoutingDestination.CLUB, RoutingReason.NON_DUPLICATE_TO_CLUB];
+    }
+    if (context.tradeability === RoutingTradeability.UNTRADEABLE && context.storageFreeSlots > 0) {
+      return [RoutingDestination.SBC_STORAGE, RoutingReason.DUPLICATE_TO_STORAGE];
+    }
+    if (context.tradeability === RoutingTradeability.TRADEABLE) {
+      return [RoutingDestination.KEEP_UNASSIGNED, RoutingReason.TRADEABLE_DUPLICATE_PRESERVED];
+    }
+    return [RoutingDestination.ASK_USER, RoutingReason.TRADEABILITY_UNVERIFIED];
+  };
+  var tradeabilityOf = (item) => item.hasTradabilityEvidence !== true ? RoutingTradeability.UNKNOWN : item.isTradable === true ? RoutingTradeability.TRADEABLE : RoutingTradeability.UNTRADEABLE;
+  var RoutingEngine = class {
+    plan({
+      inventorySnapshot,
+      ruleset,
+      duplicateRelations = null,
+      protectionAnalysis = {},
+      recipeCandidates = [],
+      activityGuard = { state: "NORMAL" }
+    } = {}) {
+      if (!inventorySnapshot || !Array.isArray(inventorySnapshot.items)) {
+        throw new TypeError("RoutingEngine requires a complete inventory snapshot");
+      }
+      if (inventorySnapshot.items.length > ROUTING_LIMITS.maxItems) {
+        throw new RangeError(`Routing input exceeds ${ROUTING_LIMITS.maxItems} items`);
+      }
+      const normalizedRuleset = normalizeRoutingRuleset(ruleset);
+      const relations = duplicateRelations ?? buildDuplicateRelations(inventorySnapshot);
+      const relationByKey = new Map(relations.relations.map((entry) => [entry.relationKey, entry]));
+      const ambiguousIds = new Set(relations.ambiguousItemRefs.map(({ itemId }) => itemId));
+      const protectedItemIds = new Set(
+        [...protectionAnalysis.protectedItemIds ?? []].map(String)
+      );
+      const verifiedRecipeItems = new Set(
+        recipeCandidates.filter((entry) => entry?.verified === true).flatMap((entry) => entry.acceptedItemIds ?? []).map(String)
+      );
+      const capacity = Number.isSafeInteger(inventorySnapshot.storageCapacity) ? inventorySnapshot.storageCapacity : null;
+      let storageFreeSlots = capacity == null ? 0 : Math.max(0, capacity - (inventorySnapshot.storage?.items?.length ?? 0));
+      const decisions = [];
+      const items = [...inventorySnapshot.unassigned?.items ?? []].sort((left, right) => String(left.itemId).localeCompare(String(right.itemId)));
+      for (const item of items) {
+        const key = getDuplicateKey(item);
+        const relation = key ? relationByKey.get(key) : null;
+        const duplicate = Boolean(
+          item.isDuplicate === true || relation && relation.copies.club.length + relation.copies.sbcStorage.length + relation.copies.unassigned.length > 1
+        );
+        const context = {
+          item,
+          location: item.location,
+          duplicate,
+          ambiguousDuplicate: ambiguousIds.has(String(item.itemId)) || item.isDuplicate === true && !key,
+          tradeability: tradeabilityOf(item),
+          rating: Number(item.rating || 0),
+          rarity: item.rarityName ?? item.rarityId ?? "",
+          cardType: item.cardType ?? "",
+          itemType: item.itemType ?? "player",
+          storageFreeSlots,
+          transferSourceAvailable: relations.transferSourceAvailable,
+          protectedItemIds,
+          recipeVerified: verifiedRecipeItems.has(String(item.itemId)),
+          activityGuard
+        };
+        const matched = normalizedRuleset.rules.find(
+          (rule) => rule.enabled && routingRuleMatches(rule, context)
+        );
+        let [destination, reason] = matched ? [matched.destination, RoutingReason.RULE_MATCHED] : defaultDecision(context);
+        const validation = validateRoutingDestination(destination, context);
+        if (!validation.valid) {
+          destination = validation.fallback;
+          reason = validation.reason;
+        }
+        if (destination === RoutingDestination.SBC_STORAGE) storageFreeSlots -= 1;
+        decisions.push(Object.freeze({
+          itemRef: Object.freeze({
+            itemId: String(item.itemId),
+            generation: inventorySnapshot.generation
+          }),
+          destination,
+          effect: validation.valid ? validation.effect : destination === RoutingDestination.KEEP_UNASSIGNED ? RoutingEffect.PRESERVE : RoutingEffect.MANUAL,
+          ruleId: matched?.id ?? null,
+          reasonCodes: Object.freeze([reason]),
+          explanation: explainRoutingDecision([reason])
+        }));
+      }
+      const inventoryFingerprint = fingerprint({
+        generation: inventorySnapshot.generation,
+        items: inventorySnapshot.items.map((item) => ({
+          itemId: item.itemId,
+          location: item.location,
+          resourceId: item.resourceId,
+          definitionId: item.definitionId,
+          isDuplicate: item.isDuplicate,
+          isTradable: item.isTradable,
+          hasTradabilityEvidence: item.hasTradabilityEvidence
+        })),
+        storageCapacity: inventorySnapshot.storageCapacity
+      });
+      const rulesetFingerprint = fingerprint(normalizedRuleset);
+      return Object.freeze({
+        schemaVersion: 1,
+        inventoryGeneration: inventorySnapshot.generation,
+        inventoryFingerprint,
+        rulesetFingerprint,
+        rulesetId: normalizedRuleset.id,
+        decisions: Object.freeze(decisions),
+        blockers: Object.freeze(decisions.filter(({ destination }) => destination === RoutingDestination.ASK_USER).map(({ itemRef, reasonCodes }) => Object.freeze({ itemRef, reasonCodes }))),
+        canExecute: false,
+        readOnly: true
+      });
+    }
+  };
 
   // src/dev/limits.js
   var DEV_LIMITS = Object.freeze({
@@ -3843,7 +4685,7 @@
 
   // src/dev/redaction.js
   var REDACTED2 = "[REDACTED]";
-  var OMITTED_ACCESSOR = "[Accessor omitted]";
+  var OMITTED_ACCESSOR2 = "[Accessor omitted]";
   var SECRET_KEY_PARTS = Object.freeze([
     "authorization",
     "accesstoken",
@@ -3899,8 +4741,8 @@
       `$1${REDACTED2}`
     );
     text = text.replace(
-      /\b(?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|password|secret)\s*[:=]\s*[^\s,;]+/gi,
-      (match) => `${match.slice(0, Math.max(match.indexOf(":"), match.indexOf("=")) + 1)}${REDACTED2}`
+      /\b((?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|password|secret)\s*[:=]\s*)[^\s,;]+/gi,
+      `$1${REDACTED2}`
     );
     return truncateDiagnosticString(text, maxLength);
   }
@@ -3940,8 +4782,29 @@
     try {
       if (Array.isArray(value)) {
         const result2 = [];
-        for (const entry of value.slice(0, options.maxItems)) {
-          const sanitized = sanitizeInternal(entry, options, depth + 1, seen);
+        let descriptors2;
+        try {
+          descriptors2 = Object.getOwnPropertyDescriptors(value);
+        } catch {
+          return "[Unreadable object]";
+        }
+        const length = Math.min(
+          Number.isSafeInteger(descriptors2.length?.value) ? descriptors2.length.value : 0,
+          options.maxItems
+        );
+        for (let index = 0; index < length; index += 1) {
+          const descriptor = descriptors2[index];
+          if (!descriptor) continue;
+          if (!("value" in descriptor)) {
+            result2.push(OMITTED_ACCESSOR2);
+            continue;
+          }
+          const sanitized = sanitizeInternal(
+            descriptor.value,
+            options,
+            depth + 1,
+            seen
+          );
           if (sanitized !== void 0) result2.push(sanitized);
         }
         return result2;
@@ -3962,7 +4825,7 @@
         }
         const descriptor = descriptors[key];
         if (!("value" in descriptor)) {
-          result[safeKey] = OMITTED_ACCESSOR;
+          result[safeKey] = OMITTED_ACCESSOR2;
           continue;
         }
         const sanitized = sanitizeInternal(
@@ -3979,7 +4842,11 @@
     }
   }
   function sanitizeDiagnosticValue(value, options = {}) {
-    return sanitizeInternal(value, normalizeOptions(options), 0, /* @__PURE__ */ new WeakSet());
+    try {
+      return sanitizeInternal(value, normalizeOptions(options), 0, /* @__PURE__ */ new WeakSet());
+    } catch {
+      return "[Unreadable object]";
+    }
   }
 
   // src/dev/class-discovery.js
@@ -4946,6 +5813,7 @@
   var DEFAULT_TIMEOUT_MS = 5e3;
   var STORAGE_KEYS = Object.freeze({
     activity: "grindpilot.activity.v1",
+    activityLedger: "grindpilot.activity-ledger.v1",
     profiles: "grindpilot.profiles.v1",
     projects: "grindpilot.projects.v1",
     settings: "grindpilot.settings.v1"
@@ -4954,6 +5822,8 @@
     "BOOTSTRAP_LOAD",
     "SETTINGS_SAVE",
     "ACTIVITY_SAVE",
+    "ACTIVITY_LEDGER_LOAD",
+    "ACTIVITY_LEDGER_SAVE",
     "PROJECTS_SAVE",
     "PROFILE_LIST",
     "PROFILE_GET",
@@ -4961,6 +5831,13 @@
     "PROFILE_DELETE"
   ]);
   var requestId = () => globalThis.crypto?.randomUUID?.() ?? `gp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  var activityLedgerKey = (partitionKey) => {
+    const token = String(partitionKey ?? "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(token)) {
+      throw new TypeError("Activity ledger partition is invalid");
+    }
+    return `${STORAGE_KEYS.activityLedger}:${token}`;
+  };
   var PageStorageArea = class {
     constructor({
       runtime = globalThis.chrome?.runtime,
@@ -5063,6 +5940,16 @@
         await this.storageCall("set", { [STORAGE_KEYS.activity]: input.value });
         return true;
       }
+      if (action === "ACTIVITY_LEDGER_LOAD") {
+        const key = activityLedgerKey(input.partitionKey);
+        const stored2 = await this.storageCall("get", [key]);
+        return stored2?.[key] ?? null;
+      }
+      if (action === "ACTIVITY_LEDGER_SAVE") {
+        const key = activityLedgerKey(input.partitionKey);
+        await this.storageCall("set", { [key]: input.value });
+        return true;
+      }
       if (action === "PROJECTS_SAVE") {
         await this.storageCall("set", { [STORAGE_KEYS.projects]: input.value });
         return true;
@@ -5094,6 +5981,12 @@
     }
     saveActivity(value) {
       return this.command("ACTIVITY_SAVE", { value });
+    }
+    loadActivityLedger(partitionKey) {
+      return this.command("ACTIVITY_LEDGER_LOAD", { partitionKey });
+    }
+    saveActivityLedger(partitionKey, value) {
+      return this.command("ACTIVITY_LEDGER_SAVE", { partitionKey, value });
     }
     saveProjects(value) {
       return this.command("PROJECTS_SAVE", { value });
@@ -5325,7 +6218,12 @@
         );
       }
       const nextGeneration = current.generation + 1;
-      const normalizeSource = (items, location2) => (Array.isArray(items) ? items : []).map(
+      for (const source of ["club", "storage", "unassigned"]) {
+        if (!Array.isArray(input[source])) {
+          throw new TypeError(`${source} inventory source must be an explicit array`);
+        }
+      }
+      const normalizeSource = (items, location2) => items.map(
         (item) => normalizeInventoryItem(item, { location: location2 })
       );
       const clubItems = normalizeSource(input.club, INVENTORY_LOCATIONS.CLUB);
@@ -5416,6 +6314,9 @@
     }
     getDuplicateGroups() {
       return this.#duplicates.group(this.getSnapshot().items);
+    }
+    getDuplicateRelations() {
+      return buildDuplicateRelations(this.getSnapshot());
     }
     planUnassignedResolution(policy) {
       return planUnassignedResolution(this.getSnapshot(), policy);
@@ -5587,6 +6488,140 @@
     return selected3.slice(0, policy.maxPacks);
   }
 
+  // src/packs/earned-pack-tracker.js
+  var packIdOf = (pack) => String(pack?.packId ?? pack?.id ?? "");
+  var packTypeOf = (pack) => String(pack?.packType ?? pack?.type ?? "");
+  var stable2 = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stable2).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable2(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  var fingerprint2 = (value) => {
+    const input = stable2(value);
+    let hash = 2166136261;
+    for (let index = 0; index < input.length; index += 1) {
+      hash ^= input.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  };
+  var normalizePackRows = (packs) => {
+    if (!Array.isArray(packs)) {
+      throw new PackPolicyError("INVALID_PACKS", "Pack snapshot must be an array");
+    }
+    const rows = packs.map((pack) => {
+      const packId2 = packIdOf(pack);
+      const count = Number(pack?.count ?? 1);
+      if (!packId2 || !Number.isSafeInteger(count) || count < 0) {
+        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot contains an invalid ID or count");
+      }
+      assertOwnedFreePack(pack);
+      return Object.freeze({
+        packId: packId2,
+        packType: packTypeOf(pack),
+        count,
+        pack: Object.freeze({ ...pack })
+      });
+    });
+    rows.sort((left, right) => left.packId.localeCompare(right.packId) || left.packType.localeCompare(right.packType));
+    return rows;
+  };
+  var countsOf = (rows) => {
+    const counts = /* @__PURE__ */ new Map();
+    for (const row of rows) {
+      const next = (counts.get(row.packId) ?? 0) + row.count;
+      if (!Number.isSafeInteger(next)) {
+        throw new PackPolicyError("INVALID_PACKS", "Pack count exceeds the safe range");
+      }
+      counts.set(row.packId, next);
+    }
+    return counts;
+  };
+  var asSnapshot = (value, options = {}) => value?.schemaVersion === 1 && Array.isArray(value.rows) ? value : EarnedPackTracker.capture(value, options);
+  var EarnedPackTracker = class {
+    static capture(packs, { observedAt = 0, sourceGeneration = null } = {}) {
+      const rows = normalizePackRows(packs);
+      const timestamp = Number(observedAt);
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
+        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot time is invalid");
+      }
+      if (sourceGeneration != null && (!Number.isSafeInteger(sourceGeneration) || sourceGeneration < 0)) {
+        throw new PackPolicyError("INVALID_PACKS", "Pack source generation is invalid");
+      }
+      const canonical = rows.map(({ packId: packId2, packType: packType2, count }) => ({ packId: packId2, packType: packType2, count }));
+      return Object.freeze({
+        schemaVersion: 1,
+        observedAt: timestamp,
+        sourceGeneration,
+        rows: Object.freeze(rows),
+        fingerprint: fingerprint2(canonical)
+      });
+    }
+    static correlate({
+      before,
+      after,
+      claimEvidence = {},
+      operationId,
+      sourceChallenge = null,
+      inventoryGeneration = null,
+      correlatedAt = 0
+    } = {}) {
+      if (typeof operationId !== "string" || !operationId.trim() || operationId.length > 160) {
+        throw new PackPolicyError("INVALID_REWARD_OPERATION", "Reward operation ID is required");
+      }
+      const beforeSnapshot = asSnapshot(before);
+      const afterSnapshot = asSnapshot(after);
+      const beforeCounts = countsOf(beforeSnapshot.rows);
+      const afterCounts = countsOf(afterSnapshot.rows);
+      const deltas = [...afterCounts.entries()].map(([packId3, count]) => ({ packId: packId3, delta: count - (beforeCounts.get(packId3) ?? 0) })).filter(({ delta }) => delta > 0);
+      const explicitId = String(claimEvidence?.packId ?? claimEvidence?.rewardPackId ?? "");
+      if (deltas.length !== 1 || deltas[0].delta !== 1 || explicitId && explicitId !== deltas[0].packId) {
+        throw new PackPolicyError(
+          "AMBIGUOUS_REWARD_PACK",
+          "Exactly one newly earned pack unit could not be correlated",
+          { explicitId: explicitId || null, positiveDeltas: deltas }
+        );
+      }
+      const packId2 = deltas[0].packId;
+      const afterRows = afterSnapshot.rows.filter((row) => row.packId === packId2);
+      const beforeRows = beforeSnapshot.rows.filter((row) => row.packId === packId2);
+      if (afterRows.length !== 1) {
+        throw new PackPolicyError("AMBIGUOUS_REWARD_PACK", "Correlated pack identity has multiple rows");
+      }
+      const types = new Set([...beforeRows, ...afterRows].map(({ packType: packType2 }) => packType2));
+      if (types.size !== 1) {
+        throw new PackPolicyError("AMBIGUOUS_REWARD_PACK", "Correlated pack stack is not homogeneous");
+      }
+      const identityKind = (beforeCounts.get(packId2) ?? 0) === 0 ? "owned_instance" : "verified_fungible_stack";
+      const binding = Object.freeze({
+        schemaVersion: 1,
+        operationId: operationId.trim(),
+        packRef: Object.freeze({ packId: packId2 }),
+        identityKind,
+        packType: afterRows[0].packType || null,
+        quantityDelta: 1,
+        sourceChallenge: sourceChallenge == null ? null : String(sourceChallenge),
+        inventoryGeneration: inventoryGeneration == null ? null : Number(inventoryGeneration),
+        beforeFingerprint: beforeSnapshot.fingerprint,
+        afterFingerprint: afterSnapshot.fingerprint,
+        correlatedAt: Number(correlatedAt)
+      });
+      return Object.freeze({ binding, pack: afterRows[0].pack });
+    }
+    static resolve(binding, packs) {
+      if (!binding || binding.schemaVersion !== 1 || binding.quantityDelta !== 1 || typeof binding.operationId !== "string" || typeof binding.packRef?.packId !== "string") {
+        throw new PackPolicyError("INVALID_REWARD_BINDING", "Earned pack binding is invalid");
+      }
+      const rows = normalizePackRows(packs).filter(({ packId: packId2 }) => packId2 === binding.packRef.packId);
+      if (rows.length !== 1 || binding.packType != null && rows[0].packType !== binding.packType) {
+        throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "The bound earned pack is no longer uniquely present");
+      }
+      return rows[0].pack;
+    }
+  };
+
   // src/packs/pack-service.js
   var idOf = (pack) => String(pack?.packId ?? pack?.id ?? "");
   var PackService = class {
@@ -5604,23 +6639,60 @@
     async plan({ policy, currentReward } = {}) {
       assertNoUnassigned(await this.inventoryService.getState());
       const packs = await this.adapter.listOwnedPacks();
+      const ownedSnapshot = EarnedPackTracker.capture(packs);
       const normalizedPolicy = normalizePackPolicy(policy);
-      const selected3 = selectPacksForPolicy({ packs, policy: normalizedPolicy, currentReward });
-      return { policy: normalizedPolicy, packs: selected3.map((pack) => ({ ...pack })) };
+      const selected3 = currentReward?.packBinding && normalizedPolicy.mode === "OPEN_CURRENT_REWARD" ? [EarnedPackTracker.resolve(currentReward.packBinding, packs)] : selectPacksForPolicy({ packs, policy: normalizedPolicy, currentReward });
+      return {
+        policy: normalizedPolicy,
+        packs: selected3.map((pack) => ({ ...pack })),
+        packSnapshotFingerprint: ownedSnapshot.fingerprint,
+        packExpectations: selected3.map((pack) => ({
+          packId: idOf(pack),
+          packType: String(pack?.packType ?? pack?.type ?? ""),
+          count: Number(pack?.count ?? 1)
+        })),
+        currentRewardBinding: normalizedPolicy.mode === "OPEN_CURRENT_REWARD" ? currentReward?.packBinding ?? null : null
+      };
     }
     async open({ policy, currentReward } = {}) {
       const plan = await this.plan({ policy, currentReward });
       return this.openPlan(plan);
     }
     async openPlan(plan = {}) {
-      if (!Array.isArray(plan?.packs)) {
+      if (!Array.isArray(plan?.packs) || !Array.isArray(plan?.packExpectations) || typeof plan?.packSnapshotFingerprint !== "string") {
         throw new PackPolicyError("INVALID_PACK_PLAN", "A verified owned-pack plan is required");
       }
+      const ownedAtStart = await this.adapter.listOwnedPacks();
+      const startSnapshot = EarnedPackTracker.capture(ownedAtStart);
+      if (startSnapshot.fingerprint !== plan.packSnapshotFingerprint) {
+        throw new PackPolicyError("PACK_PLAN_STALE", "Owned packs changed after this plan was prepared");
+      }
       const opened = [];
-      for (const pack of plan.packs) {
+      for (let index = 0; index < plan.packs.length; index += 1) {
+        const pack = plan.packs[index];
         assertNoUnassigned(await this.inventoryService.getState());
         assertOwnedFreePack(pack);
         const packId2 = idOf(pack);
+        const expectation = plan.packExpectations[index];
+        if (!expectation || expectation.packId !== packId2) {
+          throw new PackPolicyError("INVALID_PACK_PLAN", "Pack plan evidence does not match its selected pack");
+        }
+        const currentPacks = await this.adapter.listOwnedPacks();
+        const matching = currentPacks.filter((entry) => idOf(entry) === packId2);
+        const expectedCount = expectation.count - opened.filter((entry) => entry.packId === packId2).length;
+        if (matching.length !== 1 || Number(matching[0]?.count ?? 1) !== expectedCount || String(matching[0]?.packType ?? matching[0]?.type ?? "") !== expectation.packType) {
+          throw new PackPolicyError("PACK_PLAN_STALE", "The selected owned pack is no longer in its reviewed state", {
+            packId: packId2
+          });
+        }
+        if (plan.currentRewardBinding) {
+          const resolved = EarnedPackTracker.resolve(plan.currentRewardBinding, currentPacks);
+          if (idOf(resolved) !== packId2) {
+            throw new PackPolicyError("PACK_PLAN_STALE", "The earned-pack binding no longer matches the reviewed pack", {
+              packId: packId2
+            });
+          }
+        }
         this.logger?.info?.("pack.open.intent", { packId: packId2 });
         const response = await this.adapter.openOwnedPack({ packId: packId2 });
         if (response?.opened !== true || !Array.isArray(response.items)) {
@@ -5647,47 +6719,20 @@
 
   // src/packs/reward-service.js
   var idOf2 = (pack) => String(pack?.packId ?? pack?.id ?? "");
-  var countPacksById = (packs) => {
-    const counts = /* @__PURE__ */ new Map();
-    const packsById = /* @__PURE__ */ new Map();
-    for (const pack of packs) {
-      const id = idOf2(pack);
-      const count = Number(pack?.count ?? 1);
-      if (!id || !Number.isSafeInteger(count) || count < 0) {
-        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot contains an invalid ID or count");
-      }
-      const nextCount = (counts.get(id) ?? 0) + count;
-      if (!Number.isSafeInteger(nextCount)) {
-        throw new PackPolicyError("INVALID_PACKS", "Pack snapshot count exceeds the safe range");
-      }
-      counts.set(id, nextCount);
-      const matches = packsById.get(id) ?? [];
-      matches.push(pack);
-      packsById.set(id, matches);
-    }
-    return { counts, packsById };
-  };
   function identifyClaimedRewardPack({ claim, packsBefore = [], packsAfter = [] } = {}) {
-    if (!Array.isArray(packsBefore) || !Array.isArray(packsAfter)) {
-      throw new PackPolicyError("INVALID_PACKS", "Pack snapshots must be arrays");
+    try {
+      return EarnedPackTracker.correlate({
+        before: packsBefore,
+        after: packsAfter,
+        claimEvidence: claim,
+        operationId: "legacy-reward-correlation"
+      }).pack;
+    } catch (error) {
+      if (error?.code === "AMBIGUOUS_REWARD_PACK") {
+        throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", error.message, error.details);
+      }
+      throw error;
     }
-    const before = countPacksById(packsBefore);
-    const after = countPacksById(packsAfter);
-    const positiveDeltaIds = Array.from(after.counts.entries()).filter(([id, count]) => count - (before.counts.get(id) ?? 0) > 0).map(([id]) => id);
-    const explicitId = String(claim?.packId ?? claim?.rewardPackId ?? "");
-    if (positiveDeltaIds.length !== 1 || explicitId && positiveDeltaIds[0] !== explicitId) {
-      throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Could not uniquely identify the newly claimed pack", {
-        explicitId: explicitId || null,
-        positiveDeltaIds
-      });
-    }
-    const correlatedId = positiveDeltaIds[0];
-    const matches = after.packsById.get(correlatedId) ?? [];
-    if (!matches.length) {
-      throw new PackPolicyError("REWARD_PACK_AMBIGUOUS", "Correlated reward pack was not present");
-    }
-    for (const pack of matches) assertOwnedFreePack(pack);
-    return matches[0];
   }
   var RewardService = class {
     constructor({ adapter, logger = null } = {}) {
@@ -5697,16 +6742,30 @@
       this.adapter = adapter;
       this.logger = logger;
     }
-    async claimAndIdentify(rewardRef, packsBefore = null) {
+    async claimAndIdentify(rewardRef, packsBefore = null, { operationId = "reward-claim", inventoryGeneration = null } = {}) {
       const before = Array.isArray(packsBefore) ? packsBefore.map((pack2) => ({ ...pack2 })) : await this.adapter.listOwnedPacks();
       const claim = await this.adapter.claimReward(rewardRef, before);
       if (claim?.claimed !== true && claim?.success !== true) {
         throw new PackPolicyError("REWARD_CLAIM_UNVERIFIED", "Reward claim was not verified", { rewardRef });
       }
       const after = await this.adapter.listOwnedPacks();
-      const pack = identifyClaimedRewardPack({ claim, packsBefore: before, packsAfter: after });
+      const { binding, pack } = EarnedPackTracker.correlate({
+        before,
+        after,
+        claimEvidence: claim,
+        operationId,
+        sourceChallenge: rewardRef?.challengeId ?? rewardRef?.source ?? null,
+        inventoryGeneration,
+        correlatedAt: Date.now()
+      });
       this.logger?.info?.("reward.claimed", { rewardRef, packId: idOf2(pack) });
-      return { claim, pack, identifiedPackId: idOf2(pack), packType: pack.packType ?? pack.type ?? null };
+      return {
+        claim,
+        pack,
+        packBinding: binding,
+        identifiedPackId: idOf2(pack),
+        packType: pack.packType ?? pack.type ?? null
+      };
     }
   };
 
@@ -7131,9 +8190,167 @@
     };
   };
 
+  // src/recipes/duplicate-recycle.js
+  var DuplicateRecycleStatus = Object.freeze({
+    READY: "ready",
+    BLOCKED: "blocked",
+    EMPTY: "empty",
+    STALE: "stale"
+  });
+  var DuplicateRecycleReason = Object.freeze({
+    NO_BLOCKING_DUPLICATES: "NO_BLOCKING_DUPLICATES",
+    NO_VERIFIED_RECIPE: "NO_VERIFIED_RECIPE",
+    DUPLICATE_NOT_ACCEPTED: "DUPLICATE_NOT_ACCEPTED",
+    PROTECTED_ITEM_USAGE: "PROTECTED_ITEM_USAGE",
+    ITEM_EVIDENCE_UNVERIFIED: "ITEM_EVIDENCE_UNVERIFIED",
+    INVALID_SOLUTION_REFERENCE: "INVALID_SOLUTION_REFERENCE",
+    STALE_INVENTORY: "STALE_INVENTORY",
+    STALE_PROJECT: "STALE_PROJECT",
+    ACTIVITY_GUARD_NOT_NORMAL: "ACTIVITY_GUARD_NOT_NORMAL"
+  });
+  var freeze = (value) => {
+    if (Array.isArray(value)) return Object.freeze(value.map(freeze));
+    if (value && typeof value === "object") {
+      return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, freeze(entry)])));
+    }
+    return value;
+  };
+  var stable3 = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stable3).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable3(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+  var fingerprint3 = (value) => {
+    const input = stable3(value);
+    let hash = 2166136261;
+    for (let index = 0; index < input.length; index += 1) {
+      hash ^= input.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  };
+  function fingerprintDuplicateRecycleInventory(snapshot = {}) {
+    return fingerprint3({
+      storageCapacity: snapshot.storageCapacity ?? null,
+      items: [...snapshot.items ?? []].map((item) => ({
+        itemId: String(item.itemId ?? ""),
+        resourceId: item.resourceId == null ? null : String(item.resourceId),
+        definitionId: item.definitionId == null ? null : String(item.definitionId),
+        location: String(item.location ?? ""),
+        rating: Number(item.rating || 0),
+        isTradable: item.isTradable ?? null,
+        isDuplicate: item.isDuplicate ?? null,
+        isLocked: item.isLocked ?? null,
+        isProtected: item.isProtected ?? null,
+        isInStartingSquad: item.isInStartingSquad ?? null,
+        hasTradabilityEvidence: item.hasTradabilityEvidence ?? null,
+        hasLockedEvidence: item.hasLockedEvidence ?? null,
+        hasProtectedEvidence: item.hasProtectedEvidence ?? null,
+        hasStartingSquadEvidence: item.hasStartingSquadEvidence ?? null,
+        hasSpecialEvidence: item.hasSpecialEvidence ?? null
+      })).sort((left, right) => left.itemId.localeCompare(right.itemId))
+    });
+  }
+  function fingerprintDuplicateRecycleProjects(projects = []) {
+    return fingerprint3([...Array.isArray(projects) ? projects : []].map((project) => ({
+      id: String(project?.id ?? ""),
+      active: project?.active !== false,
+      priority: Number(project?.priority || 0),
+      requiredSquadsRemaining: Number(project?.requiredSquadsRemaining || 0),
+      completionProgress: Number(project?.completionProgress || 0),
+      sourceSetId: project?.sourceSetId == null ? null : String(project.sourceSetId),
+      sourceChallengeIds: [...project?.sourceChallengeIds ?? []].map(String).sort(),
+      sourceChallenges: [...project?.sourceChallenges ?? []].map((challenge) => ({
+        id: String(challenge?.id ?? ""),
+        completed: challenge?.completed === true,
+        requiredSquadRating: challenge?.requiredSquadRating ?? null,
+        specialCardRequirements: [...challenge?.specialCardRequirements ?? []].map((entry) => ({
+          cardType: String(entry?.cardType ?? ""),
+          count: Number(entry?.count || 0),
+          completed: Number(entry?.completed || 0),
+          perRemainingSquad: entry?.perRemainingSquad === true
+        })).sort((left, right) => left.cardType.localeCompare(right.cardType)),
+        unknownRequirements: [...challenge?.unknownRequirements ?? []].map(String).sort()
+      })).sort((left, right) => left.id.localeCompare(right.id)),
+      ratingRequirements: [...project?.ratingRequirements ?? []].map((entry) => ({
+        rating: Number(entry?.rating || 0),
+        count: Number(entry?.count || 0),
+        completed: Number(entry?.completed || 0)
+      })).sort((left, right) => left.rating - right.rating),
+      specialCardRequirements: [...project?.specialCardRequirements ?? []].map((entry) => ({
+        cardType: String(entry?.cardType ?? ""),
+        count: Number(entry?.count || 0),
+        completed: Number(entry?.completed || 0),
+        perRemainingSquad: entry?.perRemainingSquad === true
+      })).sort((left, right) => left.cardType.localeCompare(right.cardType)),
+      protectedPlayerIds: [...project?.protectedPlayerIds ?? []].map(String).sort(),
+      protectedResourceIds: [...project?.protectedResourceIds ?? []].map(String).sort(),
+      protectedRatings: project?.protectedRatings ?? null
+    })).sort((left, right) => left.id.localeCompare(right.id)));
+  }
+  function fingerprintDuplicateRecycleRequirement({ setId, challenge } = {}) {
+    return fingerprint3({
+      setId: setId == null ? null : String(setId),
+      challengeId: challenge?.id == null ? null : String(challenge.id),
+      completed: challenge?.completed === true,
+      requiredSquadRating: challenge?.requiredSquadRating ?? null,
+      specialCardRequirements: [...challenge?.specialCardRequirements ?? []].map((entry) => ({
+        cardType: String(entry?.cardType ?? ""),
+        count: Number(entry?.count || 0),
+        completed: Number(entry?.completed || 0),
+        perRemainingSquad: entry?.perRemainingSquad === true
+      })).sort((left, right) => left.cardType.localeCompare(right.cardType)),
+      unknownRequirements: [...challenge?.unknownRequirements ?? []].map(String).sort()
+    });
+  }
+  function fingerprintDuplicateRecycleCapabilities(capabilities = []) {
+    return fingerprint3([...Array.isArray(capabilities) ? capabilities : []].map((entry) => ({
+      id: String(entry?.id ?? "").trim().toLowerCase(),
+      status: String(entry?.status ?? "UNKNOWN").trim().toUpperCase()
+    })).filter((entry) => entry.id).sort((left, right) => left.id.localeCompare(right.id)));
+  }
+  function compileDuplicateRecycleWorkflow(preview) {
+    if (preview?.status !== DuplicateRecycleStatus.READY || preview.canCompile !== true) {
+      throw new TypeError("A ready duplicate recycle preview is required");
+    }
+    return freeze({
+      id: `duplicate-recycle-${preview.target.targetId}`,
+      name: "Recycle duplicates",
+      version: 1,
+      metadata: { source: "fut-magic-duplicate-recipe", safetyModel: "fail-closed" },
+      steps: [{
+        id: "recycle-approved-duplicates",
+        type: "ORGANIZE_ITEMS",
+        config: {
+          approvedRecycle: {
+            target: {
+              targetId: preview.target.targetId,
+              setId: preview.target.setId,
+              challengeId: preview.target.challengeId
+            },
+            requiredItemIds: preview.blockingItemIds,
+            exactSolutionItemIds: preview.target.completeSolutionItemIds,
+            inventoryGeneration: preview.inventoryGeneration,
+            inventoryFingerprint: preview.inventoryFingerprint,
+            projectGeneration: preview.projectGeneration,
+            projectFingerprint: preview.projectFingerprint,
+            protectionFingerprint: preview.target.protectionFingerprint,
+            requirementsFingerprint: preview.target.requirementsFingerprint,
+            capabilityFingerprint: preview.target.capabilityFingerprint
+          }
+        },
+        timeoutMs: 18e4,
+        retryPolicy: { maxAttempts: 1 },
+        onFailure: "PAUSE"
+      }]
+    });
+  }
+
   // src/ui/grind-panel.js
   var css = `
-:host{all:initial;--fm-bg-primary:#0b1020;--fm-bg-secondary:#121a2e;--fm-bg-elevated:#1e2b4d;--fm-text-primary:#e6edf5;--fm-text-secondary:#a7b2c9;--fm-text-muted:#7f8ba3;--fm-accent-primary:#00e6ff;--fm-accent-secondary:#26ffc2;--fm-focus:#7af4ff;--fm-destructive:#ff7f8f;--fm-border-subtle:#2a3858;color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+:host{all:initial;--fm-bg-primary:#0b1020;--fm-bg-secondary:#121a2e;--fm-bg-elevated:#1e2b4d;--fm-text-primary:#e6edf5;--fm-text-secondary:#a7b2c9;--fm-text-muted:#8793aa;--fm-accent-primary:#00e6ff;--fm-accent-secondary:#26ffc2;--fm-focus:#7af4ff;--fm-destructive:#ff7f8f;--fm-border-subtle:#2a3858;color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 *{box-sizing:border-box}.launcher{position:fixed;right:18px;top:45%;z-index:2147483600;width:46px;height:46px;border:0;border-radius:15px;background:linear-gradient(145deg,#75bfff,#1e70d2);color:#fff;font-weight:900;box-shadow:0 10px 32px #0008;cursor:pointer}
 .panel{position:fixed;z-index:2147483599;right:18px;top:72px;width:min(960px,calc(100vw - 36px));height:min(760px,calc(100vh - 100px));display:grid;grid-template-columns:170px 1fr;background:#10140ff2;backdrop-filter:blur(18px) saturate(140%);border:1px solid #4f6043;border-radius:18px;box-shadow:0 24px 80px #000c;overflow:hidden;color:#edf5e7}.hidden{display:none!important}
 aside{padding:16px 10px;background:#151b13;border-right:1px solid #36432f;overflow:auto}.brand{padding:4px 8px 15px;font-size:17px;font-weight:800;color:#75bfff}.brand small{display:block;color:#85917e;font-size:10px;font-weight:600;margin-top:3px}.nav{display:block;width:100%;border:0;background:transparent;color:#b7c2b1;text-align:left;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:12px}.nav:hover,.nav.active{background:#263747;color:#fff}.main{padding:18px;overflow:auto}.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.top h2{font-size:18px;margin:0}.close{border:0;background:#2d3529;color:#dce6d6;width:31px;height:31px;border-radius:9px;cursor:pointer}.view{display:none}.view.active{display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.card{background:#1a2118;border:1px solid #36432f;border-radius:12px;padding:12px;margin-bottom:10px}.metric{font-size:24px;font-weight:800;color:#75bfff}.label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#8f9b89}.controls{display:flex;gap:8px;flex-wrap:wrap;margin:13px 0}button.action{border:1px solid #53684a;background:#263420;color:#edf5e7;padding:8px 12px;border-radius:9px;cursor:pointer}button.primary{background:#2f8ee5;color:#fff;border-color:#63b0f5;font-weight:800}button.danger{background:#3a211f;border-color:#79413b}button:disabled{opacity:.42;cursor:not-allowed}.form{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:11px}.field{display:flex;flex-direction:column;gap:5px}.field.full{grid-column:1/-1}label{font-size:11px;color:#9da996}input,select,textarea{width:100%;border:1px solid #46543f;background:#11160f;color:#f4f8f0;border-radius:8px;padding:8px;font:inherit;font-size:12px}textarea{min-height:90px;resize:vertical}.hint{font-size:11px;color:#87927f;line-height:1.45}.banner{border-radius:10px;padding:9px 11px;margin-bottom:12px;background:#263747;color:#d7e7f4;font-size:12px}.banner.warn{background:#3d321d;color:#ffe3a3}.banner.error{background:#45201e;color:#ffc0b8}.log{display:grid;grid-template-columns:72px 92px 1fr;gap:8px;border-bottom:1px solid #293226;padding:7px 2px;font-size:11px}.muted{color:#86907f}.section-title{margin:18px 0 8px;font-size:13px;color:#c9d7c1}.empty{padding:25px;text-align:center;color:#778270;border:1px dashed #3e4939;border-radius:10px}.workflow-step{border-left:3px solid #2f8ee5;background:#151d20;padding:10px;margin:9px 0;border-radius:8px}.nested{margin:8px 0 12px 20px;padding-left:10px;border-left:1px dashed #526474}.requirement-row input{max-width:150px}.timeline{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.timeline span{padding:6px 9px;border-radius:20px;background:#252d25;color:#899487;font-size:11px}.timeline .done{color:#bfffc4}.timeline .active{background:#244a6d;color:#fff}.bucket-table{width:100%;border-collapse:collapse;font-size:11px}.bucket-table th,.bucket-table td{padding:7px;border-bottom:1px solid #303a2c;text-align:right}.bucket-table th:first-child,.bucket-table td:first-child{text-align:left}.health{display:grid;grid-template-columns:minmax(130px,1fr) 110px 2fr;gap:8px;padding:7px;border-bottom:1px solid #303a2c;font-size:11px}@media(max-width:680px){.panel{grid-template-columns:1fr;top:12px;height:calc(100vh - 24px)}aside{display:flex;gap:3px;overflow:auto;border-right:0;border-bottom:1px solid #36432f;padding:8px}.brand{display:none}.nav{white-space:nowrap;width:auto}.form{grid-template-columns:1fr}.health{grid-template-columns:1fr}}
@@ -7692,6 +8909,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       this.state = runtime.getState();
       this.syncQueued = false;
       this.packRefreshToken = 0;
+      this.organizeSurface = null;
+      this.organizeRefreshToken = 0;
+      this.organizeRefreshTimer = null;
+      this.organizeInventoryRefreshing = false;
       this.unsubscribe = runtime.subscribe((state) => {
         this.state = state;
         this.scheduleSync();
@@ -7805,12 +9026,18 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       }
     }
     mountOrganizeButton() {
+      const menu = findItemsMenu(this.root);
+      if (!menu?.parentElement) {
+        this.organizeSurface = null;
+        return;
+      }
+      const enteredSurface = this.organizeSurface !== menu.parentElement;
+      this.organizeSurface = menu.parentElement;
+      if (enteredSurface) this.queueOrganizeInventoryRefresh();
       if (this.root.querySelector(".grindpilot-organize-native")) {
         this.updateOrganizeButton();
         return;
       }
-      const menu = findItemsMenu(this.root);
-      if (!menu?.parentElement) return;
       const organize = createNativePeer(menu, {
         className: "grindpilot-organize-native",
         label: "Organize",
@@ -7835,16 +9062,38 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       menu.parentElement.insertBefore(organize, menu);
       this.updateOrganizeButton();
     }
+    queueOrganizeInventoryRefresh() {
+      const token = ++this.organizeRefreshToken;
+      if (this.organizeRefreshTimer != null) clearTimeout(this.organizeRefreshTimer);
+      this.organizeInventoryRefreshing = true;
+      this.updateOrganizeButton();
+      this.organizeRefreshTimer = setTimeout(async () => {
+        this.organizeRefreshTimer = null;
+        try {
+          await this.runtime.refreshInventory({ requireNewer: true });
+        } catch (error) {
+          this.runtime.reportUiError(error);
+        } finally {
+          if (token === this.organizeRefreshToken) {
+            this.organizeInventoryRefreshing = false;
+            this.scheduleSync();
+          }
+        }
+      }, 120);
+    }
     updateOrganizeButton() {
       const organize = this.root.querySelector(".grindpilot-organize-native");
       if (!organize) return;
       const count = Number(this.state.unassignedCount || 0);
       const runIdle = isIdleStatus(this.state.runStatus);
-      const label = count < 1 ? "Organize · No items" : !runIdle ? "Organize · Run active" : `Organize (${count})`;
+      const available = this.state.inventoryAvailable === true;
+      const checking = this.organizeInventoryRefreshing;
+      const label = checking ? "Organize · Checking…" : !available ? "Organize · Unavailable" : count < 1 ? "Organize · No items" : !runIdle ? "Organize · Run active" : `Organize (${count})`;
       setVisibleLabel(organize, label);
-      organize.disabled = count < 1 || !runIdle;
-      organize.setAttribute("aria-label", count < 1 ? "Organize with FUT Magic unavailable: no Unassigned items" : !runIdle ? "Organize with FUT Magic unavailable: finish or stop the active run first" : `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic`);
-      organize.title = count > 0 && runIdle ? `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic: Club/Storage first, then only a verified SBC` : count < 1 ? "No Unassigned items" : "Finish or stop the active run first";
+      organize.disabled = checking || !available || count < 1 || !runIdle;
+      organize.toggleAttribute("aria-busy", checking);
+      organize.setAttribute("aria-label", checking ? "Organize with FUT Magic unavailable: checking Unassigned items" : !available ? "Organize with FUT Magic unavailable: inventory could not be verified" : count < 1 ? "Organize with FUT Magic unavailable: no Unassigned items" : !runIdle ? "Organize with FUT Magic unavailable: finish or stop the active run first" : `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic`);
+      organize.title = checking ? "Checking Unassigned items" : !available ? "Unassigned items could not be verified" : count > 0 && runIdle ? `Organize ${count} item${count === 1 ? "" : "s"} with FUT Magic: Club/Storage first, then only a verified SBC` : count < 1 ? "No Unassigned items" : "Finish or stop the active run first";
     }
     mountOpenPanelButton() {
       if (this.root.querySelector(".fut-magic-open-panel-native")) return;
@@ -7876,6 +9125,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
     }
     dispose() {
       this.packRefreshToken += 1;
+      this.organizeRefreshToken += 1;
+      if (this.organizeRefreshTimer != null) clearTimeout(this.organizeRefreshTimer);
       this.observer?.disconnect();
       this.unsubscribe?.();
       this.root.querySelectorAll(".grindpilot-quick-open-native,.grindpilot-organize-native,.fut-magic-open-panel-native").forEach((node) => node.remove());
@@ -7895,7 +9146,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   --fm-bg-overlay:rgb(11 16 32 / 92%);
   --fm-text-primary:#E6EDF5;
   --fm-text-secondary:#A7B2C9;
-  --fm-text-muted:#7F8BA4;
+  --fm-text-muted:#8793aa;
   --fm-text-on-accent:#07121B;
   --fm-accent-primary:#00E6FF;
   --fm-accent-secondary:#26FFC2;
@@ -8071,6 +9322,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       const current = run.progress.current || 0;
       const ratio = total ? Math.min(1, current / total) : 0;
       const statusLabel = runStatusLabel(run.status);
+      const runTitle = String(run.title ?? "").trim() || "Active run";
       const guard = activityGuardPresentation(run);
       const compact = this.collapsed && guard.state === "normal";
       const announcement = `FUT Magic run status ${statusLabel}. Safety status ${guard.label}. ${run.currentStep?.label || run.nextStep?.label || "Preparing next step"}.`;
@@ -8081,7 +9333,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       const progressMarkup = total ? `<div class="progress" role="progressbar" aria-label="Run progress" aria-valuemin="0" aria-valuenow="${current}" aria-valuemax="${total}" aria-valuetext="${current} of ${total} cycles"><div class="bar" style="transform:scaleX(${ratio})"></div></div>` : `<div class="meta progress-copy" role="status">${current} cycles completed · Total not set</div>`;
       const interventionTitle = guard.state === "recovery" ? "Action not verified" : /player|choice/i.test(`${run.currentStep?.label || ""} ${run.intervention?.message || ""}`) ? "Player choice needed" : "Your input is needed";
       const panelLabel = guard.state === "recovery" ? "Review in panel" : "Open panel";
-      this.mount.innerHTML = compact ? `<section class="hud compact" aria-label="Active FUT Magic run"><div class="top"><div class="brand-lockup">${brandSymbol()}<span class="compact-title">${escapeHtml2(run.title)}</span></div><span class="status normal" aria-label="Run status: ${escapeHtml2(statusLabel)}"><span class="dot" aria-hidden="true"></span>${escapeHtml2(statusLabel)}</span><button class="button" data-command="expand" aria-label="Expand run HUD">${chevronIcon(false)}</button></div></section>` : `<section class="hud" aria-label="Active FUT Magic run"><div class="top"><div class="brand-lockup">${brandSymbol()}<div class="brand">FUT Magic</div></div><div class="top-actions"><div class="status ${escapeHtml2(guard.state)}" aria-label="Run status: ${escapeHtml2(statusLabel)}"><span class="dot" aria-hidden="true"></span>${escapeHtml2(statusLabel)}</div>${guard.state === "normal" ? `<button class="button" data-command="collapse" aria-label="Collapse run HUD">${chevronIcon(true)}</button>` : ""}</div></div><div class="row title"><span>${escapeHtml2(run.title)}</span><span class="meta">${escapeHtml2(total ? `${current} / ${total}` : current)}</span></div>${progressMarkup}<div class="eyebrow">${run.currentStep ? "Now" : "Next"}</div><div class="next">${escapeHtml2(run.currentStep?.label || run.nextStep?.label || "Preparing the next safe step")}</div>${run.nextStep && run.currentStep ? `<div class="meta">Next: ${escapeHtml2(run.nextStep.label)}</div>` : ""}<div class="row guard"><span class="meta">Activity Guard</span><span class="guard-status ${escapeHtml2(guard.state)}"><span class="guard-mark" aria-hidden="true"></span>${escapeHtml2(guard.label)}</span></div>${run.intervention ? `<div class="intervention ${escapeHtml2(guard.state)}" role="status" aria-live="polite"><span class="intervention-title">${escapeHtml2(interventionTitle)}</span>${escapeHtml2(run.intervention.message)}</div>` : ""}<div class="actions">${run.canPause ? '<button class="button" data-command="pause">Pause</button>' : ""}${run.canResume ? '<button class="button" data-command="resume">Resume</button>' : ""}${run.canStop ? '<button class="button stop" data-command="stop">Stop</button>' : ""}<button class="button primary" data-command="open" aria-label="${escapeHtml2(panelLabel)}" title="${escapeHtml2(panelLabel)}">${openPanelIcon()}<span>${escapeHtml2(panelLabel)}</span></button></div></section>`;
+      this.mount.innerHTML = compact ? `<section class="hud compact" aria-label="Active FUT Magic run"><div class="top"><div class="brand-lockup">${brandSymbol()}<span class="compact-title">${escapeHtml2(runTitle)}</span></div><span class="status normal" aria-label="Run status: ${escapeHtml2(statusLabel)}"><span class="dot" aria-hidden="true"></span>${escapeHtml2(statusLabel)}</span><button class="button" data-command="expand" aria-label="Expand run HUD">${chevronIcon(false)}</button></div></section>` : `<section class="hud" aria-label="Active FUT Magic run"><div class="top"><div class="brand-lockup">${brandSymbol()}<div class="brand">FUT Magic</div></div><div class="top-actions"><div class="status ${escapeHtml2(guard.state)}" aria-label="Run status: ${escapeHtml2(statusLabel)}"><span class="dot" aria-hidden="true"></span>${escapeHtml2(statusLabel)}</div>${guard.state === "normal" ? `<button class="button" data-command="collapse" aria-label="Collapse run HUD">${chevronIcon(true)}</button>` : ""}</div></div><div class="row title"><span>${escapeHtml2(runTitle)}</span><span class="meta">${escapeHtml2(total ? `${current} / ${total}` : current)}</span></div>${progressMarkup}<div class="eyebrow">${run.currentStep ? "Now" : "Next"}</div><div class="next">${escapeHtml2(run.currentStep?.label || run.nextStep?.label || "Preparing the next safe step")}</div>${run.nextStep && run.currentStep ? `<div class="meta">Next: ${escapeHtml2(run.nextStep.label)}</div>` : ""}<div class="row guard"><span class="meta">Activity Guard</span><span class="guard-status ${escapeHtml2(guard.state)}"><span class="guard-mark" aria-hidden="true"></span>${escapeHtml2(guard.label)}</span></div>${run.intervention ? `<div class="intervention ${escapeHtml2(guard.state)}" role="status" aria-live="polite"><span class="intervention-title">${escapeHtml2(interventionTitle)}</span>${escapeHtml2(run.intervention.message)}</div>` : ""}<div class="actions">${run.canPause ? '<button class="button" data-command="pause">Pause</button>' : ""}${run.canResume ? '<button class="button" data-command="resume">Resume</button>' : ""}${run.canStop ? '<button class="button stop" data-command="stop">Stop</button>' : ""}<button class="button primary" data-command="open" aria-label="${escapeHtml2(panelLabel)}" title="${escapeHtml2(panelLabel)}">${openPanelIcon()}<span>${escapeHtml2(panelLabel)}</span></button></div></section>`;
       this.shadow.querySelectorAll("[data-command]").forEach((button) => {
         button.addEventListener("click", async () => {
           const command = button.dataset.command;
@@ -8582,6 +9834,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       handlers = {},
       contextProvider = () => ({}),
       modeGate = evaluateWorkflowModeGate,
+      operationScheduler = null,
       now = defaultNow,
       idFactory = defaultIdFactory,
       setTimer = globalThis.setTimeout?.bind(globalThis),
@@ -8594,6 +9847,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       this.handlers = handlers;
       this.contextProvider = contextProvider;
       this.modeGate = modeGate;
+      this.operationScheduler = operationScheduler;
       this.now = now;
       this.idFactory = idFactory;
       this.setTimer = setTimer;
@@ -8771,7 +10025,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         await this._persist();
         return this.getSnapshot();
       }
-      if (node.status === StepStatus.RUNNING) {
+      const failedDestructiveNeedsReconciliation = node.status === StepStatus.FAILED && this.run.status === RunStatus.RECOVERY_REQUIRED && isDestructive(node.step) && this.run.pauseReason?.executionId === node.executionId && this.run.lastError?.executionId === node.executionId;
+      if (node.status === StepStatus.RUNNING || failedDestructiveNeedsReconciliation) {
         const handler = handlerFor(this.handlers, node.step.type);
         const recoveryMethod = typeof handler?.recover === "function";
         if (recoveryMethod) {
@@ -8789,6 +10044,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
           }
           const status = String(outcome2?.status ?? "ambiguous").toLowerCase();
           if (status === "completed") {
+            if (failedDestructiveNeedsReconciliation) {
+              this.run.counters.failed = Math.max(0, this.run.counters.failed - 1);
+              this.run.lastError = null;
+            }
             this._completeNode(node, outcome2?.result ?? null);
             this.run.status = RunStatus.PAUSED;
             this.run.pauseReason = {
@@ -8796,8 +10055,13 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
               message: "The interrupted step was verified as completed. Resume to continue."
             };
           } else if (status === "not_applied" || status === "retry") {
+            if (failedDestructiveNeedsReconciliation) {
+              this.run.counters.failed = Math.max(0, this.run.counters.failed - 1);
+              this.run.lastError = null;
+            }
             node.status = StepStatus.PENDING;
             node.error = null;
+            node.waitUntil = null;
             this.run.status = RunStatus.PAUSED;
             this.run.pauseReason = {
               code: "RECOVERED_STEP_NOT_APPLIED",
@@ -9037,6 +10301,38 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
           });
           await this._persist();
         }
+        if (this.operationScheduler?.preflight) {
+          const scheduled = await this.operationScheduler.preflight({
+            run: this.getSnapshot(),
+            node: cloneSerializable(node),
+            context
+          });
+          if (scheduled?.decision === "WAIT_UNTIL") {
+            node.status = StepStatus.WAITING;
+            node.waitUntil = Number(scheduled.waitUntil);
+            this.run.status = RunStatus.WAITING;
+            this.run.pauseReason = null;
+            this._record("STEP_ACTIVITY_WAIT", {
+              executionId: node.executionId,
+              wakeAt: node.waitUntil,
+              code: scheduled.code ?? "ACTIVITY_WAIT"
+            });
+            await this._persist();
+            return;
+          }
+          if (scheduled?.decision !== "ALLOW") {
+            node.status = StepStatus.PAUSED;
+            this.run.status = RunStatus.PAUSED;
+            this.run.pauseReason = {
+              code: scheduled?.code ?? "ACTIVITY_GUARD_PAUSED",
+              message: "Activity Guard paused this workflow before EA dispatch.",
+              executionId: node.executionId
+            };
+            this._record("STEP_ACTIVITY_PAUSED", this.run.pauseReason);
+            await this._persist();
+            return;
+          }
+        }
         node.attempt += 1;
         node.status = StepStatus.RUNNING;
         node.startedAt = node.startedAt ?? this.now();
@@ -9067,12 +10363,18 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         assertSerializable(outcome2, "Workflow step result");
         const outcomeStatus = String(outcome2?.status ?? "completed").toLowerCase();
         if (outcomeStatus === "waiting") {
+          const activityOutcome = String(outcome2?.activityOutcome ?? "not_applied");
+          await this._recordActivityOutcome(node, activityOutcome, outcome2?.code ?? "HANDLER_WAITING");
           node.status = StepStatus.WAITING;
           node.result = cloneSerializable(outcome2?.result ?? null);
           node.waitUntil = Number.isFinite(Number(outcome2?.resumeAt)) ? Number(outcome2.resumeAt) : null;
           this.run.status = RunStatus.WAITING;
           this._record("STEP_WAITING", { executionId: node.executionId, wakeAt: node.waitUntil });
         } else if (outcomeStatus === "paused") {
+          const activityOutcome = String(
+            outcome2?.activityOutcome ?? (isDestructive(node.step) ? "ambiguous" : "not_applied")
+          );
+          await this._recordActivityOutcome(node, activityOutcome, outcome2?.code ?? "HANDLER_PAUSED");
           node.status = StepStatus.PAUSED;
           node.result = cloneSerializable(outcome2?.result ?? null);
           this.run.status = RunStatus.PAUSED;
@@ -9080,6 +10382,22 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             code: String(outcome2?.code ?? "HANDLER_PAUSED"),
             message: String(outcome2?.message ?? "Step paused by its handler.")
           };
+          if (activityOutcome === "ambiguous" && isDestructive(node.step)) {
+            node.status = StepStatus.FAILED;
+            node.error = {
+              code: String(outcome2?.code ?? "HANDLER_PAUSED_AMBIGUOUS"),
+              message: String(outcome2?.message ?? "The dispatched action has an ambiguous post-state."),
+              details: cloneSerializable(outcome2?.result ?? null),
+              safeToRetry: false,
+              ambiguous: true
+            };
+            this.run.counters.failed += 1;
+            this._requireRecovery(node, {
+              code: "DESTRUCTIVE_STEP_AMBIGUOUS",
+              message: node.error.message
+            });
+            this._record("STEP_AMBIGUOUS", { executionId: node.executionId, error: node.error });
+          }
         } else if (outcomeStatus === "skipped") {
           this._skipNode(node, outcome2?.result ?? null);
         } else if (outcomeStatus === "failed") {
@@ -9094,6 +10412,24 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
           throw error;
         } else {
           this._completeNode(node, outcome2?.result ?? outcome2 ?? null);
+          if (this.operationScheduler?.recordSuccess) {
+            try {
+              await this.operationScheduler.recordSuccess({
+                run: this.getSnapshot(),
+                node: cloneSerializable(node),
+                outcome: cloneSerializable(outcome2)
+              });
+            } catch (schedulerError) {
+              if (this.run.status !== RunStatus.COMPLETED) {
+                this.run.status = RunStatus.PAUSED;
+                this.run.pauseReason = {
+                  code: "ACTIVITY_LEDGER_UNAVAILABLE",
+                  message: "The verified action was preserved, but future work paused because activity evidence could not be recorded.",
+                  executionId: node.executionId
+                };
+              }
+            }
+          }
         }
         await this._persist();
       } catch (error) {
@@ -9106,6 +10442,27 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       const destructive = isDestructive(node.step);
       const ambiguous = executionDispatched && (normalized.ambiguous || destructive && normalized.safeToRetry !== true);
       const retryExplicitlyDenied = error?.safeToRetry === false;
+      if (executionDispatched && this.operationScheduler?.recordFailure) {
+        try {
+          await this.operationScheduler.recordFailure({
+            run: this.getSnapshot(),
+            node: cloneSerializable(node),
+            error: normalized,
+            ambiguous
+          });
+        } catch {
+          node.status = StepStatus.PAUSED;
+          this.run.status = RunStatus.PAUSED;
+          this.run.pauseReason = {
+            code: "ACTIVITY_LEDGER_UNAVAILABLE",
+            message: "Activity evidence could not be recorded, so no retry was allowed.",
+            executionId: node.executionId
+          };
+          this._record("RUN_PAUSED_AFTER_ACTIVITY_FAILURE", this.run.pauseReason);
+          await this._persist();
+          return;
+        }
+      }
       node.error = normalized;
       this.run.lastError = {
         ...normalized,
@@ -9191,6 +10548,37 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         ...extra
       });
       return isPlainObject2(context) ? context : {};
+    }
+    async _recordActivityOutcome(node, outcome2, code) {
+      if (!this.operationScheduler) return;
+      const event = {
+        run: this.getSnapshot(),
+        node: cloneSerializable(node),
+        outcome: outcome2,
+        code
+      };
+      if (this.operationScheduler.recordOutcome) {
+        await this.operationScheduler.recordOutcome(event);
+        return;
+      }
+      if (outcome2 === "verified" && this.operationScheduler.recordSuccess) {
+        await this.operationScheduler.recordSuccess(event);
+        return;
+      }
+      if (outcome2 === "not_applied" && this.operationScheduler.recordNotApplied) {
+        await this.operationScheduler.recordNotApplied(event);
+        return;
+      }
+      if (this.operationScheduler.recordFailure) {
+        await this.operationScheduler.recordFailure({
+          ...event,
+          error: {
+            code,
+            safeToRetry: outcome2 === "transient_failure"
+          },
+          ambiguous: outcome2 === "ambiguous"
+        });
+      }
     }
     _completeNode(node, result) {
       node.status = StepStatus.COMPLETED;
@@ -9435,6 +10823,33 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 
   // src/grindpilot-main.js
   var VERSION = globalThis.document?.documentElement?.dataset?.eaDataExtensionVersion || "unknown";
+  var ACTIVITY_SESSION_STORAGE_KEY = "grindpilot.activity-session.v1";
+  var ACTIVITY_MINIMUM_SPACING_MS = 1500;
+  var newActivitySessionId = () => typeof globalThis.crypto?.randomUUID === "function" ? `session:${globalThis.crypto.randomUUID()}` : `session:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+  var resolveActivitySession = ({ explicitId = null, sessionStore = void 0 } = {}) => {
+    if (explicitId != null) return { sessionId: String(explicitId), restorable: true };
+    let store = sessionStore;
+    if (store === void 0) {
+      try {
+        store = globalThis.sessionStorage;
+      } catch {
+        store = null;
+      }
+    }
+    try {
+      const existing = store?.getItem?.(ACTIVITY_SESSION_STORAGE_KEY);
+      if (/^session:[A-Za-z0-9._:-]{1,152}$/.test(String(existing ?? ""))) {
+        return { sessionId: String(existing), restorable: true };
+      }
+      const sessionId = newActivitySessionId();
+      store?.setItem?.(ACTIVITY_SESSION_STORAGE_KEY, sessionId);
+      if (store?.getItem?.(ACTIVITY_SESSION_STORAGE_KEY) === sessionId) {
+        return { sessionId, restorable: true };
+      }
+    } catch {
+    }
+    return { sessionId: newActivitySessionId(), restorable: false };
+  };
   var outcome = (result) => ({ status: "completed", result });
   var latestResult = (run, type) => [...run?.nodes ?? []].reverse().find(
     (node) => node.step?.type === type && node.status === "completed"
@@ -9500,10 +10915,20 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       this.storage = options.storage ?? new PageStorageArea();
       this.adapter = options.adapter ?? new ControllerAdapter();
       this.inventory = options.inventory ?? new InventoryService();
+      this.routingEngine = options.routingEngine ?? new RoutingEngine();
+      const activitySession = resolveActivitySession({
+        explicitId: options.activitySessionId,
+        sessionStore: options.activitySessionStorage
+      });
+      this.activitySessionId = activitySession.sessionId;
+      this.activitySessionRestorable = activitySession.restorable;
+      this.activityLedger = options.activityLedger ?? new ActivityLedger({ maxEvents: 5e3 });
       this.logger = options.logger ?? new ActivityLogger({ maxEntries: 500 });
       this.targets = options.targets ?? new TargetProjectService();
       this.enableUi = options.enableUi !== false;
       this.enableActivityPersistence = options.enableActivityPersistence !== false;
+      this.activityLedgerPersistenceSupported = this.enableActivityPersistence && typeof this.storage.loadActivityLedger === "function" && typeof this.storage.saveActivityLedger === "function";
+      this.activityEvidenceAvailable = !this.activityLedgerPersistenceSupported || this.activitySessionRestorable;
       this.confirm = options.confirm ?? ((message) => globalThis.window?.confirm?.(message) === true);
       const runtimeRoot = options.root ?? globalThis.window ?? globalThis;
       const runtimeOrigin = options.origin ?? globalThis.location?.origin ?? "https://example.invalid";
@@ -9521,6 +10946,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       this.listeners = /* @__PURE__ */ new Set();
       this.drivePromise = null;
       this.inventoryRefreshPromise = null;
+      this.inventoryRefreshEpoch = 0;
+      this.inventoryRefreshQueuedPromise = null;
+      this.inventoryRefreshQueuedAfterEpoch = 0;
       this.inventoryAvailable = false;
       this.sbcPlanCache = /* @__PURE__ */ new Map();
       this.duplicateRoutePlanCache = /* @__PURE__ */ new Map();
@@ -9578,7 +11006,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       };
       this.inventoryFacade = {
         getState: async () => ({ unassigned: this.inventory.getSnapshot().unassigned.items }),
-        refresh: async () => this.refreshInventory()
+        refresh: async () => this.refreshInventory({ requireNewer: true })
       };
       this.rewardService = new RewardService({ adapter: this.adapter, logger: this.domainLogger() });
       this.packService = new PackService({ adapter: this.adapter, inventoryService: this.inventoryFacade, logger: this.domainLogger() });
@@ -9586,11 +11014,25 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         adapter: this.adapter,
         logger: this.domainLogger()
       });
+      this.operationScheduler = options.operationScheduler ?? new OperationScheduler({
+        ledger: this.activityLedger,
+        activityContextProvider: () => ({
+          // EA does not expose a verified persona identifier. This opaque browser
+          // session partition is restored only within the same tab session.
+          personaKey: this.activityEvidenceAvailable ? this.activitySessionId : "",
+          gameVersion: String(this.state.gameVersion || GameVersion.UNKNOWN).toLowerCase(),
+          sessionId: this.activitySessionId
+        }),
+        minimumSpacingMs: options.minimumActivitySpacingMs ?? ACTIVITY_MINIMUM_SPACING_MS,
+        failureThreshold: 3,
+        persistSnapshot: (snapshot) => this.persistActivityLedger(snapshot)
+      });
       this.engine = new WorkflowEngine({
         repository: options.workflowRepository ?? new PageWorkflowRepository(this.storage),
         handlers: this.createHandlers(),
         contextProvider: () => this.conditionContext(),
-        modeGate: (input) => this.evaluateRunGate(input)
+        modeGate: (input) => this.evaluateRunGate(input),
+        operationScheduler: this.operationScheduler
       });
       this.engineUnsubscribe = null;
       this.logger.subscribe(() => {
@@ -9751,6 +11193,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       };
     }
     async initialize() {
+      await this.restoreActivityLedger();
       await this.loadPersistentState();
       await this.refreshStatus();
       const active = await this.engine.load();
@@ -9797,6 +11240,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             if (target.kind === "SPECIFIC_CHALLENGE" && (String(context?.challengeId ?? "") !== String(target.challengeId ?? "") || target.setId != null && String(context?.setId ?? "") !== String(target.setId ?? ""))) {
               return {
                 status: "paused",
+                activityOutcome: "not_applied",
                 code: "SBC_TARGET_NOT_OPEN",
                 message: "Open the workflow's stable challenge ID before continuing.",
                 result: { target, observed: context }
@@ -9805,6 +11249,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             if (target.kind === "SPECIFIC_SET" && String(context?.setId ?? "") !== String(target.setId ?? "")) {
               return {
                 status: "paused",
+                activityOutcome: "not_applied",
                 code: "SBC_TARGET_NOT_OPEN",
                 message: "Open the workflow's stable SBC set ID before continuing.",
                 result: { target, observed: context }
@@ -9924,10 +11369,14 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         },
         [WorkflowStepType.CLAIM_REWARD]: {
           prepare: async () => ({ packsBefore: await this.adapter.listOwnedPacks() }),
-          execute: async ({ intent }) => {
+          execute: async ({ intent, node }) => {
             const reward = await this.rewardService.claimAndIdentify(
               { source: "current-sbc" },
-              intent.packsBefore
+              intent.packsBefore,
+              {
+                operationId: node?.executionId || "reward-claim",
+                inventoryGeneration: this.inventory.getSnapshot().generation
+              }
             );
             this.logger.info("Reward", "Reward claimed and pack identified", { packId: reward.identifiedPackId });
             return outcome(reward);
@@ -9989,6 +11438,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             const inventoryBefore = await this.adapter.readInventory();
             return {
               plan,
+              packBinding: reward?.packBinding ?? null,
               packId: String(plan.packs[0]?.packId ?? plan.packs[0]?.id ?? ""),
               packsBefore: await this.adapter.listOwnedPacks(),
               inventoryItemIdsBefore: [...inventoryItemIds(inventoryBefore)]
@@ -9999,12 +11449,23 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             const packOpened = Array.isArray(opened.opened) && opened.opened.length > 0;
             const expectedUnassignedStop = packOpened && opened.reason === "UNASSIGNED_BLOCKING";
             if (!packOpened || opened.status !== "completed" && !expectedUnassignedStop) {
-              return { status: "paused", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack opening requires attention", result: opened };
+              return { status: "paused", activityOutcome: "not_applied", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack opening requires attention", result: opened };
             }
             const beforeIds = new Set((intent.inventoryItemIdsBefore ?? []).map(String));
             const receivedItems = this.inventory.getSnapshot().items.filter((item) => !beforeIds.has(String(item.itemId))).map((item) => ({ itemId: item.itemId, rating: item.rating }));
+            const postPackSnapshot = this.inventory.getSnapshot();
+            const postPackProtection = this.createFodderPolicy().analyze(postPackSnapshot.items);
+            const postPackRoutingPlan = this.routingEngine.plan({
+              inventorySnapshot: postPackSnapshot,
+              duplicateRelations: this.inventory.getDuplicateRelations(),
+              ruleset: { schemaVersion: 1, id: "fut-magic.default", rules: [] },
+              protectionAnalysis: postPackProtection,
+              activityGuard: this.operationScheduler.currentGuard({
+                stepType: WorkflowStepType.RESOLVE_ITEMS
+              })
+            });
             this.logger.info("Pack", "Reward pack opened", { packId: opened.opened[0].packId });
-            return outcome({ ...opened, receivedItems });
+            return outcome({ ...opened, receivedItems, postPackRoutingPlan });
           },
           recover: async ({ node }) => {
             const intent = node?.intent ?? {};
@@ -10104,6 +11565,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             if (intent?.plan?.requiresUserAction && !intent?.allowPartial && !intent?.approvedBoundary) {
               return {
                 status: "paused",
+                activityOutcome: "not_applied",
                 code: "UNASSIGNED_USER_ACTION_REQUIRED",
                 message: "The persisted duplicate plan requires a user decision; no item was moved.",
                 result: intent.plan
@@ -10120,7 +11582,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             await this.refreshInventory();
             if (result.unresolvedUnassigned > 0 && !intent?.allowUnresolved) {
               this.logger.warn("Duplicate", "Unresolved items require user action", { count: result.unresolvedUnassigned });
-              return { status: "paused", code: "UNRESOLVED_UNASSIGNED", message: `${result.unresolvedUnassigned} unassigned item(s) require a safe policy decision`, result };
+              return { status: "paused", activityOutcome: "verified", code: "UNRESOLVED_UNASSIGNED", message: `${result.unresolvedUnassigned} unassigned item(s) require a safe policy decision`, result };
             }
             this.logger.info("Duplicate", "Unassigned items resolved safely", { storage: result.movedToStorage?.length || 0 });
             return outcome(result);
@@ -10187,10 +11649,53 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
           }
         },
         [WorkflowStepType.ORGANIZE_ITEMS]: {
-          prepare: async () => {
+          prepare: async ({ step: step2 }) => {
             await this.refreshInventory();
-            const unassigned = this.inventory.getSnapshot().unassigned.items;
-            const requiredItemIds = unassigned.map((item) => String(item.itemId));
+            const snapshot = this.inventory.getSnapshot();
+            const unassigned = snapshot.unassigned.items;
+            const approved = step2?.config?.approvedRecycle ?? null;
+            const target = approved ? {
+              targetId: String(approved.target?.targetId ?? ""),
+              name: String(approved.target?.targetId ?? "Approved duplicate recipe"),
+              setId: String(approved.target?.setId ?? ""),
+              challengeId: String(approved.target?.challengeId ?? "")
+            } : null;
+            const exactSolutionItemIds = approved ? [...approved.exactSolutionItemIds ?? []].map(String) : null;
+            const blockingItemIds = approved ? [...approved.requiredItemIds ?? []].map(String) : null;
+            if (approved) {
+              const uniqueSolution = new Set(exactSolutionItemIds);
+              const uniqueBlocking = new Set(blockingItemIds);
+              const currentIds = new Set(snapshot.items.map((item) => String(item.itemId)));
+              const currentUnassignedIds = new Set(unassigned.map((item) => String(item.itemId)));
+              const currentInventoryFingerprint = fingerprintDuplicateRecycleInventory(snapshot);
+              const currentProjectFingerprint = fingerprintDuplicateRecycleProjects(this.targets.list());
+              const [currentSet, currentCapabilities] = await Promise.all([
+                this.adapter.readCurrentSbcProject(),
+                this.adapter.getCapabilityHealth()
+              ]);
+              const currentChallenge = (currentSet?.challenges ?? []).find(
+                (challenge) => String(challenge?.id ?? "") === target.challengeId
+              );
+              const requirementsVerified = String(currentSet?.setId ?? "") === target.setId && currentChallenge && currentChallenge.completed !== true && Array.isArray(currentChallenge.unknownRequirements) && currentChallenge.unknownRequirements.length === 0;
+              const currentRequirementsFingerprint = requirementsVerified ? fingerprintDuplicateRecycleRequirement({ setId: currentSet.setId, challenge: currentChallenge }) : null;
+              const currentCapabilityFingerprint = fingerprintDuplicateRecycleCapabilities(currentCapabilities);
+              const invalid = !target.setId || !target.challengeId || exactSolutionItemIds.length !== 11 || uniqueSolution.size !== 11 || blockingItemIds.length === 0 || uniqueBlocking.size !== blockingItemIds.length || blockingItemIds.some((id) => !uniqueSolution.has(id)) || exactSolutionItemIds.some((id) => !currentIds.has(id)) || blockingItemIds.some((id) => !currentUnassignedIds.has(id));
+              if (invalid) {
+                const error = new Error("The approved duplicate recipe no longer references one exact available squad");
+                error.code = "DUPLICATE_RECIPE_STALE";
+                error.notApplied = true;
+                error.safeToRetry = false;
+                throw error;
+              }
+              if (String(approved.inventoryFingerprint ?? "") !== currentInventoryFingerprint || String(approved.projectFingerprint ?? "") !== currentProjectFingerprint || String(approved.requirementsFingerprint ?? "") !== currentRequirementsFingerprint || String(approved.capabilityFingerprint ?? "") !== currentCapabilityFingerprint) {
+                const error = new Error("Inventory, Target Projects, requirements, or capabilities changed after duplicate-recipe approval");
+                error.code = "DUPLICATE_RECIPE_EVIDENCE_CHANGED";
+                error.notApplied = true;
+                error.safeToRetry = false;
+                throw error;
+              }
+            }
+            const requiredItemIds = approved ? exactSolutionItemIds : unassigned.map((item) => String(item.itemId));
             if (!requiredItemIds.length) return { requiredItemIds: [], target: null };
             if (requiredItemIds.length > 11) {
               const error = new Error(
@@ -10199,7 +11704,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
               error.code = "ORGANIZER_TOO_MANY_ITEMS";
               throw error;
             }
-            const target = await this.getOrganizerTarget();
+            const resolvedTarget = target ?? await this.getOrganizerTarget();
             const policy = new FodderPolicy({
               protectRatingAtOrAbove: this.config.protectRatingAtOrAbove,
               protectedCardTypes: this.config.protectedCardTypes,
@@ -10211,7 +11716,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
               protectTradables: this.config.protectTradables === true,
               minimumReserveByRating: this.config.minimumReserveByRating || {}
             }, { targetProjects: this.targets });
-            const analysis = policy.analyze(this.inventory.getSnapshot().items);
+            const analysis = policy.analyze(snapshot.items);
             const protectedIds = new Set(analysis.protectedItemIds.map(String));
             const protectedRequiredItemIds = requiredItemIds.filter((id) => protectedIds.has(id));
             if (protectedRequiredItemIds.length) {
@@ -10223,8 +11728,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
               throw error;
             }
             return {
-              target,
+              target: resolvedTarget,
               requiredItemIds,
+              blockingItemIds,
+              approvedRecycle: Boolean(approved),
               protectedItemIds: analysis.protectedItemIds,
               solverSettings: { ...this.config.solverSettings || {}, useUnassigned: true }
             };
@@ -10252,6 +11759,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             if (stillUnassigned.length) {
               return {
                 status: "paused",
+                activityOutcome: "ambiguous",
                 code: "ORGANIZER_POST_STATE_UNVERIFIED",
                 message: "Organizer could not verify that every required card was consumed",
                 result: { ...result, stillUnassigned }
@@ -10322,6 +11830,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
               }
               return {
                 status: "paused",
+                activityOutcome: "not_applied",
                 code: intent?.decisionReason || "PLAYER_PICK_UNVERIFIED",
                 message: "Player-pick offers are unavailable, incomplete, or ambiguous. No selection was made.",
                 result: { policy: this.currentPickPolicy() }
@@ -10341,6 +11850,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
             }
             return {
               status: "paused",
+              activityOutcome: decision.reason === "PICK_SELECTION_UNVERIFIED" ? "ambiguous" : "not_applied",
               code: decision.reason || "PLAYER_PICK_USER_REQUIRED",
               message: `Player pick paused safely: ${decision.reason || "no unique verified selection"}.`,
               result: decision
@@ -10371,6 +11881,32 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       this.state.targetDashboard = this.targets.getDashboard(items);
       await this.storage.saveProjects(this.state.projects);
       return updated;
+    }
+    async restoreActivityLedger() {
+      if (!this.activityLedgerPersistenceSupported) return;
+      if (!this.activitySessionRestorable) {
+        this.activityEvidenceAvailable = false;
+        return;
+      }
+      try {
+        const snapshot = await this.storage.loadActivityLedger(this.activitySessionId);
+        if (snapshot != null) this.activityLedger.restore(snapshot);
+      } catch (error) {
+        this.activityEvidenceAvailable = false;
+        this.logger.warn("Activity Guard", "Stored activity evidence could not be verified", {
+          code: error?.code || "ACTIVITY_LEDGER_RESTORE_FAILED"
+        });
+      }
+    }
+    async persistActivityLedger(snapshot) {
+      if (!this.activityLedgerPersistenceSupported) return true;
+      if (!this.activityEvidenceAvailable) {
+        const error = new Error("Activity evidence is unavailable");
+        error.code = "ACTIVITY_EVIDENCE_UNAVAILABLE";
+        throw error;
+      }
+      await this.storage.saveActivityLedger(this.activitySessionId, snapshot);
+      return true;
     }
     currentGameContext({ requireSbcTarget = false } = {}) {
       const observed = this.state.currentContext || {};
@@ -10429,6 +11965,12 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
       }
       const capabilitySnapshot = capabilityRegistry.snapshot();
       const gameContext = this.currentGameContext();
+      const routingPlan = this.routingEngine.plan({
+        inventorySnapshot,
+        duplicateRelations: this.inventory.getDuplicateRelations(),
+        ruleset: { schemaVersion: 1, id: "fut-magic.default", rules: [] },
+        activityGuard: this.currentRouterActivityGuard()
+      });
       const summary = summarizeDuplicateRoute({ plan: resolutionPlan, inventorySnapshot });
       const fingerprints = buildDuplicateRouteFingerprints({
         gameContext,
@@ -10441,6 +11983,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
         inventorySnapshot,
         policy,
         resolutionPlan,
+        routingPlan,
         summary,
         capabilityRegistry,
         capabilitySnapshot,
@@ -11241,7 +12784,7 @@ ${summary}`)) return;
         error.code = "WORKFLOW_ALREADY_ACTIVE";
         throw error;
       }
-      await this.refreshInventory();
+      await this.refreshInventory({ requireNewer: true });
       const plan = this.inventory.planUnassignedResolution({
         preferSbcStorage: this.config.preferSbcStorage !== false,
         tradableWhenStorageUnavailable: "SAFE_HOLD",
@@ -11255,7 +12798,6 @@ ${summary}`)) return;
       const toStorage = plan.actions.filter(
         (action) => action.type === "MOVE_TO_SBC_STORAGE"
       ).length;
-      const organizerTarget = plan.requiresUserAction ? await this.getOrganizerTarget() : null;
       const definition = {
         id: "recycle-cards",
         name: "Recycle Cards",
@@ -11267,16 +12809,9 @@ ${summary}`)) return;
             type: WorkflowStepType.RESOLVE_ITEMS,
             config: {
               allowPartial: true,
-              allowUnresolved: true
+              allowUnresolved: false
             },
             timeoutMs: 45e3,
-            retryPolicy: { maxAttempts: 1 },
-            onFailure: "PAUSE"
-          },
-          {
-            id: "organize-remaining-items",
-            type: WorkflowStepType.ORGANIZE_ITEMS,
-            timeoutMs: 18e4,
             retryPolicy: { maxAttempts: 1 },
             onFailure: "PAUSE"
           }
@@ -11289,7 +12824,7 @@ ${summary}`)) return;
       this.logger.info("Recycle Cards", "Approved safe unassigned-card recycling", {
         toClub,
         toStorage,
-        organizerTarget: organizerTarget?.name ?? null
+        unresolvedRequiresReviewedRecipe: plan.requiresUserAction
       });
       await this.drive();
       return this.engine.getSnapshot();
@@ -11357,7 +12892,7 @@ ${summary}`)) return;
         error.code = "WORKFLOW_ALREADY_ACTIVE";
         throw error;
       }
-      await this.refreshInventory();
+      await this.refreshInventory({ requireNewer: true });
       const requestedPackId = String(
         typeof selection === "object" ? selection?.packId ?? "" : selection ?? ""
       );
@@ -11450,8 +12985,32 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
       this.emit();
       return this.getState();
     }
-    async refreshInventory() {
-      if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
+    async refreshInventory({ requireNewer = false } = {}) {
+      if (this.inventoryRefreshPromise) {
+        if (!requireNewer) return this.inventoryRefreshPromise;
+        const activeEpoch = Number(this.inventoryRefreshEpoch) || 0;
+        if (this.inventoryRefreshQueuedPromise && this.inventoryRefreshQueuedAfterEpoch >= activeEpoch) {
+          return this.inventoryRefreshQueuedPromise;
+        }
+        const activeRefresh = this.inventoryRefreshPromise;
+        let queuedRefresh;
+        queuedRefresh = activeRefresh.catch(() => null).then(() => {
+          if (this.inventoryRefreshQueuedPromise === queuedRefresh) {
+            this.inventoryRefreshQueuedPromise = null;
+            this.inventoryRefreshQueuedAfterEpoch = 0;
+          }
+          return this.refreshInventory();
+        }).finally(() => {
+          if (this.inventoryRefreshQueuedPromise === queuedRefresh) {
+            this.inventoryRefreshQueuedPromise = null;
+            this.inventoryRefreshQueuedAfterEpoch = 0;
+          }
+        });
+        this.inventoryRefreshQueuedPromise = queuedRefresh;
+        this.inventoryRefreshQueuedAfterEpoch = activeEpoch;
+        return queuedRefresh;
+      }
+      this.inventoryRefreshEpoch = (Number(this.inventoryRefreshEpoch) || 0) + 1;
       this.inventoryRefreshPromise = (async () => {
         this.inventoryAvailable = false;
         this.state.inventoryAvailable = false;
@@ -11688,6 +13247,26 @@ Only this already-owned pack will be opened. No purchase is allowed.`)) {
         ...this.state,
         gameContext: this.currentGameContext()
       });
+    }
+    /** Execute only a previously reviewed, exact duplicate-recycle preview. */
+    async startApprovedDuplicateRecycle(preview) {
+      const active = this.engine.getSnapshot();
+      if (active && ![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(active.status)) {
+        const error = new Error("Finish or stop the active workflow before recycling duplicates");
+        error.code = "WORKFLOW_ALREADY_ACTIVE";
+        throw error;
+      }
+      const definition = compileDuplicateRecycleWorkflow(preview);
+      await this.engine.start(definition, {
+        mode: WorkflowMode.AUTO,
+        approval: createAutoApproval(definition)
+      });
+      this.logger.info("Duplicate Recycle", "Approved one exact reviewed duplicate recipe", {
+        targetId: preview.target.targetId,
+        blockingCount: preview.blockingItemIds.length
+      });
+      await this.drive();
+      return this.engine.getSnapshot();
     }
     async executeProductShellCommand(command = {}) {
       const type = String(command?.type || "");

@@ -1,4 +1,4 @@
-import { createReadStream, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createReadStream, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +32,9 @@ const { port } = server.address();
 const browser = await chromium.launch({ headless: true });
 const visualOutput = resolve(root, "output", "visual-review");
 mkdirSync(visualOutput, { recursive: true });
+for (const entry of readdirSync(visualOutput)) {
+  if (/^fut-magic-.*\.png$/i.test(entry)) unlinkSync(resolve(visualOutput, entry));
+}
 const productShellFixture = JSON.parse(
   readFileSync(resolve(root, "test", "fixtures", "product-shell-view-model.json"), "utf8"),
 );
@@ -501,7 +504,7 @@ try {
   await assertNoHorizontalOverflow(sidePanelPage, "Normal-width Home");
   await assertMinimumTargets(sidePanelPage.locator(".action-row,.bottom-nav button,.focus-surface button"), "Home", 44);
   await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-home.png"));
-  await sidePanelPage.locator(".action-list").screenshot({ path: resolve(visualOutput, "fut-magic-pro-unavailable.png") });
+  await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-pro-unavailable.png"));
   await sidePanelPage.setViewportSize({ width: 520, height: 900 });
   await sidePanelPage.evaluate(() => {
     window.scrollTo(0, 0);
@@ -509,6 +512,9 @@ try {
   });
   await assertNoHorizontalOverflow(sidePanelPage, "Wide Home");
   await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-home-wide.png"));
+  await sidePanelPage.setViewportSize({ width: 600, height: 900 });
+  await assertNoHorizontalOverflow(sidePanelPage, "600px Home");
+  await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-home-600px.png"));
   await sidePanelPage.setViewportSize({ width: 380, height: 820 });
   await sidePanelPage.getByRole("button", { name: /Projects/ }).last().click();
   await sidePanelPage.getByRole("heading", { name: "Projects" }).waitFor();
@@ -604,7 +610,7 @@ try {
   await assertLoadedBrandImages(sidePanelPage, "More");
   await assertBottomNavClearance(sidePanelPage, "More");
   await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-more.png"));
-  await sidePanelPage.locator(".about").screenshot({ path: resolve(visualOutput, "fut-magic-about.png") });
+  await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-about.png"));
   await sidePanelPage.setViewportSize({ width: 600, height: 900 });
   await sidePanelPage.evaluate(() => { document.body.style.zoom = "2"; });
   const zoomFits = await sidePanelPage.evaluate(() =>
@@ -726,6 +732,7 @@ try {
   if (unknownProgressSemantics.now !== null || unknownProgressSemantics.text !== "Progress unavailable") {
     throw new Error(`Unknown project progress is presented as a measured value: ${JSON.stringify(unknownProgressSemantics)}`);
   }
+  await waitForScreen();
   await captureSidePanelDocument(sidePanelPage, resolve(visualOutput, "fut-magic-project-progress-unknown.png"));
 
   await sidePanelPage.goto(`http://127.0.0.1:${port}/sidepanel/index.html?scenario=empty-projects`);

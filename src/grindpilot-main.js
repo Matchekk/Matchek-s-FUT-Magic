@@ -1,4 +1,5 @@
 import { ActivityLogger } from "./core/activity-logger.js";
+import { ActivityLedger, OperationScheduler } from "./activity/index.js";
 import { exportRunAnalytics, summarizeRunAnalytics } from "./analytics/run-analytics.js";
 import {
   buildDuplicateRouteFingerprints,
@@ -19,6 +20,7 @@ import {
   ProductPlan,
   projectChallengeForContext,
   recommendRouterNextAction,
+  RoutingEngine,
   RouterActivityGuardState,
   DUPLICATE_ROUTE_MOVE_CAPABILITIES,
   DUPLICATE_ROUTE_POLICY,
@@ -40,6 +42,13 @@ import { TargetProjectService } from "./policies/target-project-service.js";
 import { ChromeStorageProfileRepository } from "./profiles/profile-repository.js";
 import { ProfileService } from "./profiles/profile-service.js";
 import { buildProductShellViewModel } from "./presentation/product-shell-view-model.js";
+import {
+  compileDuplicateRecycleWorkflow,
+  fingerprintDuplicateRecycleCapabilities,
+  fingerprintDuplicateRecycleInventory,
+  fingerprintDuplicateRecycleProjects,
+  fingerprintDuplicateRecycleRequirement,
+} from "./recipes/index.js";
 import { GrindPanel } from "./ui/grind-panel.js";
 import { EaSurfaceActions } from "./ui/ea-surface-actions.js";
 import { RunHud } from "./ui/run-hud.js";
@@ -64,6 +73,36 @@ import {
 } from "./workflow/index.js";
 
 const VERSION = globalThis.document?.documentElement?.dataset?.eaDataExtensionVersion || "unknown";
+const ACTIVITY_SESSION_STORAGE_KEY = "grindpilot.activity-session.v1";
+const ACTIVITY_MINIMUM_SPACING_MS = 1_500;
+
+const newActivitySessionId = () => (
+  typeof globalThis.crypto?.randomUUID === "function"
+    ? `session:${globalThis.crypto.randomUUID()}`
+    : `session:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
+);
+
+const resolveActivitySession = ({ explicitId = null, sessionStore = undefined } = {}) => {
+  if (explicitId != null) return { sessionId: String(explicitId), restorable: true };
+  let store = sessionStore;
+  if (store === undefined) {
+    try { store = globalThis.sessionStorage; } catch { store = null; }
+  }
+  try {
+    const existing = store?.getItem?.(ACTIVITY_SESSION_STORAGE_KEY);
+    if (/^session:[A-Za-z0-9._:-]{1,152}$/.test(String(existing ?? ""))) {
+      return { sessionId: String(existing), restorable: true };
+    }
+    const sessionId = newActivitySessionId();
+    store?.setItem?.(ACTIVITY_SESSION_STORAGE_KEY, sessionId);
+    if (store?.getItem?.(ACTIVITY_SESSION_STORAGE_KEY) === sessionId) {
+      return { sessionId, restorable: true };
+    }
+  } catch {
+    // The scheduler will fail closed when production persistence has no stable partition.
+  }
+  return { sessionId: newActivitySessionId(), restorable: false };
+};
 
 const outcome = (result) => ({ status: "completed", result });
 const latestResult = (run, type) =>
@@ -143,10 +182,24 @@ class GrindPilotRuntime {
     this.storage = options.storage ?? new PageStorageArea();
     this.adapter = options.adapter ?? new ControllerAdapter();
     this.inventory = options.inventory ?? new InventoryService();
+    this.routingEngine = options.routingEngine ?? new RoutingEngine();
+    const activitySession = resolveActivitySession({
+      explicitId: options.activitySessionId,
+      sessionStore: options.activitySessionStorage,
+    });
+    this.activitySessionId = activitySession.sessionId;
+    this.activitySessionRestorable = activitySession.restorable;
+    this.activityLedger = options.activityLedger ?? new ActivityLedger({ maxEvents: 5000 });
     this.logger = options.logger ?? new ActivityLogger({ maxEntries: 500 });
     this.targets = options.targets ?? new TargetProjectService();
     this.enableUi = options.enableUi !== false;
     this.enableActivityPersistence = options.enableActivityPersistence !== false;
+    this.activityLedgerPersistenceSupported =
+      this.enableActivityPersistence &&
+      typeof this.storage.loadActivityLedger === "function" &&
+      typeof this.storage.saveActivityLedger === "function";
+    this.activityEvidenceAvailable =
+      !this.activityLedgerPersistenceSupported || this.activitySessionRestorable;
     this.confirm = options.confirm ?? ((message) => globalThis.window?.confirm?.(message) === true);
     const runtimeRoot = options.root ?? globalThis.window ?? globalThis;
     const runtimeOrigin = options.origin ?? globalThis.location?.origin ?? "https://example.invalid";
@@ -165,6 +218,9 @@ class GrindPilotRuntime {
     this.listeners = new Set();
     this.drivePromise = null;
     this.inventoryRefreshPromise = null;
+    this.inventoryRefreshEpoch = 0;
+    this.inventoryRefreshQueuedPromise = null;
+    this.inventoryRefreshQueuedAfterEpoch = 0;
     this.inventoryAvailable = false;
     this.sbcPlanCache = new Map();
     this.duplicateRoutePlanCache = new Map();
@@ -199,7 +255,7 @@ class GrindPilotRuntime {
     };
     this.inventoryFacade = {
       getState: async () => ({ unassigned: this.inventory.getSnapshot().unassigned.items }),
-      refresh: async () => this.refreshInventory(),
+      refresh: async () => this.refreshInventory({ requireNewer: true }),
     };
     this.rewardService = new RewardService({ adapter: this.adapter, logger: this.domainLogger() });
     this.packService = new PackService({ adapter: this.adapter, inventoryService: this.inventoryFacade, logger: this.domainLogger() });
@@ -207,12 +263,26 @@ class GrindPilotRuntime {
       adapter: this.adapter,
       logger: this.domainLogger(),
     });
+    this.operationScheduler = options.operationScheduler ?? new OperationScheduler({
+      ledger: this.activityLedger,
+      activityContextProvider: () => ({
+        // EA does not expose a verified persona identifier. This opaque browser
+        // session partition is restored only within the same tab session.
+        personaKey: this.activityEvidenceAvailable ? this.activitySessionId : "",
+        gameVersion: String(this.state.gameVersion || GameVersion.UNKNOWN).toLowerCase(),
+        sessionId: this.activitySessionId,
+      }),
+      minimumSpacingMs: options.minimumActivitySpacingMs ?? ACTIVITY_MINIMUM_SPACING_MS,
+      failureThreshold: 3,
+      persistSnapshot: (snapshot) => this.persistActivityLedger(snapshot),
+    });
     this.engine = new WorkflowEngine({
       repository:
         options.workflowRepository ?? new PageWorkflowRepository(this.storage),
       handlers: this.createHandlers(),
       contextProvider: () => this.conditionContext(),
       modeGate: (input) => this.evaluateRunGate(input),
+      operationScheduler: this.operationScheduler,
     });
     this.engineUnsubscribe = null;
     this.logger.subscribe(() => {
@@ -366,6 +436,7 @@ class GrindPilotRuntime {
   }
 
   async initialize() {
+    await this.restoreActivityLedger();
     await this.loadPersistentState();
     await this.refreshStatus();
     const active = await this.engine.load();
@@ -423,6 +494,7 @@ class GrindPilotRuntime {
           ) {
             return {
               status: "paused",
+              activityOutcome: "not_applied",
               code: "SBC_TARGET_NOT_OPEN",
               message: "Open the workflow's stable challenge ID before continuing.",
               result: { target, observed: context },
@@ -434,6 +506,7 @@ class GrindPilotRuntime {
           ) {
             return {
               status: "paused",
+              activityOutcome: "not_applied",
               code: "SBC_TARGET_NOT_OPEN",
               message: "Open the workflow's stable SBC set ID before continuing.",
               result: { target, observed: context },
@@ -568,10 +641,14 @@ class GrindPilotRuntime {
       },
       [WorkflowStepType.CLAIM_REWARD]: {
         prepare: async () => ({ packsBefore: await this.adapter.listOwnedPacks() }),
-        execute: async ({ intent }) => {
+        execute: async ({ intent, node }) => {
           const reward = await this.rewardService.claimAndIdentify(
             { source: "current-sbc" },
             intent.packsBefore,
+            {
+              operationId: node?.executionId || "reward-claim",
+              inventoryGeneration: this.inventory.getSnapshot().generation,
+            },
           );
           this.logger.info("Reward", "Reward claimed and pack identified", { packId: reward.identifiedPackId });
           return outcome(reward);
@@ -632,6 +709,7 @@ class GrindPilotRuntime {
           const inventoryBefore = await this.adapter.readInventory();
           return {
             plan,
+            packBinding: reward?.packBinding ?? null,
             packId: String(plan.packs[0]?.packId ?? plan.packs[0]?.id ?? ""),
             packsBefore: await this.adapter.listOwnedPacks(),
             inventoryItemIdsBefore: [...inventoryItemIds(inventoryBefore)],
@@ -642,14 +720,25 @@ class GrindPilotRuntime {
           const packOpened = Array.isArray(opened.opened) && opened.opened.length > 0;
           const expectedUnassignedStop = packOpened && opened.reason === "UNASSIGNED_BLOCKING";
           if (!packOpened || (opened.status !== "completed" && !expectedUnassignedStop)) {
-            return { status: "paused", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack opening requires attention", result: opened };
+            return { status: "paused", activityOutcome: "not_applied", code: opened.reason || "PACK_NOT_OPENED", message: "Reward pack opening requires attention", result: opened };
           }
           const beforeIds = new Set((intent.inventoryItemIdsBefore ?? []).map(String));
           const receivedItems = this.inventory.getSnapshot().items
             .filter((item) => !beforeIds.has(String(item.itemId)))
             .map((item) => ({ itemId: item.itemId, rating: item.rating }));
+          const postPackSnapshot = this.inventory.getSnapshot();
+          const postPackProtection = this.createFodderPolicy().analyze(postPackSnapshot.items);
+          const postPackRoutingPlan = this.routingEngine.plan({
+            inventorySnapshot: postPackSnapshot,
+            duplicateRelations: this.inventory.getDuplicateRelations(),
+            ruleset: { schemaVersion: 1, id: "fut-magic.default", rules: [] },
+            protectionAnalysis: postPackProtection,
+            activityGuard: this.operationScheduler.currentGuard({
+              stepType: WorkflowStepType.RESOLVE_ITEMS,
+            }),
+          });
           this.logger.info("Pack", "Reward pack opened", { packId: opened.opened[0].packId });
-          return outcome({ ...opened, receivedItems });
+          return outcome({ ...opened, receivedItems, postPackRoutingPlan });
         },
         recover: async ({ node }) => {
           const intent = node?.intent ?? {};
@@ -768,6 +857,7 @@ class GrindPilotRuntime {
               !intent?.approvedBoundary) {
             return {
               status: "paused",
+              activityOutcome: "not_applied",
               code: "UNASSIGNED_USER_ACTION_REQUIRED",
               message: "The persisted duplicate plan requires a user decision; no item was moved.",
               result: intent.plan,
@@ -784,7 +874,7 @@ class GrindPilotRuntime {
           await this.refreshInventory();
           if (result.unresolvedUnassigned > 0 && !intent?.allowUnresolved) {
             this.logger.warn("Duplicate", "Unresolved items require user action", { count: result.unresolvedUnassigned });
-            return { status: "paused", code: "UNRESOLVED_UNASSIGNED", message: `${result.unresolvedUnassigned} unassigned item(s) require a safe policy decision`, result };
+            return { status: "paused", activityOutcome: "verified", code: "UNRESOLVED_UNASSIGNED", message: `${result.unresolvedUnassigned} unassigned item(s) require a safe policy decision`, result };
           }
           this.logger.info("Duplicate", "Unassigned items resolved safely", { storage: result.movedToStorage?.length || 0 });
           return outcome(result);
@@ -851,10 +941,78 @@ class GrindPilotRuntime {
         },
       },
       [WorkflowStepType.ORGANIZE_ITEMS]: {
-        prepare: async () => {
+        prepare: async ({ step }) => {
           await this.refreshInventory();
-          const unassigned = this.inventory.getSnapshot().unassigned.items;
-          const requiredItemIds = unassigned.map((item) => String(item.itemId));
+          const snapshot = this.inventory.getSnapshot();
+          const unassigned = snapshot.unassigned.items;
+          const approved = step?.config?.approvedRecycle ?? null;
+          const target = approved
+            ? {
+                targetId: String(approved.target?.targetId ?? ""),
+                name: String(approved.target?.targetId ?? "Approved duplicate recipe"),
+                setId: String(approved.target?.setId ?? ""),
+                challengeId: String(approved.target?.challengeId ?? ""),
+              }
+            : null;
+          const exactSolutionItemIds = approved
+            ? [...(approved.exactSolutionItemIds ?? [])].map(String)
+            : null;
+          const blockingItemIds = approved
+            ? [...(approved.requiredItemIds ?? [])].map(String)
+            : null;
+          if (approved) {
+            const uniqueSolution = new Set(exactSolutionItemIds);
+            const uniqueBlocking = new Set(blockingItemIds);
+            const currentIds = new Set(snapshot.items.map((item) => String(item.itemId)));
+            const currentUnassignedIds = new Set(unassigned.map((item) => String(item.itemId)));
+            const currentInventoryFingerprint = fingerprintDuplicateRecycleInventory(snapshot);
+            const currentProjectFingerprint = fingerprintDuplicateRecycleProjects(this.targets.list());
+            const [currentSet, currentCapabilities] = await Promise.all([
+              this.adapter.readCurrentSbcProject(),
+              this.adapter.getCapabilityHealth(),
+            ]);
+            const currentChallenge = (currentSet?.challenges ?? []).find(
+              (challenge) => String(challenge?.id ?? "") === target.challengeId,
+            );
+            const requirementsVerified =
+              String(currentSet?.setId ?? "") === target.setId &&
+              currentChallenge && currentChallenge.completed !== true &&
+              Array.isArray(currentChallenge.unknownRequirements) &&
+              currentChallenge.unknownRequirements.length === 0;
+            const currentRequirementsFingerprint = requirementsVerified
+              ? fingerprintDuplicateRecycleRequirement({ setId: currentSet.setId, challenge: currentChallenge })
+              : null;
+            const currentCapabilityFingerprint = fingerprintDuplicateRecycleCapabilities(currentCapabilities);
+            const invalid =
+              !target.setId || !target.challengeId ||
+              exactSolutionItemIds.length !== 11 || uniqueSolution.size !== 11 ||
+              blockingItemIds.length === 0 || uniqueBlocking.size !== blockingItemIds.length ||
+              blockingItemIds.some((id) => !uniqueSolution.has(id)) ||
+              exactSolutionItemIds.some((id) => !currentIds.has(id)) ||
+              blockingItemIds.some((id) => !currentUnassignedIds.has(id));
+            if (invalid) {
+              const error = new Error("The approved duplicate recipe no longer references one exact available squad");
+              error.code = "DUPLICATE_RECIPE_STALE";
+              error.notApplied = true;
+              error.safeToRetry = false;
+              throw error;
+            }
+            if (
+              String(approved.inventoryFingerprint ?? "") !== currentInventoryFingerprint ||
+              String(approved.projectFingerprint ?? "") !== currentProjectFingerprint ||
+              String(approved.requirementsFingerprint ?? "") !== currentRequirementsFingerprint ||
+              String(approved.capabilityFingerprint ?? "") !== currentCapabilityFingerprint
+            ) {
+              const error = new Error("Inventory, Target Projects, requirements, or capabilities changed after duplicate-recipe approval");
+              error.code = "DUPLICATE_RECIPE_EVIDENCE_CHANGED";
+              error.notApplied = true;
+              error.safeToRetry = false;
+              throw error;
+            }
+          }
+          const requiredItemIds = approved
+            ? exactSolutionItemIds
+            : unassigned.map((item) => String(item.itemId));
           if (!requiredItemIds.length) return { requiredItemIds: [], target: null };
           if (requiredItemIds.length > 11) {
             const error = new Error(
@@ -863,7 +1021,7 @@ class GrindPilotRuntime {
             error.code = "ORGANIZER_TOO_MANY_ITEMS";
             throw error;
           }
-          const target = await this.getOrganizerTarget();
+          const resolvedTarget = target ?? await this.getOrganizerTarget();
           const policy = new FodderPolicy({
             protectRatingAtOrAbove: this.config.protectRatingAtOrAbove,
             protectedCardTypes: this.config.protectedCardTypes,
@@ -875,7 +1033,7 @@ class GrindPilotRuntime {
             protectTradables: this.config.protectTradables === true,
             minimumReserveByRating: this.config.minimumReserveByRating || {},
           }, { targetProjects: this.targets });
-          const analysis = policy.analyze(this.inventory.getSnapshot().items);
+          const analysis = policy.analyze(snapshot.items);
           const protectedIds = new Set(analysis.protectedItemIds.map(String));
           const protectedRequiredItemIds = requiredItemIds.filter((id) => protectedIds.has(id));
           if (protectedRequiredItemIds.length) {
@@ -887,8 +1045,10 @@ class GrindPilotRuntime {
             throw error;
           }
           return {
-            target,
+            target: resolvedTarget,
             requiredItemIds,
+            blockingItemIds,
+            approvedRecycle: Boolean(approved),
             protectedItemIds: analysis.protectedItemIds,
             solverSettings: { ...(this.config.solverSettings || {}), useUnassigned: true },
           };
@@ -916,6 +1076,7 @@ class GrindPilotRuntime {
           if (stillUnassigned.length) {
             return {
               status: "paused",
+              activityOutcome: "ambiguous",
               code: "ORGANIZER_POST_STATE_UNVERIFIED",
               message: "Organizer could not verify that every required card was consumed",
               result: { ...result, stillUnassigned },
@@ -994,6 +1155,7 @@ class GrindPilotRuntime {
             }
             return {
               status: "paused",
+              activityOutcome: "not_applied",
               code: intent?.decisionReason || "PLAYER_PICK_UNVERIFIED",
               message: "Player-pick offers are unavailable, incomplete, or ambiguous. No selection was made.",
               result: { policy: this.currentPickPolicy() },
@@ -1013,6 +1175,9 @@ class GrindPilotRuntime {
           }
           return {
             status: "paused",
+            activityOutcome: decision.reason === "PICK_SELECTION_UNVERIFIED"
+              ? "ambiguous"
+              : "not_applied",
             code: decision.reason || "PLAYER_PICK_USER_REQUIRED",
             message: `Player pick paused safely: ${decision.reason || "no unique verified selection"}.`,
             result: decision,
@@ -1041,6 +1206,34 @@ class GrindPilotRuntime {
     this.state.targetDashboard = this.targets.getDashboard(items);
     await this.storage.saveProjects(this.state.projects);
     return updated;
+  }
+
+  async restoreActivityLedger() {
+    if (!this.activityLedgerPersistenceSupported) return;
+    if (!this.activitySessionRestorable) {
+      this.activityEvidenceAvailable = false;
+      return;
+    }
+    try {
+      const snapshot = await this.storage.loadActivityLedger(this.activitySessionId);
+      if (snapshot != null) this.activityLedger.restore(snapshot);
+    } catch (error) {
+      this.activityEvidenceAvailable = false;
+      this.logger.warn("Activity Guard", "Stored activity evidence could not be verified", {
+        code: error?.code || "ACTIVITY_LEDGER_RESTORE_FAILED",
+      });
+    }
+  }
+
+  async persistActivityLedger(snapshot) {
+    if (!this.activityLedgerPersistenceSupported) return true;
+    if (!this.activityEvidenceAvailable) {
+      const error = new Error("Activity evidence is unavailable");
+      error.code = "ACTIVITY_EVIDENCE_UNAVAILABLE";
+      throw error;
+    }
+    await this.storage.saveActivityLedger(this.activitySessionId, snapshot);
+    return true;
   }
 
   currentGameContext({ requireSbcTarget = false } = {}) {
@@ -1108,6 +1301,12 @@ class GrindPilotRuntime {
     }
     const capabilitySnapshot = capabilityRegistry.snapshot();
     const gameContext = this.currentGameContext();
+    const routingPlan = this.routingEngine.plan({
+      inventorySnapshot,
+      duplicateRelations: this.inventory.getDuplicateRelations(),
+      ruleset: { schemaVersion: 1, id: "fut-magic.default", rules: [] },
+      activityGuard: this.currentRouterActivityGuard(),
+    });
     const summary = summarizeDuplicateRoute({ plan: resolutionPlan, inventorySnapshot });
     const fingerprints = buildDuplicateRouteFingerprints({
       gameContext,
@@ -1120,6 +1319,7 @@ class GrindPilotRuntime {
       inventorySnapshot,
       policy,
       resolutionPlan,
+      routingPlan,
       summary,
       capabilityRegistry,
       capabilitySnapshot,
@@ -1971,7 +2171,7 @@ class GrindPilotRuntime {
       throw error;
     }
 
-    await this.refreshInventory();
+    await this.refreshInventory({ requireNewer: true });
     const plan = this.inventory.planUnassignedResolution({
       preferSbcStorage: this.config.preferSbcStorage !== false,
       tradableWhenStorageUnavailable: "SAFE_HOLD",
@@ -1985,8 +2185,6 @@ class GrindPilotRuntime {
     const toStorage = plan.actions.filter(
       (action) => action.type === "MOVE_TO_SBC_STORAGE",
     ).length;
-    const organizerTarget = plan.requiresUserAction ? await this.getOrganizerTarget() : null;
-
     const definition = {
       id: "recycle-cards",
       name: "Recycle Cards",
@@ -1998,16 +2196,9 @@ class GrindPilotRuntime {
           type: WorkflowStepType.RESOLVE_ITEMS,
           config: {
             allowPartial: true,
-            allowUnresolved: true,
+            allowUnresolved: false,
           },
           timeoutMs: 45_000,
-          retryPolicy: { maxAttempts: 1 },
-          onFailure: "PAUSE",
-        },
-        {
-          id: "organize-remaining-items",
-          type: WorkflowStepType.ORGANIZE_ITEMS,
-          timeoutMs: 180_000,
           retryPolicy: { maxAttempts: 1 },
           onFailure: "PAUSE",
         },
@@ -2020,7 +2211,7 @@ class GrindPilotRuntime {
     this.logger.info("Recycle Cards", "Approved safe unassigned-card recycling", {
       toClub,
       toStorage,
-      organizerTarget: organizerTarget?.name ?? null,
+      unresolvedRequiresReviewedRecipe: plan.requiresUserAction,
     });
     await this.drive();
     return this.engine.getSnapshot();
@@ -2102,7 +2293,7 @@ class GrindPilotRuntime {
       error.code = "WORKFLOW_ALREADY_ACTIVE";
       throw error;
     }
-    await this.refreshInventory();
+    await this.refreshInventory({ requireNewer: true });
     const requestedPackId = String(
       typeof selection === "object" ? selection?.packId ?? "" : selection ?? "",
     );
@@ -2185,8 +2376,38 @@ class GrindPilotRuntime {
     this.emit(); return this.getState();
   }
 
-  async refreshInventory() {
-    if (this.inventoryRefreshPromise) return this.inventoryRefreshPromise;
+  async refreshInventory({ requireNewer = false } = {}) {
+    if (this.inventoryRefreshPromise) {
+      if (!requireNewer) return this.inventoryRefreshPromise;
+      const activeEpoch = Number(this.inventoryRefreshEpoch) || 0;
+      if (
+        this.inventoryRefreshQueuedPromise &&
+        this.inventoryRefreshQueuedAfterEpoch >= activeEpoch
+      ) {
+        return this.inventoryRefreshQueuedPromise;
+      }
+      const activeRefresh = this.inventoryRefreshPromise;
+      let queuedRefresh;
+      queuedRefresh = activeRefresh
+        .catch(() => null)
+        .then(() => {
+          if (this.inventoryRefreshQueuedPromise === queuedRefresh) {
+            this.inventoryRefreshQueuedPromise = null;
+            this.inventoryRefreshQueuedAfterEpoch = 0;
+          }
+          return this.refreshInventory();
+        })
+        .finally(() => {
+          if (this.inventoryRefreshQueuedPromise === queuedRefresh) {
+            this.inventoryRefreshQueuedPromise = null;
+            this.inventoryRefreshQueuedAfterEpoch = 0;
+          }
+        });
+      this.inventoryRefreshQueuedPromise = queuedRefresh;
+      this.inventoryRefreshQueuedAfterEpoch = activeEpoch;
+      return queuedRefresh;
+    }
+    this.inventoryRefreshEpoch = (Number(this.inventoryRefreshEpoch) || 0) + 1;
     this.inventoryRefreshPromise = (async () => {
       this.inventoryAvailable = false;
       this.state.inventoryAvailable = false;
@@ -2371,6 +2592,30 @@ class GrindPilotRuntime {
       ...this.state,
       gameContext: this.currentGameContext(),
     });
+  }
+
+  /** Execute only a previously reviewed, exact duplicate-recycle preview. */
+  async startApprovedDuplicateRecycle(preview) {
+    const active = this.engine.getSnapshot();
+    if (
+      active &&
+      ![RunStatus.COMPLETED, RunStatus.STOPPED, RunStatus.FAILED].includes(active.status)
+    ) {
+      const error = new Error("Finish or stop the active workflow before recycling duplicates");
+      error.code = "WORKFLOW_ALREADY_ACTIVE";
+      throw error;
+    }
+    const definition = compileDuplicateRecycleWorkflow(preview);
+    await this.engine.start(definition, {
+      mode: WorkflowMode.AUTO,
+      approval: createAutoApproval(definition),
+    });
+    this.logger.info("Duplicate Recycle", "Approved one exact reviewed duplicate recipe", {
+      targetId: preview.target.targetId,
+      blockingCount: preview.blockingItemIds.length,
+    });
+    await this.drive();
+    return this.engine.getSnapshot();
   }
   async executeProductShellCommand(command = {}) {
     const type = String(command?.type || "");

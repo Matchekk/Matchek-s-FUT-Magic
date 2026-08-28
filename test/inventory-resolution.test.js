@@ -13,6 +13,8 @@ const item = (itemId, resourceId, overrides = {}) => ({
   assetId: `asset-${resourceId}`,
   rating: 84,
   isTradeable: false,
+  isMovable: true,
+  isStorable: true,
   ...overrides,
 });
 
@@ -154,5 +156,23 @@ test("resolution policy rejects any implicit quicksell fallback", () => {
       }),
     /SAFE_HOLD or PAUSE/,
   );
+});
+
+test("missing movement evidence blocks before any automatic route", () => {
+  const inventory = new InventoryService();
+  inventory.synchronize({
+    club: [],
+    storage: [],
+    unassigned: [{
+      itemId: "unknown-move",
+      resourceId: "version",
+      definitionId: "version",
+      isTradable: false,
+    }],
+    storageCapacity: 10,
+  });
+  const [action] = inventory.planUnassignedResolution().actions;
+  assert.equal(action.type, ACTION.PAUSE);
+  assert.equal(action.reason, "unassigned_move_evidence_unverified");
 });
 

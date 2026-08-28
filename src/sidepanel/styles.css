@@ -8,9 +8,9 @@
   --fm-radius-round: var(--fm-radius-pill);
   --fm-type-title: var(--fm-type-title-size);
   --fm-type-section: var(--fm-type-section-size);
-  --fm-type-body: var(--fm-type-label-size);
-  --fm-type-label: var(--fm-type-caption-size);
-  --fm-type-caption: 0.6875rem;
+  --fm-type-body: var(--fm-type-body-size);
+  --fm-type-label: var(--fm-type-label-size);
+  --fm-type-caption: var(--fm-type-caption-size);
   --fm-type-metric: 1.0625rem;
   --fm-motion-press: var(--fm-motion-instant);
   --fm-motion-screen: var(--fm-motion-standard);
@@ -58,7 +58,7 @@ main { padding: 0 var(--fm-space-4) calc(var(--fm-space-6) + env(safe-area-inset
 .screen { animation: fm-screen-in var(--fm-motion-screen) var(--fm-ease-out) both; }
 @keyframes fm-screen-in { from { opacity: 0; transform: translateX(6px); } to { opacity: 1; transform: none; } }
 h1, h2, h3, p { margin: 0; }
-h1 { margin: var(--fm-space-3) 0 var(--fm-space-1); font-size: var(--fm-type-title); line-height: 1.5rem; font-weight: var(--fm-weight-bold); letter-spacing: -.02em; outline: none; }
+h1 { width: max-content; max-width: 100%; margin: var(--fm-space-3) 0 var(--fm-space-1); font-size: var(--fm-type-title); line-height: 1.5rem; font-weight: var(--fm-weight-bold); letter-spacing: -.02em; outline: none; }
 h1:focus-visible { border-radius: 2px; outline: 2px solid var(--fm-focus); outline-offset: 4px; }
 h2 { font-size: var(--fm-type-section); line-height: 1.25rem; font-weight: var(--fm-weight-bold); letter-spacing: -.006em; }
 h3 { font-size: .875rem; line-height: 1.25rem; font-weight: var(--fm-weight-semibold); }

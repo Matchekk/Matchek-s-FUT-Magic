@@ -84,6 +84,15 @@ export const summarizeDuplicateRoute = ({ plan, inventorySnapshot }) => {
         message: "EA did not provide verified SBC Storage evidence for every proposed card.",
       });
     }
+    if (
+      action.type === INVENTORY_RESOLUTION_ACTIONS.PAUSE &&
+      String(action.reason || "").endsWith("_evidence_unverified")
+    ) {
+      blockers.push({
+        code: "ROUTING_CAPABILITY_EVIDENCE_MISSING",
+        message: "EA did not provide verified movement evidence for every proposed card.",
+      });
+    }
   }
 
   const safeActions = actions.filter((action) => SAFE_TYPES.has(action.type));

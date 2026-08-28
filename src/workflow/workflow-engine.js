@@ -166,6 +166,7 @@ export class WorkflowEngine {
     handlers = {},
     contextProvider = () => ({}),
     modeGate = evaluateWorkflowModeGate,
+    operationScheduler = null,
     now = defaultNow,
     idFactory = defaultIdFactory,
     setTimer = globalThis.setTimeout?.bind(globalThis),
@@ -178,6 +179,7 @@ export class WorkflowEngine {
     this.handlers = handlers;
     this.contextProvider = contextProvider;
     this.modeGate = modeGate;
+    this.operationScheduler = operationScheduler;
     this.now = now;
     this.idFactory = idFactory;
     this.setTimer = setTimer;
@@ -371,7 +373,13 @@ export class WorkflowEngine {
       await this._persist();
       return this.getSnapshot();
     }
-    if (node.status === StepStatus.RUNNING) {
+    const failedDestructiveNeedsReconciliation =
+      node.status === StepStatus.FAILED &&
+      this.run.status === RunStatus.RECOVERY_REQUIRED &&
+      isDestructive(node.step) &&
+      this.run.pauseReason?.executionId === node.executionId &&
+      this.run.lastError?.executionId === node.executionId;
+    if (node.status === StepStatus.RUNNING || failedDestructiveNeedsReconciliation) {
       const handler = handlerFor(this.handlers, node.step.type);
       const recoveryMethod = typeof handler?.recover === "function";
       if (recoveryMethod) {
@@ -389,6 +397,10 @@ export class WorkflowEngine {
         }
         const status = String(outcome?.status ?? "ambiguous").toLowerCase();
         if (status === "completed") {
+          if (failedDestructiveNeedsReconciliation) {
+            this.run.counters.failed = Math.max(0, this.run.counters.failed - 1);
+            this.run.lastError = null;
+          }
           this._completeNode(node, outcome?.result ?? null);
           this.run.status = RunStatus.PAUSED;
           this.run.pauseReason = {
@@ -396,8 +408,13 @@ export class WorkflowEngine {
             message: "The interrupted step was verified as completed. Resume to continue.",
           };
         } else if (status === "not_applied" || status === "retry") {
+          if (failedDestructiveNeedsReconciliation) {
+            this.run.counters.failed = Math.max(0, this.run.counters.failed - 1);
+            this.run.lastError = null;
+          }
           node.status = StepStatus.PENDING;
           node.error = null;
+          node.waitUntil = null;
           this.run.status = RunStatus.PAUSED;
           this.run.pauseReason = {
             code: "RECOVERED_STEP_NOT_APPLIED",
@@ -648,6 +665,39 @@ export class WorkflowEngine {
         await this._persist();
       }
 
+      if (this.operationScheduler?.preflight) {
+        const scheduled = await this.operationScheduler.preflight({
+          run: this.getSnapshot(),
+          node: cloneSerializable(node),
+          context,
+        });
+        if (scheduled?.decision === "WAIT_UNTIL") {
+          node.status = StepStatus.WAITING;
+          node.waitUntil = Number(scheduled.waitUntil);
+          this.run.status = RunStatus.WAITING;
+          this.run.pauseReason = null;
+          this._record("STEP_ACTIVITY_WAIT", {
+            executionId: node.executionId,
+            wakeAt: node.waitUntil,
+            code: scheduled.code ?? "ACTIVITY_WAIT",
+          });
+          await this._persist();
+          return;
+        }
+        if (scheduled?.decision !== "ALLOW") {
+          node.status = StepStatus.PAUSED;
+          this.run.status = RunStatus.PAUSED;
+          this.run.pauseReason = {
+            code: scheduled?.code ?? "ACTIVITY_GUARD_PAUSED",
+            message: "Activity Guard paused this workflow before EA dispatch.",
+            executionId: node.executionId,
+          };
+          this._record("STEP_ACTIVITY_PAUSED", this.run.pauseReason);
+          await this._persist();
+          return;
+        }
+      }
+
       node.attempt += 1;
       node.status = StepStatus.RUNNING;
       node.startedAt = node.startedAt ?? this.now();
@@ -681,6 +731,8 @@ export class WorkflowEngine {
       assertSerializable(outcome, "Workflow step result");
       const outcomeStatus = String(outcome?.status ?? "completed").toLowerCase();
       if (outcomeStatus === "waiting") {
+        const activityOutcome = String(outcome?.activityOutcome ?? "not_applied");
+        await this._recordActivityOutcome(node, activityOutcome, outcome?.code ?? "HANDLER_WAITING");
         node.status = StepStatus.WAITING;
         node.result = cloneSerializable(outcome?.result ?? null);
         node.waitUntil = Number.isFinite(Number(outcome?.resumeAt))
@@ -689,6 +741,10 @@ export class WorkflowEngine {
         this.run.status = RunStatus.WAITING;
         this._record("STEP_WAITING", { executionId: node.executionId, wakeAt: node.waitUntil });
       } else if (outcomeStatus === "paused") {
+        const activityOutcome = String(
+          outcome?.activityOutcome ?? (isDestructive(node.step) ? "ambiguous" : "not_applied"),
+        );
+        await this._recordActivityOutcome(node, activityOutcome, outcome?.code ?? "HANDLER_PAUSED");
         node.status = StepStatus.PAUSED;
         node.result = cloneSerializable(outcome?.result ?? null);
         this.run.status = RunStatus.PAUSED;
@@ -696,6 +752,22 @@ export class WorkflowEngine {
           code: String(outcome?.code ?? "HANDLER_PAUSED"),
           message: String(outcome?.message ?? "Step paused by its handler."),
         };
+        if (activityOutcome === "ambiguous" && isDestructive(node.step)) {
+          node.status = StepStatus.FAILED;
+          node.error = {
+            code: String(outcome?.code ?? "HANDLER_PAUSED_AMBIGUOUS"),
+            message: String(outcome?.message ?? "The dispatched action has an ambiguous post-state."),
+            details: cloneSerializable(outcome?.result ?? null),
+            safeToRetry: false,
+            ambiguous: true,
+          };
+          this.run.counters.failed += 1;
+          this._requireRecovery(node, {
+            code: "DESTRUCTIVE_STEP_AMBIGUOUS",
+            message: node.error.message,
+          });
+          this._record("STEP_AMBIGUOUS", { executionId: node.executionId, error: node.error });
+        }
       } else if (outcomeStatus === "skipped") {
         this._skipNode(node, outcome?.result ?? null);
       } else if (outcomeStatus === "failed") {
@@ -710,6 +782,24 @@ export class WorkflowEngine {
         throw error;
       } else {
         this._completeNode(node, outcome?.result ?? outcome ?? null);
+        if (this.operationScheduler?.recordSuccess) {
+          try {
+            await this.operationScheduler.recordSuccess({
+              run: this.getSnapshot(),
+              node: cloneSerializable(node),
+              outcome: cloneSerializable(outcome),
+            });
+          } catch (schedulerError) {
+            if (this.run.status !== RunStatus.COMPLETED) {
+              this.run.status = RunStatus.PAUSED;
+              this.run.pauseReason = {
+                code: "ACTIVITY_LEDGER_UNAVAILABLE",
+                message: "The verified action was preserved, but future work paused because activity evidence could not be recorded.",
+                executionId: node.executionId,
+              };
+            }
+          }
+        }
       }
       await this._persist();
     } catch (error) {
@@ -726,6 +816,27 @@ export class WorkflowEngine {
       (destructive && normalized.safeToRetry !== true)
     );
     const retryExplicitlyDenied = error?.safeToRetry === false;
+    if (executionDispatched && this.operationScheduler?.recordFailure) {
+      try {
+        await this.operationScheduler.recordFailure({
+          run: this.getSnapshot(),
+          node: cloneSerializable(node),
+          error: normalized,
+          ambiguous,
+        });
+      } catch {
+        node.status = StepStatus.PAUSED;
+        this.run.status = RunStatus.PAUSED;
+        this.run.pauseReason = {
+          code: "ACTIVITY_LEDGER_UNAVAILABLE",
+          message: "Activity evidence could not be recorded, so no retry was allowed.",
+          executionId: node.executionId,
+        };
+        this._record("RUN_PAUSED_AFTER_ACTIVITY_FAILURE", this.run.pauseReason);
+        await this._persist();
+        return;
+      }
+    }
     node.error = normalized;
     this.run.lastError = {
       ...normalized,
@@ -815,6 +926,38 @@ export class WorkflowEngine {
       ...extra,
     });
     return isPlainObject(context) ? context : {};
+  }
+
+  async _recordActivityOutcome(node, outcome, code) {
+    if (!this.operationScheduler) return;
+    const event = {
+      run: this.getSnapshot(),
+      node: cloneSerializable(node),
+      outcome,
+      code,
+    };
+    if (this.operationScheduler.recordOutcome) {
+      await this.operationScheduler.recordOutcome(event);
+      return;
+    }
+    if (outcome === "verified" && this.operationScheduler.recordSuccess) {
+      await this.operationScheduler.recordSuccess(event);
+      return;
+    }
+    if (outcome === "not_applied" && this.operationScheduler.recordNotApplied) {
+      await this.operationScheduler.recordNotApplied(event);
+      return;
+    }
+    if (this.operationScheduler.recordFailure) {
+      await this.operationScheduler.recordFailure({
+        ...event,
+        error: {
+          code,
+          safeToRetry: outcome === "transient_failure",
+        },
+        ambiguous: outcome === "ambiguous",
+      });
+    }
   }
 
   _completeNode(node, result) {

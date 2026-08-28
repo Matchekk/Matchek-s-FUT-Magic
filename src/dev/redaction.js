@@ -69,8 +69,8 @@ export function redactSecretText(value, maxLength = DEV_LIMITS.maxStringLength) 
     `$1${REDACTED}`,
   );
   text = text.replace(
-    /\b(?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|password|secret)\s*[:=]\s*[^\s,;]+/gi,
-    (match) => `${match.slice(0, Math.max(match.indexOf(":"), match.indexOf("=")) + 1)}${REDACTED}`,
+    /\b((?:access_token|refresh_token|id_token|token|session|sid|x-ut-sid|password|secret)\s*[:=]\s*)[^\s,;]+/gi,
+    `$1${REDACTED}`,
   );
   return truncateDiagnosticString(text, maxLength);
 }
@@ -114,8 +114,31 @@ function sanitizeInternal(value, options, depth, seen) {
   try {
     if (Array.isArray(value)) {
       const result = [];
-      for (const entry of value.slice(0, options.maxItems)) {
-        const sanitized = sanitizeInternal(entry, options, depth + 1, seen);
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        return "[Unreadable object]";
+      }
+      const length = Math.min(
+        Number.isSafeInteger(descriptors.length?.value)
+          ? descriptors.length.value
+          : 0,
+        options.maxItems,
+      );
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = descriptors[index];
+        if (!descriptor) continue;
+        if (!("value" in descriptor)) {
+          result.push(OMITTED_ACCESSOR);
+          continue;
+        }
+        const sanitized = sanitizeInternal(
+          descriptor.value,
+          options,
+          depth + 1,
+          seen,
+        );
         if (sanitized !== undefined) result.push(sanitized);
       }
       return result;
@@ -160,7 +183,11 @@ function sanitizeInternal(value, options, depth, seen) {
  * invoking getters. Secret-looking keys and common token formats are redacted.
  */
 export function sanitizeDiagnosticValue(value, options = {}) {
-  return sanitizeInternal(value, normalizeOptions(options), 0, new WeakSet());
+  try {
+    return sanitizeInternal(value, normalizeOptions(options), 0, new WeakSet());
+  } catch {
+    return "[Unreadable object]";
+  }
 }
 
 export const REDACTED_VALUE = REDACTED;

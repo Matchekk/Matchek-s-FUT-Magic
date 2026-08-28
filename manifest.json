@@ -51,6 +51,7 @@
       "resources": [
         "page/ea-data-bridge.js",
         "page/ea-data-bridge.css",
+        "page/fut-magic-ea-workspace.js",
         "data/changelog.json"
       ],
       "matches": [
